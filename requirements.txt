@@ -1,0 +1,16 @@
+# Native-solver orchestration. idaes-pse provides the `idaes get-extensions` CLI used in
+# the Dockerfile to install the prebuilt IPOPT (with HSL) + k_aug + dot_sens binaries.
+# idaes-pse requires pyomo>=6.10 and numpy<3; the explicit pins below keep a coherent set.
+idaes-pse==2.10.0
+pyomo==6.10.0
+
+# Scientific stack
+numpy==1.26.4
+scipy==1.13.1
+scikit-image==0.23.2
+sympy==1.13.1
+matplotlib==3.9.2
+pandas==2.2.2
+
+# Web UI
+streamlit==1.38.0

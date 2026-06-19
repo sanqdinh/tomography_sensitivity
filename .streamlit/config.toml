@@ -1,0 +1,13 @@
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+# Fly's edge proxy terminates TLS and forwards to the container; the app is fully public
+# and accepts no consequential uploads, so CORS/XSRF protection is disabled to avoid
+# false-positive websocket rejections behind the proxy.
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
