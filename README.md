@@ -1,99 +1,82 @@
-# tomography_sensitivity
+# Tomographic Reconstruction with Sensitivity-Based Uncertainty Quantification
 
-Interactive Streamlit web app for tomographic reconstruction + sensitivity-based
-uncertainty quantification. It wraps the research example
-`sDOE_senNLP/examples/Example2/Example2_simple_uq.py` so the parameters become live
-controls and the results render in the browser.
+An interactive web app for CT-style image reconstruction that also estimates **how trustworthy
+each pixel of the result is**. You set up a virtual scan in the sidebar, press **Run**, watch the
+solver work in a live log, then explore the reconstruction — alongside a per-pixel uncertainty
+map — right in your browser.
+
+It's a self-contained, single-purpose demo for exploring how scan and reconstruction settings
+shape both the *quality* and the *reliability* of a reconstructed image. It is not a
+general-purpose CT library: it runs one fixed pipeline on a built-in synthetic test image.
 
 ## What it does
 
-On each run it:
+Every run carries out the same four-stage pipeline, end to end, on a standard synthetic test
+image (the Shepp-Logan phantom):
 
-1. **Forward solve** — an IPOPT NLP simulates measurements (a sinogram) from a Shepp-Logan
-   phantom.
-2. **Inverse solve** — a second IPOPT NLP reconstructs the initial image (sinogram RMSE +
-   total-variation regularization).
-3. **Classical baselines** — FBP (`iradon`) and SART reconstructions for comparison.
-4. **Uncertainty quantification** — `k_aug` extracts the sensitivity Jacobian
-   d(image)/d(sinogram); the posterior covariance is `J · (σ²·I) · Jᵀ`, yielding a per-pixel
-   log-covariance map and the scalar **D-optimality** criterion.
+1. **Simulate a scan.** Starting from the known phantom, the app generates synthetic CT
+   measurements — a *sinogram* — as if a scanner had imaged it from several angles.
+2. **Reconstruct the image.** Working only from those measurements, it rebuilds the image,
+   balancing faithfulness to the measurements against a preference for smooth, clean results.
+3. **Compare with classical methods.** For reference, it reconstructs the same image two
+   well-known conventional ways — filtered back-projection (FBP) and SART.
+4. **Quantify the uncertainty.** Finally, it measures how sensitive each reconstructed pixel is
+   to the measurements, turning that into a per-pixel uncertainty map and a single overall
+   reliability score.
 
-It produces six figures (phantom, NLP reconstruction, covariance map, merged sinogram, FBP,
-SART) and the D-optimality value.
+Steps 1 and 2 are optimization solves; the uncertainty in step 4 is read directly from the
+solved reconstruction.
 
-> ⏱️ A full run at the default size (30×30, 9 angles) takes minutes — two IPOPT solves plus a
-> k_aug sensitivity extraction. Keep the browser tab open while it runs.
+## What you get
 
-## Native dependencies (important)
+When a run finishes, the app lays out **six figures** in a two-row, three-column grid:
 
-This app needs **compiled** solver binaries that are *not* pip-installable on their own:
+- the **original phantom** — the ground-truth image
+- the app's **reconstruction**
+- a **per-pixel uncertainty map** — where the reconstruction is more or less reliable (log scale)
+- the **simulated sinogram** — the raw measurements, merged across angles
+- the **FBP** reconstruction — classical baseline
+- the **SART** reconstruction — classical baseline
 
-- **IPOPT** (with HSL `ma86`) for the two NLP solves
-- **k_aug** for the sensitivity extraction
+Alongside the figures you also get:
 
-Both come from IDAES via `idaes get-extensions` (the `Dockerfile` does this automatically).
-Running outside Docker requires those binaries on `PATH` (or `IPOPT_EXECUTABLE` set). The
-linear solver is configurable and falls back `ma86 → ma57 → ma27 → mumps` if one isn't
-available.
+- a single **D-optimality score** that summarizes overall reconstruction uncertainty in one
+  number — smaller means tighter, more reliable — handy for comparing one set of settings
+  against another; and
+- **run details**: solver status plus counts such as the number of reconstructed pixels and
+  measurements used.
 
-The `senDOE/` package here is a **vendored snapshot** of the research code — see
-[`SENDOE_VENDOR.md`](./SENDOE_VENDOR.md).
+A live, scrolling solver log streams the whole time a run is working.
 
-## Run locally with Docker (recommended)
+## Using it
 
-```bash
-docker build -t tomo-uq:local .
-docker run --rm -p 8501:8501 tomo-uq:local
-# open http://localhost:8501
-```
+1. Set the parameters in the sidebar.
+2. Click **Run**.
+3. Follow the solver log as it streams.
+4. Review the six figures and the D-optimality score — then tweak and run again to compare.
 
-The build runs fail-fast smoke tests (IPOPT `--version`, `import senDOE`, and a tiny IPOPT
-solve), so if `docker build` succeeds the native solvers work in the image.
+Results stay on screen while you adjust other controls; the app only re-solves when you press
+**Run** again.
 
-### Headless pipeline smoke test
+## Parameters you can tune
 
-```bash
-docker run --rm tomo-uq:local \
-  python3 -c "from tomography_uq import run_simple_uq, UQParams; \
-r=run_simple_uq(UQParams()); print(r.d_optimality, r.forward_solver_status)"
-```
+The sidebar shapes the virtual scan and the reconstruction:
 
-## Run locally without Docker
+- **Image resolution** — pixels per side of the image grid (default 30×30). Larger is slower.
+- **Projection angles** — how many directions the virtual scanner images from (default 9) and
+  the angle range they span (0–180°).
+- **Beam-degradation settings** — model how the beam weakens as it passes through the object.
+- **Smoothness weight** — how strongly the reconstruction favors a clean image over exactly
+  matching the measurements.
+- **Measurement-noise level** — the assumed uncertainty in the measurements, which feeds the
+  uncertainty estimate.
+- **Solver settings** — the optimizer's iteration limit and which underlying numerical solver to
+  use.
 
-Requires Python 3.10+, the packages in `requirements.txt`, and IPOPT + k_aug on `PATH`
-(e.g. via `idaes get-extensions`).
+## Good to know
 
-```bash
-pip install -r requirements.txt
-idaes get-extensions          # installs ipopt/k_aug/dot_sens under ~/.idaes/bin
-streamlit run app.py
-```
-
-## Deploy to Fly.io (on-demand / scale-to-zero)
-
-`fly.toml` is configured for `auto_stop_machines` / `auto_start_machines` with
-`min_machines_running = 0` — the machine boots on the first request and stops after idle, so
-there is no always-on cost. (Requires a Fly account; deploy with your own auth.)
-
-```bash
-fly auth login
-fly launch --no-deploy        # detects the Dockerfile; keep the provided fly.toml
-fly deploy                     # builds remotely if you have no local Docker
-fly open                       # open the deployed URL
-fly logs                       # watch cold-start / health checks / OOM
-```
-
-After idle, `fly status` should show the machine **stopped**; the next request cold-starts
-it within the health-check grace period.
-
-## Layout
-
-```
-app.py              Streamlit UI (entrypoint)
-tomography_uq.py    run_simple_uq(params, log_callback) — the parameterized pipeline
-senDOE/             vendored snapshot of the research package (see SENDOE_VENDOR.md)
-Dockerfile          ubuntu:22.04 + idaes get-extensions + fail-fast smoke tests
-fly.toml            Fly.io scale-to-zero config
-requirements.txt    pinned Python dependencies
-.streamlit/         Streamlit server config
-```
+- A full run at the default size takes **a few minutes** — two optimization solves plus a
+  sensitivity analysis. Keep the browser tab open while it works.
+- Everything runs on a built-in synthetic phantom; there is no uploading of real scans or images.
+- This is a focused demonstration of sensitivity-based uncertainty quantification for
+  tomographic reconstruction, built around one fixed pipeline.
