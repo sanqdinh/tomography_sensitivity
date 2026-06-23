@@ -6,11 +6,11 @@ Two modes share one page:
    out as picture | dials/buttons | sequence table. The read-only table is the single measurement
    sequence; the picture is a *derived view* — the cumulative dose-response degradation
    (``pixel·exp(-α·I_local - β·I_local²)``) of the first ``view_k`` measurements. Sliders compose
-   the next measurement (angle, radial offset, #beams); **Take measurement** applies it and
-   appends a table row, **Reset** clears the sequence. **Previous/Next Measurement** scrub
-   ``view_k`` over ``0..N`` to replay the history: the picture shows that step, its beams are
-   traced in red, and the table highlights that row. This runs entirely in the browser — no
-   solver needed.
+   the next measurement (angle, radial offset, #beams) — previewed live as **red** dashes;
+   **Take measurement** applies it and appends a table row, **Reset** clears the sequence.
+   **Previous/Next Measurement** scrub ``view_k`` over ``0..N`` to replay the history: the
+   picture shows that step, the viewed measurement's beams are traced in **blue**, and the table
+   highlights that row. This runs entirely in the browser — no solver needed.
 
 2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (two IPOPT solves + a
    k_aug sensitivity extraction, minutes at the default size). It solves **exactly** the table's
@@ -138,9 +138,14 @@ def _bundle_r_values(offset: float, n_beams: int, image_res: int) -> list:
     return [float(r) for r in rs if abs(r) <= r_max]
 
 
-def _live_figure(img, image_res, angle_deg, offset, n_beams, beams_visible,
-                 measurements_done, vmin, vmax):
-    """Large central grayscale image + colorbar + dynamic title + optional red beam overlay."""
+def _live_figure(img, image_res, measurements_done, vmin, vmax,
+                 preview=None, committed=None, beams_visible=True):
+    """Large central grayscale image + colorbar + dynamic title with optional beam overlays.
+
+    ``preview`` / ``committed`` are ``(angle_deg, offset, n_beams)`` bundles or ``None``. When
+    ``beams_visible``: the committed (viewed) measurement is drawn in **blue** dashes and the
+    next-measurement preview (live sliders) in **red** dashes, on top.
+    """
     h, w = img.shape
     extent = [-w / 2, w / 2, -h / 2, h / 2]
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
@@ -156,12 +161,20 @@ def _live_figure(img, image_res, angle_deg, offset, n_beams, beams_visible,
     if beams_visible:
         seg_n = 200
         seg_range = [-(seg_n - 1) / 2.0, (seg_n - 1) / 2.0]
-        for r in _bundle_r_values(offset, n_beams, image_res):
-            seg = get_segment_polar(
-                r_distance=r, angle=np.deg2rad(angle_deg),
-                seg_range=seg_range, num_points=seg_n,
-            )
-            ax.plot(seg[:, 0], seg[:, 1], "r--", linewidth=0.8)
+
+        def _draw(bundle, color):
+            if bundle is None:
+                return
+            angle_deg, offset, n_beams = bundle
+            for r in _bundle_r_values(offset, n_beams, image_res):
+                seg = get_segment_polar(
+                    r_distance=r, angle=np.deg2rad(angle_deg),
+                    seg_range=seg_range, num_points=seg_n,
+                )
+                ax.plot(seg[:, 0], seg[:, 1], color=color, linestyle="--", linewidth=0.8)
+
+        _draw(committed, "blue")  # measurement actually taken (the viewed row)
+        _draw(preview, "red")     # next-measurement preview (sliders), drawn on top
     return fig
 
 
@@ -262,12 +275,12 @@ _view_image = _degraded_image(
     _seq[:_k], float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
     float(st.session_state["live_beta"]), IMAGE_RES,
 )
-# The overlay traces the currently-viewed measurement's beams (none on the clean phantom).
-if _k >= 1:
-    _ov_angle, _ov_offset, _ov_nbeams = _seq[_k - 1]
-    _show_overlay = st.session_state["beams_visible"]
-else:
-    _ov_angle, _ov_offset, _ov_nbeams, _show_overlay = 0.0, 0.0, 0, False
+# Two overlays: red = live next-measurement preview (sliders); blue = the viewed measurement.
+_preview = (
+    float(st.session_state["live_angle"]), float(st.session_state["live_offset"]),
+    int(st.session_state["live_nbeams"]),
+)
+_committed = _seq[_k - 1] if _k >= 1 else None
 
 with left:
     nav = st.columns(2)
@@ -277,12 +290,14 @@ with left:
                   use_container_width=True, disabled=(_k >= _n))
     st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
     _live = _live_figure(
-        _view_image, IMAGE_RES, _ov_angle, _ov_offset, _ov_nbeams,
-        _show_overlay, _k, _vmin, _vmax,
+        _view_image, IMAGE_RES, _k, _vmin, _vmax,
+        preview=_preview, committed=_committed,
+        beams_visible=st.session_state["beams_visible"],
     )
     st.pyplot(_live, use_container_width=True)
     plt.close(_live)
-    st.caption("Red dashes trace the **currently-viewed** measurement's beams.")
+    st.caption("**Red** dashes = next-measurement preview (sliders); **blue** dashes = "
+               "the measurement shown.")
     st.latex(
         r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
         r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
