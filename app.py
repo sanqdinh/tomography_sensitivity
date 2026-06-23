@@ -3,16 +3,19 @@
 Two modes share one page:
 
 1. **Live dose-response simulator** (main area) — an Example10-style interactive playground.
-   A large central grayscale image starts as the Shepp-Logan phantom and progressively
-   *degrades* as you apply X-ray measurements (``pixel·exp(-α·I_local - β·I_local²)``).
-   Sliders set the projection angle, the radial offset of the ray bundle, and the number of
-   beams; a red dashed overlay shows where the rays fall. **Step** degrades the image,
-   **Reset** restores the phantom. This runs entirely in the browser process — no solver needed.
+   The sidebar table is the single measurement sequence; the central grayscale image is a
+   *derived view* of it — the cumulative dose-response degradation (``pixel·exp(-α·I_local -
+   β·I_local²)``) of exactly the table's rows. Sliders compose the next measurement (angle,
+   radial offset, #beams) with a red dashed preview overlay; **Take measurement** applies it and
+   appends a row to the (read-only) table, **Reset** clears the sequence. The image is a derived
+   view of that table, so the two never disagree. This runs entirely in the browser — no solver
+   needed.
 
 2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (two IPOPT solves + a
-   k_aug sensitivity extraction, minutes at the default size). It uses the multi-step geometry
-   from the sidebar table and the live I0/α/β values, then shows the reconstruction prominently
-   plus the full UQ suite (posterior covariance, D-optimality, beam view, streaming solver log).
+   k_aug sensitivity extraction, minutes at the default size). It solves **exactly** the table's
+   sequence (same conversion the live image uses) with the live I0/α/β values, then shows the
+   reconstruction prominently plus the full UQ suite (posterior covariance, D-optimality, beam
+   view, streaming solver log).
 
 Streamlit reruns the whole script on every widget interaction, so the degraded image and the
 solve results are stashed in ``st.session_state`` to survive reruns. The heavy solve runs ONLY
@@ -46,8 +49,8 @@ st.set_page_config(page_title="Tomography Sensitivity UQ", layout="wide")
 
 st.title("Tomographic reconstruction + sensitivity-based UQ")
 st.caption(
-    "Tune the live dose-response simulator below (angle · offset · #beams, I0/α/β) → add steps "
-    "to the geometry table → **Reconstruct** runs the forward + inverse IPOPT solve and k_aug "
+    "Take measurements with the live simulator (each is logged to the sidebar sequence table) → "
+    "**Reconstruct** solves that exact sequence with a forward + inverse IPOPT solve and k_aug "
     "sensitivity for the posterior covariance & D-optimality."
 )
 
@@ -55,16 +58,32 @@ st.caption(
 IMAGE_RES = 30
 
 
-def _default_beam_table() -> pd.DataFrame:
-    """9 evenly-spaced angles over [0, 180), full fan each — reproduces the old default."""
-    angles = np.linspace(0.0, 180.0, 9, endpoint=False)
+def _empty_beam_table() -> pd.DataFrame:
+    """An empty measurement sequence (built up by taking measurements / editing the table)."""
     return pd.DataFrame(
         {
-            "angle_deg": [float(a) for a in angles],
-            "offset": [0.0] * len(angles),
-            "n_beams": [0] * len(angles),  # 0 => full image-width fan
+            "angle_deg": pd.Series([], dtype=float),
+            "offset": pd.Series([], dtype=float),
+            "n_beams": pd.Series([], dtype=int),
         }
     )
+
+
+def _table_to_seq(df: pd.DataFrame) -> tuple:
+    """Table → hashable ``((angle_deg, offset, n_beams), ...)`` measurement sequence.
+
+    Drops rows with no angle and coerces exactly like the Reconstruct geometry build, so the
+    derived live image and the solved geometry are guaranteed identical. ``n_beams == 0`` keeps
+    the full-fan sentinel.
+    """
+    df = df.dropna(subset=["angle_deg"])
+    seq = []
+    for _, row in df.iterrows():
+        nb = row["n_beams"]
+        nb = 0 if pd.isna(nb) else max(int(nb), 0)
+        off = 0.0 if pd.isna(row["offset"]) else float(row["offset"])
+        seq.append((float(row["angle_deg"]), off, int(nb)))
+    return tuple(seq)
 
 
 # --- live simulator helpers (pure frontend; reuse vendored geometry) -------------------
@@ -145,44 +164,27 @@ def _live_figure(img, image_res, angle_deg, offset, n_beams, beams_visible,
     return fig
 
 
-def _seed_live_state(image_res: int) -> None:
-    """(Re)build the live degraded image as the phantom at this resolution; reset the counter."""
-    st.session_state["current_image"] = _phantom(int(image_res)).copy()
-    st.session_state["measurements_done"] = 0
-    st.session_state["live_res"] = int(image_res)
+@st.cache_data(show_spinner=False)
+def _degraded_image(seq: tuple, I0: float, alpha: float, beta: float,
+                    image_res: int) -> np.ndarray:
+    """Cumulative dose-response degradation of the phantom over the measurement sequence.
+
+    Pure function of the table (``seq``) + global dose params, so the live image is always an
+    exact view of the table. Cached: dragging the angle slider (overlay only) is a cache hit;
+    only taking/editing a measurement or changing I0/α/β recomputes.
+    """
+    img = _phantom(image_res).copy()
+    for angle_deg, offset, n_beams in seq:
+        theta = np.deg2rad(angle_deg)
+        for r in _bundle_r_values(offset, n_beams, image_res):
+            img = _degradation_dose_response(img, r, theta, I0, alpha, beta)
+    return img
 
 
 # --- live simulator button callbacks (fire before the rerun body; read live_* keys) ----
 
-def _degrade_once(img):
-    """One measurement = degrade along every (clamped) ray in the current bundle."""
-    s = st.session_state
-    rs = _bundle_r_values(s["live_offset"], s["live_nbeams"], s["live_res"])
-    theta = np.deg2rad(s["live_angle"])
-    out = img
-    for r in rs:
-        out = _degradation_dose_response(
-            out, r, theta, s["live_I0"], s["live_alpha"], s["live_beta"]
-        )
-    return out
-
-
 def _cb_step():
-    s = st.session_state
-    s["current_image"] = _degrade_once(s["current_image"])
-    s["measurements_done"] += 1
-
-
-def _cb_reset():
-    _seed_live_state(st.session_state["live_res"])
-
-
-def _cb_toggle():
-    st.session_state["beams_visible"] = not st.session_state["beams_visible"]
-
-
-def _cb_add_as_step():
-    """Append the current live slider config to the multi-step geometry table."""
+    """Take a measurement: append the current slider bundle as a row in the sequence table."""
     s = st.session_state
     new_row = pd.DataFrame(
         [{
@@ -194,66 +196,58 @@ def _cb_add_as_step():
     s["beam_table"] = pd.concat([s["beam_table"], new_row], ignore_index=True)
 
 
+def _cb_reset():
+    """Clear the sequence — back to the clean phantom."""
+    st.session_state["beam_table"] = _empty_beam_table()
+
+
+def _cb_toggle():
+    st.session_state["beams_visible"] = not st.session_state["beams_visible"]
+
+
 # --- session state seeding -------------------------------------------------------------
 if "beam_table" not in st.session_state:
-    st.session_state["beam_table"] = _default_beam_table()
+    st.session_state["beam_table"] = _empty_beam_table()
 st.session_state.setdefault("beams_visible", True)
 # Live control values live in session_state so the central figure (rendered before the
 # widgets exist in script order) can read them, and callbacks have a single source of truth.
 for _k, _v in {
-    "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 20,
-    "live_I0": 2.0, "live_alpha": 0.3, "live_beta": 0.01,
+    "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 48,
+    "live_I0": 0.0, "live_alpha": 0.3, "live_beta": 0.01,
 }.items():
     st.session_state.setdefault(_k, _v)
 
 
-# --- sidebar: the measurement-sequence table (the only sidebar control) ----------------
-with st.sidebar:
-    st.header("Measurement sequence")
-    st.caption(
-        "One row per projection **step** — angle (°), offset (bundle center), #beams "
-        "(0 = full fan). Edit directly or use **➕ Add as step**."
-    )
-    edited = st.data_editor(
-        st.session_state["beam_table"],
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "angle_deg": st.column_config.NumberColumn("Angle °", step=1.0, format="%.2f"),
-            "offset": st.column_config.NumberColumn("Offset", step=0.5, format="%.2f"),
-            "n_beams": st.column_config.NumberColumn(
-                "# Beams", min_value=0, step=1, format="%d",
-                help="0 = full image-width fan",
-            ),
-        },
-    )
-    st.session_state["beam_table"] = edited
-
-# Seed the live degraded image once (resolution is fixed at IMAGE_RES).
-if "current_image" not in st.session_state:
-    _seed_live_state(IMAGE_RES)
-
-# --- main: live dose-response simulator ------------------------------------------------
-left, right = st.columns([3, 2])
+# --- main: live dose-response simulator (the image is a derived view of the table) -----
+# image (left) | live-simulator dials + buttons (middle) | measurement-sequence table (right)
+left, mid, right = st.columns([3, 2, 2])
 
 _ph = _phantom(IMAGE_RES)
 _vmin, _vmax = float(_ph.min()), float(_ph.max())
 
+# The single source of truth: the table → sequence → cumulative degraded image.
+_seq = _table_to_seq(st.session_state["beam_table"])
+_current_image = _degraded_image(
+    _seq, float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
+    float(st.session_state["live_beta"]), IMAGE_RES,
+)
+
 with left:
     _live = _live_figure(
-        st.session_state["current_image"], IMAGE_RES,
+        _current_image, IMAGE_RES,
         st.session_state["live_angle"], st.session_state["live_offset"],
         st.session_state["live_nbeams"], st.session_state["beams_visible"],
-        st.session_state["measurements_done"], _vmin, _vmax,
+        len(_seq), _vmin, _vmax,
     )
     st.pyplot(_live, use_container_width=True)
     plt.close(_live)
+    st.caption("Red dashes preview the **next** measurement; the table is the committed sequence.")
     st.latex(
         r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
         r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
     )
 
-with right:
+with mid:
     st.subheader("Live simulator")
     st.slider("Angle (deg)", 0.0, 180.0, step=1.0, key="live_angle")
     st.slider("Offset (bundle center)", -24.0, 24.0, step=0.5, key="live_offset",
@@ -268,35 +262,46 @@ with right:
     cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
 
     b = st.columns(3)
-    b[0].button("Step", on_click=_cb_step, use_container_width=True,
-                help="Apply one measurement.")
+    b[0].button("➕ Take measurement", on_click=_cb_step, use_container_width=True,
+                help="Apply a measurement at the current angle/offset/#beams and append it to "
+                     "the sequence table.")
     b[1].button("Reset", on_click=_cb_reset, use_container_width=True,
-                help="Restore the phantom.")
+                help="Clear the sequence — back to the clean phantom.")
     b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
-    a = st.columns(2)
-    a[0].button("➕ Add as step", on_click=_cb_add_as_step, use_container_width=True,
-                help="Append this angle/offset/#beams as a row in the table.")
-    reconstruct_clicked = a[1].button("Reconstruct", type="primary",
-                                      use_container_width=True)
-    st.caption("⏱️ Reconstruct takes minutes. It uses the live I0/α/β; set I0=0 for the "
-               "Example2-identical reconstruction.")
+    reconstruct_clicked = st.button("Reconstruct", type="primary",
+                                    use_container_width=True)
+    st.caption("⏱️ Reconstruct solves exactly the table's sequence (minutes). It uses the live "
+               "I0/α/β; set I0=0 for the Example2-identical reconstruction.")
+
+with right:
+    st.subheader("Measurement sequence")
+    st.caption(
+        "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
+        "(0 = full fan). Use **➕ Take measurement** / **Reset** to change it."
+    )
+    # Read-only view (st.dataframe, not st.data_editor) so the sequence can't be edited by an
+    # accidental click — it is driven solely by the Take measurement / Reset buttons.
+    st.dataframe(
+        st.session_state["beam_table"],
+        use_container_width=True,
+        column_config={
+            "angle_deg": st.column_config.NumberColumn("Angle °", format="%.2f"),
+            "offset": st.column_config.NumberColumn("Offset", format="%.2f"),
+            "n_beams": st.column_config.NumberColumn("# Beams", format="%d"),
+        },
+    )
 
 st.divider()
 
 # --- heavy solve: only on Reconstruct press --------------------------------------------
 if reconstruct_clicked:
-    # Convert the edited table into beam steps (drop rows with no angle).
-    df = st.session_state["beam_table"].dropna(subset=["angle_deg"])
-    steps: list[BeamStep] = []
-    for _, row in df.iterrows():
-        nb = row["n_beams"]
-        nb = 0 if pd.isna(nb) else max(int(nb), 0)  # 0 = full fan sentinel
-        off = 0.0 if pd.isna(row["offset"]) else float(row["offset"])
-        steps.append(BeamStep(angle_deg=float(row["angle_deg"]), offset=off, n_beams=nb))
+    # Same table → sequence conversion the live image uses, so the solve matches the picture.
+    steps = [BeamStep(angle_deg=a, offset=o, n_beams=n)
+             for (a, o, n) in _table_to_seq(st.session_state["beam_table"])]
 
     if not steps:
-        st.error("Add at least one beam step — the geometry table is empty.")
+        st.error("Take at least one measurement (or add a table row) before reconstructing.")
         st.stop()
 
     # Cost guard: k_aug parameters span the full (unique r × unique angle × time) product,
