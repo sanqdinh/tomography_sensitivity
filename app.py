@@ -12,8 +12,9 @@ Two modes share one page:
    picture shows that step, the viewed measurement's beams are traced in **blue**, and the table
    highlights that row. This runs entirely in the browser — no solver needed.
 
-2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (two IPOPT solves + a
-   k_aug sensitivity extraction, minutes at the default size). It solves **exactly** the table's
+2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (a forward + inverse
+   optimization plus a sensitivity extraction, minutes at the default size). It solves **exactly**
+   the table's
    sequence (same conversion the live image uses) with the live I0/α/β values, then shows the
    reconstruction prominently plus the full UQ suite (posterior covariance, D-optimality, beam
    view, streaming solver log).
@@ -215,6 +216,40 @@ def _normalize_result_fig(fig):
     return fig
 
 
+def _render_results(slot, results):
+    """Render the Reconstruct output (banner + 2×2 figure grid) into a fixed placeholder.
+
+    Rendering through a slot lets a fresh Reconstruct clear the previous output up-front, so the
+    old figures disappear while the new solve runs instead of lingering underneath.
+    """
+    with slot.container():
+        if results is None:
+            st.info("Tune the live simulator and build the sequence, then click **Reconstruct** "
+                    "to run the solve.")
+            return
+        st.success(
+            f"**D-optimality = {results.d_optimality:.4f}**  ·  "
+            f"forward: {results.forward_solver_status} ({results.forward_linear_solver})  ·  "
+            f"inverse: {results.inverse_solver_status} ({results.inverse_linear_solver})  ·  "
+            f"{results.n_free_image0} free pixels  ·  "
+            f"{results.n_user_rays} rays / {results.n_sinogram_measurements} sensitivity params"
+        )
+        # Tile the four figures 2×2 with identical data-image size. Only the covariance carries a
+        # colorbar; reserving the same colorbar slot on every figure keeps the actual image equal.
+        for _f in (results.fig_phantom, results.fig_nlp, results.fig_covariance, results.fig_beams):
+            _normalize_result_fig(_f)
+        r1 = st.columns(2)
+        r1[0].pyplot(results.fig_phantom, use_container_width=True)
+        r1[0].caption("Original phantom")
+        r1[1].pyplot(results.fig_nlp, use_container_width=True)
+        r1[1].caption("Reconstruction (NLP)")
+        r2 = st.columns(2)
+        r2[0].pyplot(results.fig_covariance, use_container_width=True)
+        r2[0].caption("Posterior covariance (log10 diagonal)")
+        r2[1].pyplot(results.fig_beams, use_container_width=True)
+        r2[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
+
+
 @st.cache_data(show_spinner=False)
 def _degraded_image(seq: tuple, I0: float, alpha: float, beta: float,
                     image_res: int) -> np.ndarray:
@@ -331,16 +366,16 @@ with left:
 with mid:
     st.subheader("Live simulator")
     st.caption("Set the projection below, then **➕ Take measurement** to add it to the sequence.")
-    st.slider("Angle (deg)", 0.0, 180.0, step=1.0, key="live_angle")
+    st.slider("Angle (deg)", 0.0, 359.0, step=1.0, key="live_angle")
     st.slider("Offset (bundle center)", -24.0, 24.0, step=0.5, key="live_offset",
               help="Radial center of the ray bundle (image units). Rays outside the grid are "
                    "dropped.")
     st.slider("# Beams", 1, 48, step=1, key="live_nbeams",
               help="Rays spaced one image-unit apart, centered at the offset.")
     cc = st.columns(3)
-    cc[0].number_input("I0", step=0.5, key="live_I0",
-                       help="Beam intensity. 0 → no dose degradation (the image is not darkened "
-                            "by measurements).")
+    cc[0].number_input("I0", min_value=0.0, step=0.5, key="live_I0",
+                       help="Beam intensity (≥ 0). 0 → no dose degradation (the image is not "
+                            "darkened by measurements).")
     cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
     cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
 
@@ -382,6 +417,12 @@ with right:
 
 st.divider()
 
+# Fixed placeholders so a fresh Reconstruct clears the previous output up-front: reaching these
+# empty() slots on the rerun removes the old figures *before* the (minutes-long) solve, so they
+# vanish while it runs instead of lingering underneath. Results are filled back in below.
+_log_slot = st.empty()
+_results_slot = st.empty()
+
 # --- heavy solve: only on Reconstruct press --------------------------------------------
 if reconstruct_clicked:
     # Same table → sequence conversion the live image uses, so the solve matches the picture.
@@ -389,10 +430,12 @@ if reconstruct_clicked:
              for (a, o, n) in _table_to_seq(st.session_state["beam_table"])]
 
     if not steps:
-        st.error("Take at least one measurement (or add a table row) before reconstructing.")
+        st.session_state.pop("results", None)
+        _results_slot.error("Take at least one measurement (or add a table row) before "
+                            "reconstructing.")
         st.stop()
 
-    # Cost guard: k_aug parameters span the full (unique r × unique angle × time) product,
+    # Cost guard: sensitivity parameters span the full (unique r × unique angle × time) product,
     # so fractional offsets that don't reuse the detector grid inflate cost quadratically.
     _rmax = IMAGE_RES / 2 - 0.5 + 1e-9
     uniq_r, uniq_ang, total_rays = set(), set(), 0
@@ -403,12 +446,6 @@ if reconstruct_clicked:
         uniq_r.update(round(r, 6) for r in rv)
         uniq_ang.add(round(s.angle_deg, 6))
     param_cols = len(uniq_r) * len(uniq_ang) * (len(steps) + 1)
-    if param_cols > 5000 or total_rays > 2000:
-        st.warning(
-            f"⚠️ ~{param_cols:,} k_aug parameter columns / {total_rays:,} rays — the "
-            "sensitivity + covariance step may take many minutes or run out of memory. "
-            "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
-        )
 
     # noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
     params = UQParams(
@@ -420,49 +457,30 @@ if reconstruct_clicked:
         beam_steps=steps,
     )
 
-    st.subheader("Solver log")
-    log_box = st.empty()
-    log_lines: list[str] = []
+    with _log_slot.container():
+        if param_cols > 5000 or total_rays > 2000:
+            st.warning(
+                f"⚠️ ~{param_cols:,} sensitivity parameter columns / {total_rays:,} rays — the "
+                "sensitivity + covariance step may take many minutes or run out of memory. "
+                "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
+            )
+        st.subheader("Solver log (inverse solve)")
+        log_box = st.empty()
+        log_lines: list[str] = []
 
-    def log_callback(chunk: str) -> None:
-        log_lines.append(chunk)
-        # Show a rolling tail so very long IPOPT logs stay responsive in the browser.
-        log_box.code("".join(log_lines)[-8000:], language="text")
+        def log_callback(chunk: str) -> None:
+            log_lines.append(chunk)
+            # Show a rolling tail so very long solver logs stay responsive in the browser.
+            log_box.code("".join(log_lines)[-8000:], language="text")
 
-    with st.spinner("Solving forward + inverse NLP and extracting k_aug sensitivity…"):
-        try:
-            results = run_simple_uq(params, log_callback=log_callback)
-            st.session_state["results"] = results
-        except Exception as exc:  # surface failures instead of a blank page
-            st.session_state.pop("results", None)
-            st.error(f"Run failed: {exc}")
-            st.exception(exc)
+        with st.spinner("Solving forward + inverse problem and extracting sensitivity…"):
+            try:
+                results = run_simple_uq(params, log_callback=log_callback)
+                st.session_state["results"] = results
+            except Exception as exc:  # surface failures instead of a blank page
+                st.session_state.pop("results", None)
+                st.error(f"Run failed: {exc}")
+                st.exception(exc)
 
-# --- render persisted results (survives reruns without re-solving) ---------------------
-results = st.session_state.get("results")
-if results is not None:
-    st.success(
-        f"**D-optimality = {results.d_optimality:.4f}**  ·  "
-        f"forward: {results.forward_solver_status} ({results.forward_linear_solver})  ·  "
-        f"inverse: {results.inverse_solver_status} ({results.inverse_linear_solver})  ·  "
-        f"{results.n_free_image0} free pixels  ·  "
-        f"{results.n_user_rays} rays / {results.n_sinogram_measurements} k_aug params"
-    )
-
-    # Tile the four figures 2×2 with identical data-image size. Only the covariance carries a
-    # colorbar; reserving the same colorbar slot on every figure keeps the actual image equal.
-    for _f in (results.fig_phantom, results.fig_nlp, results.fig_covariance, results.fig_beams):
-        _normalize_result_fig(_f)
-    _r1 = st.columns(2)
-    _r1[0].pyplot(results.fig_phantom, use_container_width=True)
-    _r1[0].caption("Original phantom")
-    _r1[1].pyplot(results.fig_nlp, use_container_width=True)
-    _r1[1].caption("Reconstruction (NLP)")
-    _r2 = st.columns(2)
-    _r2[0].pyplot(results.fig_covariance, use_container_width=True)
-    _r2[0].caption("Posterior covariance (log10 diagonal)")
-    _r2[1].pyplot(results.fig_beams, use_container_width=True)
-    _r2[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
-else:
-    st.info("Tune the live simulator and build the geometry table, then click **Reconstruct** "
-            "to run the solve.")
+# Render current results into the fixed slot (new ones after a solve; persisted on a plain rerun).
+_render_results(_results_slot, st.session_state.get("results"))

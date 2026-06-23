@@ -124,11 +124,12 @@ class _LogWriter:
     def __init__(self, callback: Optional[Callable[[str], None]] = None):
         self._cb = callback
         self._chunks: list[str] = []
+        self.muted = False  # when True, accumulate but do not forward to the callback
 
     def write(self, s: str) -> int:
         if s:
             self._chunks.append(s)
-            if self._cb is not None:
+            if self._cb is not None and not self.muted:
                 try:
                     self._cb(s)
                 except Exception:
@@ -232,6 +233,9 @@ def run_simple_uq(
     UQResults
     """
     writer = _LogWriter(log_callback)
+    # Mute everything up to the inverse solve (geometry setup + forward solve), so the live log
+    # shows only the inverse solve onward. Unmuted just before the inverse-solve marker below.
+    writer.muted = True
 
     image_res = int(params.image_res)
     steps = params.beam_steps
@@ -285,6 +289,8 @@ def run_simple_uq(
         )
 
     # --- forward solve: simulate measurements (Example2 lines 83-87) ------------------
+    # Writer is muted (set at creation), so this forward solve still runs and is captured but is
+    # not forwarded to the live log.
     solver = _make_solver(params)
     writer.write("\n===== FORWARD SOLVE (simulate measurements) =====\n")
     _, fwd_ls, fwd_tc = _solve_with_fallback(solver, sample, writer, params.linear_solver)
@@ -310,6 +316,7 @@ def run_simple_uq(
     sample.obj = pyo.Objective(
         expr=sample.rmse_sinogram_expression + params.tv_weight * sample.tv_expression
     )
+    writer.muted = False  # stream the inverse solve onward to the live log
     writer.write("\n===== INVERSE SOLVE (reconstruct image) =====\n")
     _, inv_ls, inv_tc = _solve_with_fallback(solver, sample, writer, params.linear_solver)
 
@@ -362,7 +369,7 @@ def run_simple_uq(
         ax_beams.legend(loc="upper right", fontsize="small", framealpha=0.7)
 
     # --- sensitivity-based UQ via k_aug (Example2 lines 171-200) ----------------------
-    writer.write("\n===== k_aug SENSITIVITY EXTRACTION =====\n")
+    writer.write("\n===== SENSITIVITY EXTRACTION =====\n")
     sinogram_id_vars = list(sample.sinogram_data.items())
     sinogram_vars = [var for _, var in sinogram_id_vars]
     dimage0_dsinogram = extract_sensitivity_matrix(
