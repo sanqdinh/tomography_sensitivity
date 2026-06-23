@@ -5,18 +5,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Interactive Streamlit app for tomographic reconstruction + sensitivity-based uncertainty
-quantification (UQ). It turns the research example
-`sDOE_senNLP/examples/Example2/Example2_simple_uq.py` into a parameterized, browser-driven
-pipeline. `README.md` covers user-facing setup/deploy in depth; this file is for working
-*in* the code.
+quantification (UQ). It started as the research example
+`sDOE_senNLP/examples/Example2/Example2_simple_uq.py` and now lets the user define the
+projection geometry interactively. `README.md` is a high-level project intro (no ops — setup
+lives in `Dockerfile`/`fly.toml`); this file is for working *in* the code.
 
 ## Architecture (three layers, read top-down)
 
-1. **`app.py`** — Streamlit UI and the only entrypoint. Sidebar widgets → `UQParams`; the
-   heavy solve runs **only on the Run button press**. Streamlit re-executes the whole
-   script on every widget interaction, so results are stashed in
-   `st.session_state["results"]` to survive reruns without re-solving. IPOPT output streams
-   live to a `log_callback` that renders a rolling tail (last 8000 chars).
+1. **`app.py`** — Streamlit UI and the only entrypoint. Sidebar → `UQParams`; the geometry is
+   an editable `st.data_editor` beam table (one row per step: angle / offset / #beams) persisted
+   in `st.session_state["beam_table"]`, with a live matplotlib dial preview that updates on every
+   edit (not gated on Run). The heavy solve runs **only on the Run button press**. Streamlit
+   re-executes the whole script on every widget interaction, so results are stashed in
+   `st.session_state["results"]` to survive reruns without re-solving. IPOPT output streams live
+   to a `log_callback` that renders a rolling tail (last 8000 chars).
 
 2. **`tomography_uq.py`** — `run_simple_uq(params: UQParams, log_callback=None) -> UQResults`,
    the parameterized re-implementation of Example2. Contract it deliberately upholds: takes
@@ -30,10 +32,10 @@ pipeline. `README.md` covers user-facing setup/deploy in depth; this file is for
    provenance. To refresh, re-copy the exact 8-file import subset and bump the commit hash in
    `SENDOE_VENDOR.md`. The pieces actually used:
    - `models/tomography_pyomo_pixel_intersection.py` — builds the Pyomo model
-     (`create_sample_model`, `add_beam_constraints_pyomo`, sinogram-RMSE / total-variation
-     objective expressions, `extract_sinogram_value`). `image[ix, iy, time]` is the decision
-     variable; the `time==0` slice is fixed to the phantom for the forward solve and freed
-     for the inverse solve.
+     (`create_sample_model`, `add_beam_constraints_pyomo` — accepts arbitrary `(r, theta)`
+     measurement lists — sinogram-RMSE / total-variation objective expressions). `image[ix, iy,
+     time]` is the decision variable; the `time==0` slice is fixed to the phantom for the forward
+     solve and freed for the inverse solve.
    - `helpers/geometry.py` — Radon transform via line / pixel-grid intersection.
    - `helpers/statistics.py` — `d_optimality` and related design criteria (log-det via
      Cholesky / eigendecomposition / stochastic-Lanczos).
@@ -41,11 +43,26 @@ pipeline. `README.md` covers user-facing setup/deploy in depth; this file is for
      backend) for the dx/dp Jacobian.
 
 ### Pipeline inside `run_simple_uq`
-Forward IPOPT solve (simulate a sinogram from a Shepp-Logan phantom) → inverse IPOPT solve
-(reconstruct `image[:, :, 0]` via sinogram RMSE + total-variation) → classical FBP
-(`iradon`) and SART baselines → **k_aug** extracts `d(image0)/d(sinogram)`; posterior
-covariance `= J·(σ²·I)·Jᵀ`, yielding the per-pixel log-covariance map and the scalar
-**D-optimality**. Note `n_angle = n_horizon − 1` (so the default `n_horizon=10` → 9 angles).
+User-defined geometry (`params.beam_steps`: a list of `BeamStep(angle_deg, offset, n_beams)`) →
+forward IPOPT solve (simulate a sinogram from a Shepp-Logan phantom) → inverse IPOPT solve
+(reconstruct `image[:, :, 0]` via sinogram RMSE + total-variation) → **k_aug** extracts
+`d(image0)/d(sinogram)`; posterior covariance `= J·(σ²·I)·Jᵀ`, yielding the per-pixel
+log-covariance map and the scalar **D-optimality** → a beam/measurement view of the geometry.
+
+Geometry notes:
+- Each beam step is one time index; `n_horizon = len(beam_steps) + 1` (reproduces the old
+  `n_angle = n_horizon − 1`). The default `beam_steps` (9 evenly-spaced angles, full fan) are
+  byte-identical to the previous `linspace` geometry, so default results are unchanged.
+- Per-step rays: `r = offset + (arange(n_beams) − (n_beams−1)/2)`, with `n_beams=0` ⇒ full
+  `image_res` fan. Rays with `abs(r) > image_res/2 − 0.5` are dropped — this guards the vendored
+  `geometry.py` empty-intersection `IndexError`; **do not** remove that clamp.
+- The classical FBP/SART baselines were removed (per-step offsets make the detector grid
+  irregular, which `iradon`/`extract_sinogram_value` assume is uniform). `extract_sinogram_value`
+  is now unused (left in the vendored file).
+- k_aug's param list is the **full** `sinogram_data` product (`r_union × angle_union × time`),
+  not just the real measurements — pre-existing behavior; the covariance self-sizes. Arbitrary
+  *fractional* offsets enlarge `r_union` and thus k_aug cost (`app.py` warns); integer / 0.5-grid
+  offsets reuse the shared detector grid.
 
 ## Native solver dependency (the main gotcha)
 
@@ -63,7 +80,7 @@ pip-installable: **IPOPT** (with HSL) and **k_aug** / **dot_sens**. They come fr
 - Linear-solver fallback order is `ma27 → ma57 → mumps` (`_FALLBACK_LINEAR_SOLVERS`). The
   fallback only switches when a solver **fails to run** (e.g. missing from the build), not on
   a non-optimal termination. **`ma86` is intentionally excluded** — it is not in the IDAES
-  IPOPT build used for deployment, even though the README prose mentions it.
+  IPOPT build used for deployment (`requirements.txt`'s comment about HSL `ma86` notwithstanding).
 - `print_info_string` from Example2 is deliberately omitted — it makes the IDAES IPOPT
   3.13.2 build exit abnormally.
 
@@ -94,6 +111,7 @@ There is **no automated test suite** — the vendored snapshot deliberately excl
 
 ## Cost / sizing
 
-A full run at the default size (`image_res` 30, 9 angles) takes **minutes** — two IPOPT
-solves plus a k_aug extraction. Cost scales ~ `N² · n_horizon`; pushing `image_res` up can
-OOM the default 2 GB Fly VM.
+A full run at the default size (`image_res` 30, 9 beam steps) takes **minutes** — two IPOPT
+solves plus a k_aug extraction. Cost scales ~ `N² · (#beam steps)`, and fractional beam offsets
+further inflate the k_aug parameter count (see geometry notes); pushing any of these up can OOM
+the default 2 GB Fly VM.

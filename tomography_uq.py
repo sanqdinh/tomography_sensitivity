@@ -12,20 +12,25 @@ tomographic uncertainty-quantification pipeline from the research example
 The actual physics/solver building blocks come from the vendored ``senDOE`` package
 (see ``SENDOE_VENDOR.md``). This module does NOT import or modify the original example.
 
-Pipeline (identical in substance to Example2):
+The projection geometry is user-defined: each :class:`BeamStep` is one projection (its own
+angle, radial offset, and number of beams), replacing the old evenly-spaced ``linspace``
+angles. The default ``beam_steps`` reproduce Example2 exactly (9 angles over [0, 180), a
+full ``image_res``-wide fan per angle).
+
+Pipeline (reconstruction/UQ identical in substance to Example2):
     1. forward IPOPT solve simulates measurements (sinogram) from a Shepp-Logan phantom,
     2. inverse IPOPT solve reconstructs ``image[:, :, 0]`` (RMSE + total-variation),
-    3. FBP (``iradon``) and SART reconstructions for comparison,
-    4. k_aug extracts d(image0)/d(sinogram); posterior covariance = J·(σ²·I)·Jᵀ,
-       from which the log10 covariance map and the D-optimality scalar are produced.
+    3. k_aug extracts d(image0)/d(sinogram); posterior covariance = J·(σ²·I)·Jᵀ,
+       from which the log10 covariance map and the D-optimality scalar are produced,
+    4. a beam/measurement view shows the rays of the chosen geometry over the phantom.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import matplotlib
 
@@ -34,7 +39,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pyomo.environ as pyo  # noqa: E402
-from skimage.transform import iradon, iradon_sart, resize  # noqa: E402
+from skimage.transform import resize  # noqa: E402
 from skimage.data import shepp_logan_phantom  # noqa: E402
 
 from senDOE.models.tomography_pyomo_pixel_intersection import (  # noqa: E402
@@ -43,7 +48,6 @@ from senDOE.models.tomography_pyomo_pixel_intersection import (  # noqa: E402
     update_sinogram_rmse_expression,
     update_image_TV_expression,
     add_beam_constraints_pyomo,
-    extract_sinogram_value,
     hamming_window,
     update_image_weigth,
 )
@@ -59,11 +63,32 @@ _FALLBACK_LINEAR_SOLVERS = ["ma27", "ma57", "mumps"]
 
 
 @dataclass
+class BeamStep:
+    """One projection step of the user-defined geometry.
+
+    Each step contributes ``n_beams`` parallel rays at ``angle_deg``, spaced one image-unit
+    apart and centered at ``offset`` (radial position of the bundle). ``n_beams == 0`` is a
+    sentinel meaning "use the full ``image_res``-wide fan" (resolved in :func:`run_simple_uq`).
+    """
+
+    angle_deg: float
+    offset: float = 0.0  # radial center of the ray bundle, image units
+    n_beams: int = 0  # 0 => default to image_res at build time
+
+
+def _default_beam_steps() -> List[BeamStep]:
+    """Default geometry: 9 evenly-spaced angles over [0, 180), full fan each.
+
+    Reproduces Example2's old ``n_horizon=10`` (n_angle=9) evenly-spaced projections exactly.
+    """
+    return [BeamStep(float(a), 0.0, 0) for a in np.linspace(0.0, 180.0, 9, endpoint=False)]
+
+
+@dataclass
 class UQParams:
     """Tunable inputs for :func:`run_simple_uq` (defaults reproduce Example2 exactly)."""
 
     image_res: int = 30
-    n_horizon: int = 10  # number of time steps; n_angle = n_horizon - 1
     I0: float = 0.0  # initial beam intensity (0 => no dose degradation)
     alpha: float = 0.3  # alpha_Dose_Response (linear degradation coefficient)
     beta: float = 0.01  # beta_Rose_Response (quadratic degradation coefficient)
@@ -71,27 +96,26 @@ class UQParams:
     noise_cov_scale: float = 10.0  # measurement noise covariance = scale * I
     ipopt_max_iter: int = 1000
     linear_solver: str = "ma27"
-    angle_start: float = 0.0  # degrees
-    angle_stop: float = 180.0  # degrees (angles spaced over [start, stop), endpoint excluded)
+    # User-defined projection geometry; one BeamStep per time step (n_horizon = len + 1).
+    beam_steps: List[BeamStep] = field(default_factory=_default_beam_steps)
 
 
 @dataclass
 class UQResults:
-    """Everything :func:`run_simple_uq` produces: six figures + scalar metrics."""
+    """Everything :func:`run_simple_uq` produces: four figures + scalar metrics."""
 
-    fig_sinogram: "plt.Figure"
     fig_phantom: "plt.Figure"
     fig_nlp: "plt.Figure"
-    fig_fbp: "plt.Figure"
-    fig_sart: "plt.Figure"
     fig_covariance: "plt.Figure"
+    fig_beams: "plt.Figure"
     d_optimality: float
     forward_solver_status: str
     inverse_solver_status: str
     forward_linear_solver: str
     inverse_linear_solver: str
     n_free_image0: int
-    n_sinogram_measurements: int
+    n_sinogram_measurements: int  # full sinogram_data product (k_aug param columns)
+    n_user_rays: int  # rays actually placed by the user geometry (after clamping)
 
 
 class _LogWriter:
@@ -210,10 +234,13 @@ def run_simple_uq(
     writer = _LogWriter(log_callback)
 
     image_res = int(params.image_res)
-    n_horizon = int(params.n_horizon)
-    n_angle = n_horizon - 1
-    if n_angle < 1:
-        raise ValueError("n_horizon must be >= 2 (need at least one projection angle).")
+    steps = params.beam_steps
+    if len(steps) < 1:
+        raise ValueError("Need at least one beam step (the geometry is empty).")
+    # Each step is one time index; the model needs an extra trailing time step (the final
+    # dynamic-constraint target), so n_horizon = (#steps) + 1.  This reproduces the old
+    # n_angle = n_horizon - 1 mapping.
+    n_horizon = len(steps) + 1
 
     # --- geometry & phantom (Example2 lines 44-75) ------------------------------------
     phantom = shepp_logan_phantom()
@@ -222,21 +249,35 @@ def run_simple_uq(
     sample = create_sample_model(n_horizon=n_horizon, image_res=image_res)
     load_image_to_sample(sample, phantom)
 
-    r_interval_set = np.linspace(-image_res / 2 + 0.5, image_res / 2 - 0.5, image_res)
-    angle_set = np.linspace(params.angle_start, params.angle_stop, n_angle, endpoint=False)
-
+    # Build each user-defined projection step.  Rays are spaced one image-unit apart,
+    # centered at the step's offset; offset=0 / n_beams=image_res reproduces the old
+    # full fan (np.linspace(-N/2+0.5, N/2-0.5, N)) exactly.  Rays whose distance from
+    # center reaches the image boundary are dropped to avoid the vendored geometry's
+    # empty-intersection IndexError (senDOE/helpers/geometry.py).
+    _R_MAX = image_res / 2 - 0.5 + 1e-9
     measurement_set = []
-    for time in range(n_angle):
-        degree = angle_set[time]
+    for i, step in enumerate(steps):
+        n_beams = step.n_beams if step.n_beams and step.n_beams > 0 else image_res
+        r_all = step.offset + (np.arange(n_beams) - (n_beams - 1) / 2.0)
+        r_vals = [float(r) for r in r_all if abs(r) <= _R_MAX]
+        dropped = n_beams - len(r_vals)
+        if dropped:
+            writer.write(f"\n[step {i}: dropped {dropped} ray(s) outside the image]\n")
+        if not r_vals:
+            raise ValueError(
+                f"Beam step {i} (angle={step.angle_deg}, offset={step.offset}, "
+                f"n_beams={n_beams}) has no rays inside the image; reduce |offset| "
+                f"or add beams."
+            )
         measurement_set_k = [
-            {"r": float(r), "theta": float(degree * np.pi / 180), "time": time}
-            for r in r_interval_set
+            {"r": r, "theta": float(step.angle_deg * np.pi / 180), "time": i}
+            for r in r_vals
         ]
         measurement_set = measurement_set + measurement_set_k
         sample = add_beam_constraints_pyomo(
             sample,
             measurement_set_k,
-            injection_time=time,
+            injection_time=i,
             I0=params.I0,
             alpha_Dose_Response=params.alpha,
             beta_Rose_Response=params.beta,
@@ -247,22 +288,6 @@ def run_simple_uq(
     solver = _make_solver(params)
     writer.write("\n===== FORWARD SOLVE (simulate measurements) =====\n")
     _, fwd_ls, fwd_tc = _solve_with_fallback(solver, sample, writer, params.linear_solver)
-
-    # --- merged sinogram (Example2 lines 99-114) -------------------------------------
-    sinogram_merged = extract_sinogram_value(sample, time=0)
-    dx, dy = 0.5 * 180.0 / max(phantom.shape), 0.5 / phantom.shape[0]
-    for i in range(1, n_angle):
-        sinogram_merged = sinogram_merged + extract_sinogram_value(sample, time=i)
-
-    fig_sinogram, ax_sino = plt.subplots(figsize=(10, 10))
-    ax_sino.imshow(
-        sinogram_merged,
-        cmap="gray",
-        extent=(-dx, 180.0 + dx, -dy, sinogram_merged.shape[0] + dy),
-        aspect="auto",
-        interpolation="none",
-    )
-    ax_sino.set_title("Sinogram (Merged over time)")
 
     # --- harvest "measured" sinogram values (Example2 lines 116-120) -----------------
     sinogram_data = []
@@ -304,17 +329,37 @@ def run_simple_uq(
     ax_nlp.imshow(image_reconstruct, cmap="gray")
     ax_nlp.set_title("Reconstruction (NLP)")
 
-    # --- classical reconstructions for comparison (Example2 lines 158-168) -----------
-    reconstruction_iradon = iradon(sinogram_merged, theta=angle_set)
-    reconstruction_iradon_sart = iradon_sart(sinogram_merged, theta=angle_set)
-
-    fig_fbp, ax_fbp = plt.subplots(figsize=(10, 10))
-    ax_fbp.imshow(reconstruction_iradon, cmap="gray")
-    ax_fbp.set_title("Reconstruction (FBP)")
-
-    fig_sart, ax_sart = plt.subplots(figsize=(10, 10))
-    ax_sart.imshow(reconstruction_iradon_sart, cmap="gray")
-    ax_sart.set_title("Reconstruction (SART)")
+    # --- beam / measurement view: the chosen geometry over the phantom ----------------
+    # One line per ray (x*cos(theta) + y*sin(theta) = r), colored by projection step.
+    half = image_res / 2.0
+    fig_beams, ax_beams = plt.subplots(figsize=(10, 10))
+    ax_beams.imshow(
+        phantom, cmap="gray", extent=(-half, half, -half, half), origin="upper"
+    )
+    cmap = plt.get_cmap("viridis", max(len(steps), 1))
+    seen_steps = set()
+    for measurement in measurement_set:
+        r = measurement["r"]
+        theta = measurement["theta"]
+        i_step = measurement["time"]
+        ct, st = np.cos(theta), np.sin(theta)
+        px, py = r * ct, r * st  # point on the line nearest the origin
+        dx, dy = -st, ct  # direction along the line
+        x0, y0 = px - image_res * dx, py - image_res * dy
+        x1, y1 = px + image_res * dx, py + image_res * dy
+        label = None
+        if i_step not in seen_steps:
+            label = f"step {i_step}: {steps[i_step].angle_deg:.0f}°"
+            seen_steps.add(i_step)
+        ax_beams.plot(
+            [x0, x1], [y0, y1], lw=0.6, alpha=0.7, color=cmap(i_step), label=label
+        )
+    ax_beams.set_xlim(-half, half)
+    ax_beams.set_ylim(-half, half)
+    ax_beams.set_aspect("equal")
+    ax_beams.set_title("Beam / measurement view (%d rays)" % len(measurement_set))
+    if len(steps) <= 12:
+        ax_beams.legend(loc="upper right", fontsize="small", framealpha=0.7)
 
     # --- sensitivity-based UQ via k_aug (Example2 lines 171-200) ----------------------
     writer.write("\n===== k_aug SENSITIVITY EXTRACTION =====\n")
@@ -350,12 +395,10 @@ def run_simple_uq(
     )
 
     return UQResults(
-        fig_sinogram=fig_sinogram,
         fig_phantom=fig_phantom,
         fig_nlp=fig_nlp,
-        fig_fbp=fig_fbp,
-        fig_sart=fig_sart,
         fig_covariance=fig_covariance,
+        fig_beams=fig_beams,
         d_optimality=float(d_optimality_value),
         forward_solver_status=fwd_tc,
         inverse_solver_status=inv_tc,
@@ -363,6 +406,7 @@ def run_simple_uq(
         inverse_linear_solver=inv_ls,
         n_free_image0=len(image0_vars),
         n_sinogram_measurements=len(sinogram_vars),
+        n_user_rays=len(measurement_set),
     )
 
 
