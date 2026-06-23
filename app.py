@@ -26,13 +26,16 @@ backend: it imports the vendored geometry primitives and re-implements one small
 (the dose-response degradation) for the live preview.
 """
 
+import html as _html
 import os
+import time
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from tomography_uq import UQParams, BeamStep, run_simple_uq
 
@@ -59,6 +62,16 @@ st.caption(
 
 # Fixed sim/reconstruction resolution (was the sidebar slider; equals the UQParams default).
 IMAGE_RES = 30
+
+# Solver-log box: a scrollable monospace div force-scrolled to the bottom on every update. Rendered
+# via components.html (sandboxed iframe) so the trailing <script> actually runs — st.html strips
+# scripts, so it cannot auto-follow. ``{body}`` is the HTML-escaped rolling log tail.
+_LOG_IFRAME = (
+    '<div id="lb" style="height:300px;overflow-y:auto;white-space:pre-wrap;'
+    'font-family:monospace;font-size:12px;line-height:1.3;background:#0e1117;'
+    'color:#d6d6d6;padding:8px;border-radius:6px;">{body}</div>'
+    "<script>var b=document.getElementById('lb');b.scrollTop=b.scrollHeight;</script>"
+)
 
 
 def _empty_beam_table() -> pd.DataFrame:
@@ -192,32 +205,87 @@ def _style_sequence(df: pd.DataFrame, k: int):
     return sty
 
 
-# Result figures: pin the data axes (and reserve a colorbar slot) so all four show the actual
-# image at the same size in the 2×2 grid, regardless of which one carries a colorbar.
-_FIG_MAIN_RECT = (0.06, 0.10, 0.74, 0.74)   # data axes — identical on all four (square)
-_FIG_CBAR_RECT = (0.82, 0.10, 0.04, 0.74)   # colorbar slot — reserved on all; used by covariance
+# Result figures: each backend figure is a square, equal-aspect image (optionally + a colorbar)
+# with a title. We pin two canvases, both rendered with ``bbox_inches=None`` (not Streamlit's
+# default "tight") so margins are honored verbatim:
+#   • Covariance (has a colorbar): a WIDE canvas = square data box + a reserved right strip for the
+#     colorbar and its word labels, with thin margins and a title row above.
+#   • The three colorbar-less figures (phantom / reconstruction / beams): a NEAR-SQUARE canvas with
+#     no right strip, so the image fills the width and there is no blank space on the right.
+# Both canvases share the same data-box size (~8.04in), bottom margin, and title row, so the actual
+# images render at the same scale; only the colorbar-less canvas is narrower. Consequence: the
+# colorbar-less figures have a more-square aspect, so at equal column width they render a bit TALLER
+# than the (wider) covariance figure — that is the cost of dropping the reserved strip.
+_FIG_SIZE = (10.0, 8.8)                          # covariance canvas → square box + colorbar strip
+_FIG_MAIN_RECT = (0.016, 0.0205, 0.804, 0.9136)  # data axes — square box, tight margins, title room above
+_FIG_CBAR_RECT = (0.842, 0.0205, 0.024, 0.9136)  # colorbar slot — matches the image height
+_FIG_SIZE_PLAIN = (8.36, 8.8)                    # colorbar-less canvas → square box, no right strip
+_FIG_MAIN_RECT_PLAIN = (0.0191, 0.0205, 0.9617, 0.9136)  # same ~8.04in box, flush right (no blank strip)
+# The covariance canvas is wider than the plain one (by its colorbar strip). Giving its grid column
+# this same width ratio means both fill their columns at the SAME height and image size — the wider
+# column exactly absorbs the colorbar, so no figure needs a blank reserved strip. (≈1.196.)
+_CBAR_COL_RATIO = _FIG_SIZE[0] / _FIG_SIZE_PLAIN[0]
 
 
 def _normalize_result_fig(fig):
-    """Pin a backend result figure to one layout so its data image matches the others.
+    """Pin a backend result figure to a tight canvas+layout for the result grid.
 
-    The four figures are square ``figsize=(10,10)`` with square, equal-aspect data; ``subplots``
-    makes the data axes ``fig.axes[0]`` and ``fig.colorbar`` appends the colorbar as
-    ``fig.axes[1]``. Forcing the data axes to a fixed square rect (and any colorbar axes to the
-    reserved strip) makes the actual image identical on all four — the three without a colorbar
-    just leave that strip blank. Idempotent (adds no axes), so safe to call on every rerun.
+    The backend figures are ``figsize=(10,10)`` with square, equal-aspect data; ``subplots`` makes
+    the data axes ``fig.axes[0]`` and ``fig.colorbar`` appends the colorbar as ``fig.axes[1]``.
+    Figures *with* a colorbar get the wide canvas (square data box + reserved colorbar strip);
+    colorbar-less figures get the near-square canvas so the image fills the width with no blank
+    strip on the right. Idempotent (adds no axes), so safe to call on every rerun. Must be rendered
+    with ``bbox_inches=None`` so the chosen margins survive.
     """
     axes = fig.axes
     if not axes:
         return fig
-    axes[0].set_position(_FIG_MAIN_RECT)   # data axes (created first by subplots)
+    has_cbar = len(axes) > 1                 # fig.colorbar appended a second axes ⇒ this is covariance
+    if has_cbar:
+        fig.set_size_inches(*_FIG_SIZE)
+        axes[0].set_position(_FIG_MAIN_RECT)
+    else:
+        fig.set_size_inches(*_FIG_SIZE_PLAIN)  # narrower canvas, no reserved colorbar strip
+        axes[0].set_position(_FIG_MAIN_RECT_PLAIN)
+    axes[0].set_xticks([])                  # drop the number labels on every result image
+    axes[0].set_yticks([])                  # (the backend title is kept; canvas reserves a title row)
     for extra in axes[1:]:                  # colorbar axes (appended by fig.colorbar)
-        extra.set_position(_FIG_CBAR_RECT)
+        extra.set_box_aspect(None)          # clear the colorbar's fixed length:width aspect (default 20)
+        extra.set_aspect("auto")            # — otherwise it redraws at 20×width (≈4.8in) centered, far
+        extra.set_position(_FIG_CBAR_RECT)  # shorter than the image; now it fills the strip's full height
+    return fig
+
+
+def _style_covariance_fig(fig):
+    """Frontend-only restyle of the baked covariance figure: set a friendly title and replace the
+    colorbar's numeric ticks with two words.
+
+    Overrides the backend title ("Covariance of Initial Image Variables (d=…)") with a clearer one.
+    Uses the ``Colorbar`` object API (``cbar.set_ticks``/``set_ticklabels``), which installs a
+    fixed locator/formatter that survives the redraw ``st.pyplot`` triggers — setting ticks on the
+    raw colorbar axes would be overridden on draw. Idempotent across reruns (overwrites, never
+    appends).
+    """
+    axes = fig.axes
+    if not axes:
+        return fig
+    axes[0].set_title("Posterior covariance — per-pixel uncertainty")
+    imgs = axes[0].get_images()
+    if imgs and imgs[0].colorbar is not None:   # relabel the colorbar with words, not values
+        im = imgs[0]
+        cbar = im.colorbar
+        lo, hi = im.get_clim()
+        if hi <= lo:                            # degenerate (constant covariance) guard
+            hi = lo + 1e-9
+        pad = 0.02 * (hi - lo)                  # inset off the extremes so labels aren't clipped
+        cbar.set_ticks([lo + pad, hi - pad])
+        cbar.set_ticklabels(["Low\nUncertainty", "High\nUncertainty"])  # two lines, narrower strip
+        cbar.set_label("")
     return fig
 
 
 def _render_results(slot, results):
-    """Render the Reconstruct output (banner + 2×2 figure grid) into a fixed placeholder.
+    """Render the Reconstruct output (banner + two-column figure grid) into a fixed placeholder.
 
     Rendering through a slot lets a fresh Reconstruct clear the previous output up-front, so the
     old figures disappear while the new solve runs instead of lingering underneath.
@@ -234,20 +302,29 @@ def _render_results(slot, results):
             f"{results.n_free_image0} free pixels  ·  "
             f"{results.n_user_rays} rays / {results.n_sinogram_measurements} sensitivity params"
         )
-        # Tile the four figures 2×2 with identical data-image size. Only the covariance carries a
-        # colorbar; reserving the same colorbar slot on every figure keeps the actual image equal.
+        # 2×2 grid: left = original / reconstruction, right = beam view / posterior covariance.
+        # All four share the same ~8.04in data image; the covariance adds a reserved colorbar strip
+        # (wider canvas), while the three colorbar-less figures use a near-square canvas with no
+        # right strip. The covariance is additionally restyled (word ticks on the colorbar).
         for _f in (results.fig_phantom, results.fig_nlp, results.fig_covariance, results.fig_beams):
             _normalize_result_fig(_f)
-        r1 = st.columns(2)
-        r1[0].pyplot(results.fig_phantom, use_container_width=True)
-        r1[0].caption("Original phantom")
-        r1[1].pyplot(results.fig_nlp, use_container_width=True)
-        r1[1].caption("Reconstruction (NLP)")
-        r2 = st.columns(2)
-        r2[0].pyplot(results.fig_covariance, use_container_width=True)
-        r2[0].caption("Posterior covariance (log10 diagonal)")
-        r2[1].pyplot(results.fig_beams, use_container_width=True)
-        r2[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
+        _style_covariance_fig(results.fig_covariance)
+        # Built row by row (not as two stacked columns) so the covariance's column can be wider than
+        # the plain columns by exactly its colorbar strip (_CBAR_COL_RATIO). Each figure fills its own
+        # column (bbox_inches=None keeps its margins verbatim), so there is no blank reserved strip,
+        # yet every figure renders at the same height and image size. The thin spacer in row 1 holds
+        # the width that the covariance colorbar occupies in row 2, keeping the four images aligned.
+        _spacer = _CBAR_COL_RATIO - 1.0
+        row1 = st.columns([1.0, 1.0, _spacer])
+        row1[0].pyplot(results.fig_phantom, use_container_width=True, bbox_inches=None)
+        row1[0].caption("Original phantom")
+        row1[1].pyplot(results.fig_beams, use_container_width=True, bbox_inches=None)
+        row1[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
+        row2 = st.columns([1.0, _CBAR_COL_RATIO])
+        row2[0].pyplot(results.fig_nlp, use_container_width=True, bbox_inches=None)
+        row2[0].caption("Reconstruction (NLP)")
+        row2[1].pyplot(results.fig_covariance, use_container_width=True, bbox_inches=None)
+        row2[1].caption("Posterior covariance — per-pixel uncertainty")
 
 
 @st.cache_data(show_spinner=False)
@@ -387,6 +464,7 @@ with mid:
                 help="Clear the sequence — back to the clean phantom.")
     b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
+    st.subheader("Solver Tuning")
     st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
               help="Total-variation penalty in the reconstruction objective (higher = smoother; "
                    "0 disables it). Used only by Reconstruct.")
@@ -465,13 +543,24 @@ if reconstruct_clicked:
                 "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
             )
         st.subheader("Solver log (inverse solve)")
+        # Fixed-height box that auto-follows the newest line (see _LOG_IFRAME).
         log_box = st.empty()
         log_lines: list[str] = []
+        _last_render = [0.0]
+
+        def _render_log() -> None:
+            # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
+            body = _html.escape("".join(log_lines)[-8000:])
+            log_box.empty()  # drop the prior iframe so they don't stack
+            with log_box.container():
+                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
 
         def log_callback(chunk: str) -> None:
             log_lines.append(chunk)
-            # Show a rolling tail so very long solver logs stay responsive in the browser.
-            log_box.code("".join(log_lines)[-8000:], language="text")
+            now = time.time()
+            if now - _last_render[0] >= 0.2:  # throttle so the iframe rebuild doesn't flicker
+                _last_render[0] = now
+                _render_log()
 
         with st.spinner("Solving forward + inverse problem and extracting sensitivity…"):
             try:
@@ -481,6 +570,8 @@ if reconstruct_clicked:
                 st.session_state.pop("results", None)
                 st.error(f"Run failed: {exc}")
                 st.exception(exc)
+            finally:
+                _render_log()  # final flush: last lines always shown and pinned to the bottom
 
 # Render current results into the fixed slot (new ones after a solve; persisted on a plain rerun).
 _render_results(_results_slot, st.session_state.get("results"))
