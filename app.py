@@ -2,7 +2,7 @@
 
 Two modes share one page:
 
-1. **Live dose-response simulator** (main area) — an Example10-style interactive playground laid
+1. **Live dose-response simulator** (main area) — an interactive playground laid
    out as picture | dials/buttons | sequence table. The read-only table is the single measurement
    sequence; the picture is a *derived view* — the cumulative dose-response degradation
    (``pixel·exp(-α·I_local - β·I_local²)``) of the first ``view_k`` measurements. Sliders compose
@@ -50,9 +50,10 @@ st.set_page_config(page_title="Tomography Sensitivity UQ", layout="wide")
 
 st.title("Tomographic reconstruction + sensitivity-based UQ")
 st.caption(
-    "Take measurements with the live simulator (each is logged to the sidebar sequence table) → "
-    "**Reconstruct** solves that exact sequence with a forward + inverse IPOPT solve and k_aug "
-    "sensitivity for the posterior covariance & D-optimality."
+    "Take X-ray measurements with the live simulator (each is logged to the sequence table on "
+    "the right) → **Reconstruct** solves that exact sequence — a forward solve simulates the "
+    "measurements, an inverse solve recovers the image, and a sensitivity analysis gives the "
+    "per-pixel posterior covariance (uncertainty) and a scalar D-optimality information score."
 )
 
 # Fixed sim/reconstruction resolution (was the sidebar slider; equals the UQParams default).
@@ -338,7 +339,8 @@ with mid:
               help="Rays spaced one image-unit apart, centered at the offset.")
     cc = st.columns(3)
     cc[0].number_input("I0", step=0.5, key="live_I0",
-                       help="Beam intensity. 0 → no dose degradation (Example2 default).")
+                       help="Beam intensity. 0 → no dose degradation (the image is not darkened "
+                            "by measurements).")
     cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
     cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
 
@@ -356,8 +358,8 @@ with mid:
 
     reconstruct_clicked = st.button("Reconstruct", type="primary",
                                     use_container_width=True)
-    st.caption("⏱️ Reconstruct solves exactly the table's sequence (minutes). It uses the live "
-               "I0/α/β; set I0=0 for the Example2-identical reconstruction.")
+    st.caption("⏱️ Reconstruct solves exactly the table's sequence (takes a few minutes). It uses "
+               "the live I0/α/β; set I0=0 to reconstruct without modeling dose degradation.")
 
 with right:
     st.subheader("Measurement sequence")
