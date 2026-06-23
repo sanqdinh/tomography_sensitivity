@@ -2,14 +2,15 @@
 
 Two modes share one page:
 
-1. **Live dose-response simulator** (main area) — an Example10-style interactive playground.
-   The sidebar table is the single measurement sequence; the central grayscale image is a
-   *derived view* of it — the cumulative dose-response degradation (``pixel·exp(-α·I_local -
-   β·I_local²)``) of exactly the table's rows. Sliders compose the next measurement (angle,
-   radial offset, #beams) with a red dashed preview overlay; **Take measurement** applies it and
-   appends a row to the (read-only) table, **Reset** clears the sequence. The image is a derived
-   view of that table, so the two never disagree. This runs entirely in the browser — no solver
-   needed.
+1. **Live dose-response simulator** (main area) — an Example10-style interactive playground laid
+   out as picture | dials/buttons | sequence table. The read-only table is the single measurement
+   sequence; the picture is a *derived view* — the cumulative dose-response degradation
+   (``pixel·exp(-α·I_local - β·I_local²)``) of the first ``view_k`` measurements. Sliders compose
+   the next measurement (angle, radial offset, #beams); **Take measurement** applies it and
+   appends a table row, **Reset** clears the sequence. **Previous/Next Measurement** scrub
+   ``view_k`` over ``0..N`` to replay the history: the picture shows that step, its beams are
+   traced in red, and the table highlights that row. This runs entirely in the browser — no
+   solver needed.
 
 2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (two IPOPT solves + a
    k_aug sensitivity extraction, minutes at the default size). It solves **exactly** the table's
@@ -164,6 +165,18 @@ def _live_figure(img, image_res, angle_deg, offset, n_beams, beams_visible,
     return fig
 
 
+def _style_sequence(df: pd.DataFrame, k: int):
+    """Read-only table styler that highlights the currently-viewed measurement (row k-1)."""
+    sty = df.style
+    if 1 <= k <= len(df):
+        sty = sty.apply(
+            lambda row: ["background-color: #ffe08a; color: #000" if row.name == k - 1 else ""
+                         for _ in row],
+            axis=1,
+        )
+    return sty
+
+
 @st.cache_data(show_spinner=False)
 def _degraded_image(seq: tuple, I0: float, alpha: float, beta: float,
                     image_res: int) -> np.ndarray:
@@ -194,11 +207,24 @@ def _cb_step():
         }]
     )
     s["beam_table"] = pd.concat([s["beam_table"], new_row], ignore_index=True)
+    s["view_k"] = len(s["beam_table"])  # jump the view to the just-taken measurement
 
 
 def _cb_reset():
     """Clear the sequence — back to the clean phantom."""
     st.session_state["beam_table"] = _empty_beam_table()
+    st.session_state["view_k"] = 0
+
+
+def _cb_prev():
+    """Step the view back one measurement."""
+    st.session_state["view_k"] = max(0, int(st.session_state["view_k"]) - 1)
+
+
+def _cb_next():
+    """Step the view forward one measurement (bounded by the sequence length)."""
+    n = len(st.session_state["beam_table"])
+    st.session_state["view_k"] = min(n, int(st.session_state["view_k"]) + 1)
 
 
 def _cb_toggle():
@@ -209,6 +235,7 @@ def _cb_toggle():
 if "beam_table" not in st.session_state:
     st.session_state["beam_table"] = _empty_beam_table()
 st.session_state.setdefault("beams_visible", True)
+st.session_state.setdefault("view_k", 0)  # number of measurements currently displayed
 # Live control values live in session_state so the central figure (rendered before the
 # widgets exist in script order) can read them, and callbacks have a single source of truth.
 for _k, _v in {
@@ -225,23 +252,37 @@ left, mid, right = st.columns([3, 2, 2])
 _ph = _phantom(IMAGE_RES)
 _vmin, _vmax = float(_ph.min()), float(_ph.max())
 
-# The single source of truth: the table → sequence → cumulative degraded image.
+# The single source of truth: the table → sequence. The picture shows the first `_k`
+# measurements (Previous/Next scrub `_k` over 0..N); the table highlights measurement `_k`.
 _seq = _table_to_seq(st.session_state["beam_table"])
-_current_image = _degraded_image(
-    _seq, float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
+_n = len(_seq)
+_k = max(0, min(int(st.session_state["view_k"]), _n))  # clamp (table may have shrunk)
+st.session_state["view_k"] = _k
+_view_image = _degraded_image(
+    _seq[:_k], float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
     float(st.session_state["live_beta"]), IMAGE_RES,
 )
+# The overlay traces the currently-viewed measurement's beams (none on the clean phantom).
+if _k >= 1:
+    _ov_angle, _ov_offset, _ov_nbeams = _seq[_k - 1]
+    _show_overlay = st.session_state["beams_visible"]
+else:
+    _ov_angle, _ov_offset, _ov_nbeams, _show_overlay = 0.0, 0.0, 0, False
 
 with left:
+    nav = st.columns(2)
+    nav[0].button("⬅ Previous Measurement", on_click=_cb_prev,
+                  use_container_width=True, disabled=(_k == 0))
+    nav[1].button("Next Measurement ➡", on_click=_cb_next,
+                  use_container_width=True, disabled=(_k >= _n))
+    st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
     _live = _live_figure(
-        _current_image, IMAGE_RES,
-        st.session_state["live_angle"], st.session_state["live_offset"],
-        st.session_state["live_nbeams"], st.session_state["beams_visible"],
-        len(_seq), _vmin, _vmax,
+        _view_image, IMAGE_RES, _ov_angle, _ov_offset, _ov_nbeams,
+        _show_overlay, _k, _vmin, _vmax,
     )
     st.pyplot(_live, use_container_width=True)
     plt.close(_live)
-    st.caption("Red dashes preview the **next** measurement; the table is the committed sequence.")
+    st.caption("Red dashes trace the **currently-viewed** measurement's beams.")
     st.latex(
         r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
         r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
@@ -249,6 +290,7 @@ with left:
 
 with mid:
     st.subheader("Live simulator")
+    st.caption("Set the projection below, then **➕ Take measurement** to add it to the sequence.")
     st.slider("Angle (deg)", 0.0, 180.0, step=1.0, key="live_angle")
     st.slider("Offset (bundle center)", -24.0, 24.0, step=0.5, key="live_offset",
               help="Radial center of the ray bundle (image units). Rays outside the grid are "
@@ -278,12 +320,13 @@ with right:
     st.subheader("Measurement sequence")
     st.caption(
         "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
-        "(0 = full fan). Use **➕ Take measurement** / **Reset** to change it."
+        "(0 = full fan). The **highlighted** row is the one currently shown on the left."
     )
     # Read-only view (st.dataframe, not st.data_editor) so the sequence can't be edited by an
-    # accidental click — it is driven solely by the Take measurement / Reset buttons.
+    # accidental click — it is driven solely by the Take measurement / Reset buttons. The Styler
+    # highlights the currently-viewed measurement (Previous/Next).
     st.dataframe(
-        st.session_state["beam_table"],
+        _style_sequence(st.session_state["beam_table"], _k),
         use_container_width=True,
         column_config={
             "angle_deg": st.column_config.NumberColumn("Angle °", format="%.2f"),
