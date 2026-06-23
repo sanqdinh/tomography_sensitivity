@@ -6,7 +6,7 @@ Two modes share one page:
    A large central grayscale image starts as the Shepp-Logan phantom and progressively
    *degrades* as you apply X-ray measurements (``pixel·exp(-α·I_local - β·I_local²)``).
    Sliders set the projection angle, the radial offset of the ray bundle, and the number of
-   beams; a red dashed overlay shows where the rays fall. **Step**/**Apply** degrade the image,
+   beams; a red dashed overlay shows where the rays fall. **Step** degrades the image,
    **Reset** restores the phantom. This runs entirely in the browser process — no solver needed.
 
 2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (two IPOPT solves + a
@@ -51,6 +51,9 @@ st.caption(
     "sensitivity for the posterior covariance & D-optimality."
 )
 
+# Fixed sim/reconstruction resolution (was the sidebar slider; equals the UQParams default).
+IMAGE_RES = 30
+
 
 def _default_beam_table() -> pd.DataFrame:
     """9 evenly-spaced angles over [0, 180), full fan each — reproduces the old default."""
@@ -62,41 +65,6 @@ def _default_beam_table() -> pd.DataFrame:
             "n_beams": [0] * len(angles),  # 0 => full image-width fan
         }
     )
-
-
-def _geometry_preview_fig(df: pd.DataFrame, image_res: int):
-    """Render a quick 'where do the beams point' dial from the current table (no solve)."""
-    half = image_res / 2.0
-    fig, ax = plt.subplots(figsize=(3.2, 3.2))
-    ax.add_patch(plt.Circle((0, 0), half, fill=False, color="0.6", lw=1.0))
-    rows = df.dropna(subset=["angle_deg"])
-    cmap = plt.get_cmap("viridis", max(len(rows), 1))
-    for i, (_, row) in enumerate(rows.iterrows()):
-        angle = float(row["angle_deg"])
-        offset = 0.0 if pd.isna(row.get("offset")) else float(row["offset"])
-        nb = row.get("n_beams")
-        nb = image_res if (pd.isna(nb) or int(nb) <= 0) else int(nb)
-        th = np.deg2rad(angle)
-        ct, sn = np.cos(th), np.sin(th)
-        dx, dy = -sn, ct  # direction along each ray
-        for k, rr in enumerate((offset - (nb - 1) / 2.0, offset, offset + (nb - 1) / 2.0)):
-            px, py = rr * ct, rr * sn
-            x0, y0 = px - image_res * dx, py - image_res * dy
-            x1, y1 = px + image_res * dx, py + image_res * dy
-            ax.plot(
-                [x0, x1], [y0, y1],
-                lw=1.3 if k == 1 else 0.5,
-                ls="-" if k == 1 else "--",
-                color=cmap(i), alpha=0.85,
-            )
-    lim = half * 1.05
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
-    ax.set_aspect("equal")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_title("Geometry preview", fontsize=9)
-    return fig
 
 
 # --- live simulator helpers (pure frontend; reuse vendored geometry) -------------------
@@ -209,16 +177,6 @@ def _cb_reset():
     _seed_live_state(st.session_state["live_res"])
 
 
-def _cb_apply():
-    """Reach the Measurements-slider target (Example10 ``apply_n_iterations``)."""
-    s = st.session_state
-    target = int(s["live_measurements"])
-    if target < s["measurements_done"]:  # going down ⇒ reset, then climb
-        _cb_reset()
-    while s["measurements_done"] < target:
-        _cb_step()
-
-
 def _cb_toggle():
     st.session_state["beams_visible"] = not st.session_state["beams_visible"]
 
@@ -244,46 +202,18 @@ st.session_state.setdefault("beams_visible", True)
 # widgets exist in script order) can read them, and callbacks have a single source of truth.
 for _k, _v in {
     "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 20,
-    "live_I0": 2.0, "live_alpha": 0.3, "live_beta": 0.01, "live_measurements": 0,
+    "live_I0": 2.0, "live_alpha": 0.3, "live_beta": 0.01,
 }.items():
     st.session_state.setdefault(_k, _v)
 
 
-# --- sidebar: solver/UQ params + multi-step geometry table -----------------------------
+# --- sidebar: the measurement-sequence table (the only sidebar control) ----------------
 with st.sidebar:
-    st.header("Run parameters")
-    image_res = st.slider(
-        "Image resolution (N×N)", min_value=16, max_value=48, value=30, step=2,
-        help="Pixels per side. Cost grows ~ N² · (#steps); the default (30) matches Example2.",
-    )
-
-    st.divider()
-    st.subheader("Projection geometry (Reconstruct steps)")
+    st.header("Measurement sequence")
     st.caption(
-        "One row per projection **step**: angle (°), offset (radial center of the ray "
-        "bundle), and #beams (0 = full image-width fan). Use **➕ Add as step** below to push "
-        "the live simulator's current bundle here."
+        "One row per projection **step** — angle (°), offset (bundle center), #beams "
+        "(0 = full fan). Edit directly or use **➕ Add as step**."
     )
-
-    with st.expander("Seed evenly-spaced angles", expanded=False):
-        c1, c2 = st.columns(2)
-        seed_count = c1.number_input("Count", min_value=1, max_value=64, value=9, step=1)
-        seed_beams = c2.number_input("#Beams (0=full)", min_value=0, value=0, step=1)
-        c3, c4 = st.columns(2)
-        seed_start = c3.number_input("Start °", value=0.0, step=10.0)
-        seed_stop = c4.number_input("Stop °", value=180.0, step=10.0)
-        if st.button("Seed table", use_container_width=True):
-            angs = np.linspace(
-                float(seed_start), float(seed_stop), int(seed_count), endpoint=False
-            )
-            st.session_state["beam_table"] = pd.DataFrame(
-                {
-                    "angle_deg": [float(a) for a in angs],
-                    "offset": [0.0] * len(angs),
-                    "n_beams": [int(seed_beams)] * len(angs),
-                }
-            )
-
     edited = st.data_editor(
         st.session_state["beam_table"],
         num_rows="dynamic",
@@ -299,35 +229,19 @@ with st.sidebar:
     )
     st.session_state["beam_table"] = edited
 
-    _prev = _geometry_preview_fig(edited, int(image_res))
-    st.pyplot(_prev, use_container_width=True)
-    plt.close(_prev)  # avoid matplotlib figure leakage across reruns
-
-    st.divider()
-    st.subheader("Solver / UQ params")
-    tv_weight = st.number_input("TV regularization weight", value=0.1, step=0.05,
-                                format="%.4f")
-    noise_scale = st.number_input("Measurement noise covariance (× I)", value=10.0,
-                                  step=1.0)
-    max_iter = st.number_input("IPOPT max_iter", value=1000, step=100, min_value=1)
-    linear_solver = st.selectbox("Linear solver", ["ma27", "ma57", "mumps"],
-                                 index=0,
-                                 help="Falls back to the next option if one isn't available.")
-
-# Rebuild the live image when the resolution changes (the degraded image is grid-specific).
-if (st.session_state.get("live_res") != int(image_res)
-        or "current_image" not in st.session_state):
-    _seed_live_state(int(image_res))
+# Seed the live degraded image once (resolution is fixed at IMAGE_RES).
+if "current_image" not in st.session_state:
+    _seed_live_state(IMAGE_RES)
 
 # --- main: live dose-response simulator ------------------------------------------------
 left, right = st.columns([3, 2])
 
-_ph = _phantom(int(image_res))
+_ph = _phantom(IMAGE_RES)
 _vmin, _vmax = float(_ph.min()), float(_ph.max())
 
 with left:
     _live = _live_figure(
-        st.session_state["current_image"], int(image_res),
+        st.session_state["current_image"], IMAGE_RES,
         st.session_state["live_angle"], st.session_state["live_offset"],
         st.session_state["live_nbeams"], st.session_state["beams_visible"],
         st.session_state["measurements_done"], _vmin, _vmax,
@@ -352,24 +266,21 @@ with right:
                        help="Beam intensity. 0 → no dose degradation (Example2 default).")
     cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
     cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
-    st.slider("Measurements (Apply target)", 0, 30, step=1, key="live_measurements")
 
-    b = st.columns(4)
-    b[0].button("Apply", on_click=_cb_apply, use_container_width=True,
-                help="Degrade up to the Measurements target.")
-    b[1].button("Step", on_click=_cb_step, use_container_width=True,
-                help="Apply one more measurement.")
-    b[2].button("Reset", on_click=_cb_reset, use_container_width=True,
+    b = st.columns(3)
+    b[0].button("Step", on_click=_cb_step, use_container_width=True,
+                help="Apply one measurement.")
+    b[1].button("Reset", on_click=_cb_reset, use_container_width=True,
                 help="Restore the phantom.")
-    b[3].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
+    b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
     a = st.columns(2)
     a[0].button("➕ Add as step", on_click=_cb_add_as_step, use_container_width=True,
-                help="Append this angle/offset/#beams as a row in the geometry table.")
+                help="Append this angle/offset/#beams as a row in the table.")
     reconstruct_clicked = a[1].button("Reconstruct", type="primary",
                                       use_container_width=True)
-    st.caption("⏱️ Reconstruct (res 30, 9 steps) takes minutes. It uses the live I0/α/β; set "
-               "I0=0 for the Example2-identical reconstruction.")
+    st.caption("⏱️ Reconstruct takes minutes. It uses the live I0/α/β; set I0=0 for the "
+               "Example2-identical reconstruction.")
 
 st.divider()
 
@@ -390,10 +301,10 @@ if reconstruct_clicked:
 
     # Cost guard: k_aug parameters span the full (unique r × unique angle × time) product,
     # so fractional offsets that don't reuse the detector grid inflate cost quadratically.
-    _rmax = int(image_res) / 2 - 0.5 + 1e-9
+    _rmax = IMAGE_RES / 2 - 0.5 + 1e-9
     uniq_r, uniq_ang, total_rays = set(), set(), 0
     for s in steps:
-        nb = s.n_beams if s.n_beams > 0 else int(image_res)
+        nb = s.n_beams if s.n_beams > 0 else IMAGE_RES
         rv = [float(r) for r in s.offset + (np.arange(nb) - (nb - 1) / 2.0) if abs(r) <= _rmax]
         total_rays += len(rv)
         uniq_r.update(round(r, 6) for r in rv)
@@ -406,15 +317,12 @@ if reconstruct_clicked:
             "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
         )
 
+    # tv_weight / noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
     params = UQParams(
-        image_res=int(image_res),
+        image_res=IMAGE_RES,
         I0=float(st.session_state["live_I0"]),
         alpha=float(st.session_state["live_alpha"]),
         beta=float(st.session_state["live_beta"]),
-        tv_weight=float(tv_weight),
-        noise_cov_scale=float(noise_scale),
-        ipopt_max_iter=int(max_iter),
-        linear_solver=str(linear_solver),
         beam_steps=steps,
     )
 
