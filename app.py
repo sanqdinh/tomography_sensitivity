@@ -190,6 +190,30 @@ def _style_sequence(df: pd.DataFrame, k: int):
     return sty
 
 
+# Result figures: pin the data axes (and reserve a colorbar slot) so all four show the actual
+# image at the same size in the 2×2 grid, regardless of which one carries a colorbar.
+_FIG_MAIN_RECT = (0.06, 0.10, 0.74, 0.74)   # data axes — identical on all four (square)
+_FIG_CBAR_RECT = (0.82, 0.10, 0.04, 0.74)   # colorbar slot — reserved on all; used by covariance
+
+
+def _normalize_result_fig(fig):
+    """Pin a backend result figure to one layout so its data image matches the others.
+
+    The four figures are square ``figsize=(10,10)`` with square, equal-aspect data; ``subplots``
+    makes the data axes ``fig.axes[0]`` and ``fig.colorbar`` appends the colorbar as
+    ``fig.axes[1]``. Forcing the data axes to a fixed square rect (and any colorbar axes to the
+    reserved strip) makes the actual image identical on all four — the three without a colorbar
+    just leave that strip blank. Idempotent (adds no axes), so safe to call on every rerun.
+    """
+    axes = fig.axes
+    if not axes:
+        return fig
+    axes[0].set_position(_FIG_MAIN_RECT)   # data axes (created first by subplots)
+    for extra in axes[1:]:                  # colorbar axes (appended by fig.colorbar)
+        extra.set_position(_FIG_CBAR_RECT)
+    return fig
+
+
 @st.cache_data(show_spinner=False)
 def _degraded_image(seq: tuple, I0: float, alpha: float, beta: float,
                     image_res: int) -> np.ndarray:
@@ -253,7 +277,7 @@ st.session_state.setdefault("view_k", 0)  # number of measurements currently dis
 # widgets exist in script order) can read them, and callbacks have a single source of truth.
 for _k, _v in {
     "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 48,
-    "live_I0": 0.0, "live_alpha": 0.3, "live_beta": 0.01,
+    "live_I0": 0.0, "live_alpha": 0.3, "live_beta": 0.01, "live_tv_weight": 0.1,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -326,6 +350,10 @@ with mid:
                 help="Clear the sequence — back to the clean phantom.")
     b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
+    st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
+              help="Total-variation penalty in the reconstruction objective (higher = smoother; "
+                   "0 disables it). Used only by Reconstruct.")
+
     reconstruct_clicked = st.button("Reconstruct", type="primary",
                                     use_container_width=True)
     st.caption("⏱️ Reconstruct solves exactly the table's sequence (minutes). It uses the live "
@@ -380,12 +408,13 @@ if reconstruct_clicked:
             "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
         )
 
-    # tv_weight / noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
+    # noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
     params = UQParams(
         image_res=IMAGE_RES,
         I0=float(st.session_state["live_I0"]),
         alpha=float(st.session_state["live_alpha"]),
         beta=float(st.session_state["live_beta"]),
+        tv_weight=float(st.session_state["live_tv_weight"]),
         beam_steps=steps,
     )
 
@@ -418,19 +447,20 @@ if results is not None:
         f"{results.n_user_rays} rays / {results.n_sinogram_measurements} k_aug params"
     )
 
-    # Reconstruction is the headline — centered, full width.
-    hero = st.columns([1, 2, 1])
-    hero[1].pyplot(results.fig_nlp, use_container_width=True)
-    hero[1].caption("Reconstruction (NLP)")
-
-    # Full UQ suite.
-    row = st.columns(3)
-    row[0].pyplot(results.fig_phantom, use_container_width=True)
-    row[0].caption("Original phantom")
-    row[1].pyplot(results.fig_covariance, use_container_width=True)
-    row[1].caption("Posterior covariance (log10 diagonal)")
-    row[2].pyplot(results.fig_beams, use_container_width=True)
-    row[2].caption("Beam / measurement view — the chosen projection geometry over the phantom")
+    # Tile the four figures 2×2 with identical data-image size. Only the covariance carries a
+    # colorbar; reserving the same colorbar slot on every figure keeps the actual image equal.
+    for _f in (results.fig_phantom, results.fig_nlp, results.fig_covariance, results.fig_beams):
+        _normalize_result_fig(_f)
+    _r1 = st.columns(2)
+    _r1[0].pyplot(results.fig_phantom, use_container_width=True)
+    _r1[0].caption("Original phantom")
+    _r1[1].pyplot(results.fig_nlp, use_container_width=True)
+    _r1[1].caption("Reconstruction (NLP)")
+    _r2 = st.columns(2)
+    _r2[0].pyplot(results.fig_covariance, use_container_width=True)
+    _r2[0].caption("Posterior covariance (log10 diagonal)")
+    _r2[1].pyplot(results.fig_beams, use_container_width=True)
+    _r2[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
 else:
     st.info("Tune the live simulator and build the geometry table, then click **Reconstruct** "
             "to run the solve.")
