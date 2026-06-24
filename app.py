@@ -182,13 +182,18 @@ def _degradation_dose_response(image, r, theta, I0, alpha, beta):
 def _bundle_r_values(offset: float, n_beams: int, image_res: int) -> list:
     """Radial positions of a ray bundle (BeamStep convention: n rays, 1 unit apart, centered).
 
-    ``n_beams == 0`` ⇒ full ``image_res`` fan. Rays outside the grid are dropped with the same
-    ``|r| <= image_res/2 - 0.5`` clamp the backend uses (guards the vendored empty-intersection
-    IndexError).
+    ``n_beams == 0`` ⇒ full ``image_res`` fan. Each ray is snapped onto the center of the pixel
+    it falls in: pixel centers sit at half-integers because geometry maps ``x → col = floor(x +
+    image_res/2)``, so without the snap an odd ray count / integer offset lands a beam on a pixel
+    *edge* (it then degrades the pixel to its right while the drawn line runs along the boundary).
+    Snapping leaves which pixel is hit unchanged but centers the beam on it; even fans / the
+    default full fan are already half-integer, so they are byte-identical. Rays outside the grid
+    are dropped with the same ``|r| <= image_res/2 - 0.5`` clamp the backend uses (guards the
+    vendored empty-intersection IndexError).
     """
     n = int(n_beams) if int(n_beams) > 0 else int(image_res)
     r_max = image_res / 2 - 0.5 + 1e-9
-    rs = offset + (np.arange(n) - (n - 1) / 2.0)
+    rs = np.floor(offset + (np.arange(n) - (n - 1) / 2.0)) + 0.5
     return [float(r) for r in rs if abs(r) <= r_max]
 
 
@@ -517,7 +522,9 @@ with mid:
     st.subheader("Solver Tuning")
     st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
               help="Total-variation penalty in the reconstruction objective (higher = smoother; "
-                   "0 disables it). Used only by Reconstruct.")
+                   "0 disables it). Used only by Reconstruct. Very low values with few or clustered "
+                   "angles can make the UQ/sensitivity step fail (singular system) — raise this or "
+                   "add more evenly-spaced angles if Reconstruct reports a UQ failure.")
 
     reconstruct_clicked = st.button("Reconstruct", type="primary",
                                     use_container_width=True)
@@ -616,7 +623,10 @@ if reconstruct_clicked:
             try:
                 results = run_simple_uq(params, log_callback=log_callback)
                 st.session_state["results"] = results
-            except Exception as exc:  # surface failures instead of a blank page
+            except RuntimeError as exc:  # curated, user-facing guidance (e.g. singular-KKT UQ failure)
+                st.session_state.pop("results", None)
+                st.error(str(exc))  # message is already actionable; skip the scary chained traceback
+            except Exception as exc:  # unexpected bug: surface the full traceback
                 st.session_state.pop("results", None)
                 st.error(f"Run failed: {exc}")
                 st.exception(exc)

@@ -114,7 +114,7 @@ class UQResults:
     forward_linear_solver: str
     inverse_linear_solver: str
     n_free_image0: int
-    n_sinogram_measurements: int  # full sinogram_data product (k_aug param columns)
+    n_sinogram_measurements: int  # real measurement params fed to k_aug (one per ray)
     n_user_rays: int  # rays actually placed by the user geometry (after clamping)
 
 
@@ -262,7 +262,12 @@ def run_simple_uq(
     measurement_set = []
     for i, step in enumerate(steps):
         n_beams = step.n_beams if step.n_beams and step.n_beams > 0 else image_res
-        r_all = step.offset + (np.arange(n_beams) - (n_beams - 1) / 2.0)
+        # Snap rays onto pixel centers (half-integers) so a beam passes through the middle of the
+        # pixel it degrades rather than along an edge; geometry maps x -> col = floor(x + N/2), so
+        # this centers the beam without changing which pixel is hit and keeps this solve in sync
+        # with the live image (see app.py:_bundle_r_values). Even fans / the default full fan are
+        # already half-integer and stay byte-identical.
+        r_all = np.floor(step.offset + (np.arange(n_beams) - (n_beams - 1) / 2.0)) + 0.5
         r_vals = [float(r) for r in r_all if abs(r) <= _R_MAX]
         dropped = n_beams - len(r_vals)
         if dropped:
@@ -370,19 +375,68 @@ def run_simple_uq(
 
     # --- sensitivity-based UQ via k_aug (Example2 lines 171-200) ----------------------
     writer.write("\n===== SENSITIVITY EXTRACTION =====\n")
-    sinogram_id_vars = list(sample.sinogram_data.items())
-    sinogram_vars = [var for _, var in sinogram_id_vars]
-    dimage0_dsinogram = extract_sensitivity_matrix(
-        model=sample,
-        var_list=image0_vars,
-        param_list=sinogram_vars,
-        mode="k_aug",
-        return_type="dense",
-    )
+    # k_aug computes one sensitivity column per parameter. Only the real measurement rays
+    # appear in the objective; every other sinogram_data entry is a degenerate free variable
+    # (a structurally-zero Jacobian column) that only inflates k_aug's backsolve + the
+    # vendored parser's Python negation loop. Fix those entries (k_aug's own loop would have
+    # anyway) so the factorized KKT system is identical to before, but hand k_aug only the
+    # measured params. The dropped columns are all-zero, so Sigma = sigma^2 * J*J^T (and thus
+    # the covariance map and D-optimality) is unchanged to floating point.
+    measured_ids = {
+        (m["r"], m["theta"], m["time"]) for m in measurement_set
+    }
+    sinogram_vars = []
+    for idx, var in sample.sinogram_data.items():
+        if idx in measured_ids:
+            sinogram_vars.append(var)
+        elif not var.fixed:
+            var.fix()
+    def _uq_failure(detail: str) -> RuntimeError:
+        # Build a clear, actionable error for a failed sensitivity/covariance step and close the
+        # figures already built above so a repeated (failing) Reconstruct does not leak them.
+        for _f in (fig_phantom, fig_nlp, fig_beams):
+            plt.close(_f)
+        n_px = image_res * image_res
+        n_rays = len(measurement_set)
+        return RuntimeError(
+            "Sensitivity / UQ step failed: " + detail + " The reduced KKT system is singular or "
+            "ill-conditioned at the inverse solution, so the posterior covariance is undefined "
+            f"[inverse solve status: {inv_tc}; {n_rays} measurement rays for {n_px} image pixels; "
+            f"TV weight = {params.tv_weight:g}"
+            + ("; I0 = 0 (no dose degradation)" if params.I0 == 0 else "")
+            + "]. If the inverse solve above did not reach 'optimal', that non-convergence is the "
+            "likely cause. Otherwise the problem is under-determined / under-regularized — raise "
+            "the TV regularization weight, add more (and more evenly-spaced) projection angles or "
+            "beams, and/or set I0 > 0; each improves conditioning so the sensitivity can be "
+            "extracted."
+        )
 
-    measurement_noise_covariance = params.noise_cov_scale * np.eye(len(sinogram_vars))
-    covariance_image0 = (
-        dimage0_dsinogram @ measurement_noise_covariance @ dimage0_dsinogram.T
+    try:
+        dimage0_dsinogram = extract_sensitivity_matrix(
+            model=sample,
+            var_list=image0_vars,
+            param_list=sinogram_vars,
+            mode="k_aug",
+            return_type="dense",
+        )
+    except (TypeError, ValueError, KeyError, IndexError) as exc:
+        # k_aug produces no usable dsdp output when it cannot factor the KKT system at the solution
+        # (singular / rank-deficient reduced Hessian). The vendored parser then fails cryptically:
+        # np.fromstring(None, ...) -> TypeError "a bytes-like object is required, not 'NoneType'"
+        # (pyomo_sensitivity.py:115), or a KeyError/ValueError/IndexError if it wrote an
+        # inconsistent matrix. This one narrow call only fails this way, so translate any of these
+        # into actionable guidance (the original is chained via ``from exc`` for debugging).
+        raise _uq_failure("k_aug could not compute the sensitivity matrix.") from exc
+
+    # A near-singular factorization can still emit a file full of inf/nan, which would otherwise
+    # silently poison the covariance and D-optimality below — treat it like a failed extraction.
+    if not np.all(np.isfinite(dimage0_dsinogram)):
+        raise _uq_failure("k_aug returned a non-finite sensitivity matrix.")
+
+    # noise covariance is sigma^2 * I, so Sigma = sigma^2 * (J*J^T) -- avoids building an
+    # N x N identity and a redundant matmul against it.
+    covariance_image0 = params.noise_cov_scale * (
+        dimage0_dsinogram @ dimage0_dsinogram.T
     )
     covariance_image0_diag = np.diag(covariance_image0)
     covariance_image0_diag_2D = covariance_image0_diag.reshape((image_res, image_res))
@@ -390,7 +444,11 @@ def run_simple_uq(
     d_optimality_value = d_optimality(covariance_image0)
 
     fig_covariance, ax_cov = plt.subplots(figsize=(10, 10))
-    im_cov = ax_cov.imshow(np.log10(covariance_image0_diag_2D), cmap="viridis")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Pixels that no ray constrains have exactly zero variance -> log10 = -inf (matplotlib
+        # masks them); suppress the divide-by-zero warning so it does not spam the solver log.
+        log_cov_diag_2D = np.log10(covariance_image0_diag_2D)
+    im_cov = ax_cov.imshow(log_cov_diag_2D, cmap="viridis")
     ax_cov.set_title(
         "Covariance of Initial Image Variables (d=%.2f)" % d_optimality_value
     )

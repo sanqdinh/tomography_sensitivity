@@ -135,7 +135,11 @@ function bundleR(offset, nbeams, R) {
   var rmax = R / 2 - 0.5 + 1e-9;
   var rs = [];
   for (var i = 0; i < n; i++) {
-    var r = offset + (i - (n - 1) / 2.0);
+    // Snap onto the center (half-integer) of the pixel the ray falls in — mirrors app.py
+    // _bundle_r_values / geometry's col = floor(x + R/2). Without this an odd beam count / integer
+    // offset draws the beam along a pixel edge instead of through the pixel's middle. Even fans are
+    // already half-integer, so they are unchanged.
+    var r = Math.floor(offset + (i - (n - 1) / 2.0)) + 0.5;
     if (Math.abs(r) <= rmax) rs.push(r);
   }
   return rs;
