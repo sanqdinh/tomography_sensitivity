@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>live_sim</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #262730;
+    background: transparent;
+  }
+  #wrap { padding: 2px 2px 6px 2px; box-sizing: border-box; }
+  #title { font-size: 15px; font-weight: 600; margin: 0 0 6px 2px; }
+
+  /* Image + overlay: a square area, capped so the image + sliders fit one screen
+     (the left column is wide; without a cap the square image fills it and pushes the
+     sliders off-screen). #img/#svg are inset:0 children so they shrink with #stage and
+     stay pixel-aligned; the JS uses img.clientWidth as the overlay scale, so it tracks
+     whatever final size #stage renders at. */
+  #stage { position: relative; width: 100%; max-width: 320px; max-height: 320px;
+           aspect-ratio: 1 / 1; margin: 0 auto; }
+  #img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    image-rendering: pixelated;             /* match the backend's interpolation="nearest" */
+    border-radius: 4px; display: block; background: #000;
+  }
+  #svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; pointer-events: none; }
+
+  /* Intensity legend. */
+  #legend { display: flex; align-items: center; gap: 6px; margin: 8px 2px 2px 2px; font-size: 11px; opacity: 0.8; }
+  #legendbar { flex: 1; height: 8px; border-radius: 4px;
+    background: linear-gradient(to right, #000, #fff); border: 1px solid rgba(128,128,128,0.4); }
+
+  /* Sliders. */
+  #controls { margin-top: 6px; }
+  .ctl { margin: 6px 2px; }
+  .ctl .row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 2px; }
+  .ctl .name { font-weight: 600; }
+  .ctl .val { font-variant-numeric: tabular-nums; opacity: 0.95; }
+  .ctl input[type="range"] { width: 100%; margin: 0; accent-color: #ff2b2b; cursor: pointer; }
+  .hint { font-size: 11px; opacity: 0.65; margin: 2px 2px 0 2px; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="title">Number of measurements: 0</div>
+    <div id="stage">
+      <img id="img" alt="phantom" />
+      <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div id="legend"><span>Intensity</span><div id="legendbar"></div><span>high</span></div>
+
+    <div id="controls">
+      <div class="ctl">
+        <div class="row"><span class="name">Angle (deg)</span><span class="val" id="angleVal">45</span></div>
+        <input type="range" id="angle" min="0" max="359" step="1" value="45" />
+      </div>
+      <div class="ctl">
+        <div class="row"><span class="name">Offset (bundle center)</span><span class="val" id="offsetVal">0</span></div>
+        <!-- Integer step: half-unit offsets shift the bundle onto/off the |r|<=14.5 clamp boundary on
+             alternating ticks, so the visible ray count oscillated (shimmy). Range ±14 keeps the
+             center ray on the grid (beyond that every ray is clamped away → empty preview). -->
+        <input type="range" id="offset" min="-14" max="14" step="1" value="0" />
+      </div>
+      <div class="ctl">
+        <div class="row"><span class="name"># Beams</span><span class="val" id="nbeamsVal">30</span></div>
+        <!-- Capped at image_res (30): with 1-unit spacing only ~30 rays ever fit the grid; more just
+             toggle clamped edge rays (added nothing, flickered the count). -->
+        <input type="range" id="nbeams" min="1" max="30" step="1" value="30" />
+      </div>
+      <div class="hint"><b style="color:#ff2b2b">Red</b> dashes = next-measurement preview (these sliders);
+        <b style="color:#1f77ff">blue</b> dashes = the measurement shown.</div>
+    </div>
+  </div>
+
+<script>
+// ---- Bare Streamlit component bridge (no build / no external lib) -----------------------
+var Streamlit = {
+  setComponentReady: function () {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+  },
+  setFrameHeight: function (h) {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
+  },
+  setComponentValue: function (v) {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*");
+  }
+};
+
+var SVGNS = "http://www.w3.org/2000/svg";
+var img = document.getElementById("img");
+var svg = document.getElementById("svg");
+var titleEl = document.getElementById("title");
+var angleEl = document.getElementById("angle");
+var offsetEl = document.getElementById("offset");
+var nbeamsEl = document.getElementById("nbeams");
+var angleVal = document.getElementById("angleVal");
+var offsetVal = document.getElementById("offsetVal");
+var nbeamsVal = document.getElementById("nbeamsVal");
+
+// State pushed from Python (defaults are placeholders until the first render).
+var imageRes = 30;
+var committed = null;       // [angleDeg, offset, nbeams] of the viewed measurement, or null
+var beamsVisible = true;
+
+// Current live slider values (the red preview).
+var curAngle = 45, curOffset = 0, curNbeams = 30;
+
+// True while a slider thumb is held down, so a streamlit:render arriving mid-drag (e.g. a rerun
+// from another widget, or the previous release still settling) does not snap the thumb back.
+var dragging = false;
+
+// First render seeds the thumbs from Python's values; afterwards the component OWNS them and never
+// reassigns from render args. Python only ever echoes back the value we sent (app.py:472-475), so a
+// later reassign can only be a no-op or — when a stale render lands just after release — a snap-back
+// to the previous value. (If Python ever sets the sliders out-of-band, replace this with an
+// "echo-pending" scheme: ignore slider args until they match the last value we sent.)
+var mounted = false;
+// A streamlit:render that arrived while a thumb was held down, stashed to replay on release so its
+// redraw/iframe-resize never reflows the page mid-drag (which drops the native range-drag tracking).
+var pendingArgs = null;
+// Last height we reported; the body height is effectively constant after mount, so guarding on this
+// collapses a per-render setFrameHeight storm (each resize disturbs an active drag + re-fires the
+// #stage ResizeObserver) down to the handful of calls that actually change the layout.
+var lastHeight = -1;
+
+// ---- Geometry (mirror of app.py / senDOE) ---------------------------------------------
+function toPx(x, y, R, D) { return [((x + R / 2) / R) * D, ((R / 2 - y) / R) * D]; }
+
+function bundleR(offset, nbeams, R) {
+  var n = nbeams > 0 ? nbeams : R;
+  var rmax = R / 2 - 0.5 + 1e-9;
+  var rs = [];
+  for (var i = 0; i < n; i++) {
+    var r = offset + (i - (n - 1) / 2.0);
+    if (Math.abs(r) <= rmax) rs.push(r);
+  }
+  return rs;
+}
+
+function drawBundle(angleDeg, offset, nbeams, color, D) {
+  var R = imageRes;
+  var th = (angleDeg * Math.PI) / 180.0;
+  var c = Math.cos(th), s = Math.sin(th);
+  var L = 99.5;                                   // seg half-length, far past the ±R/2 view
+  var rs = bundleR(offset, nbeams, R);
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    var p0 = toPx(r * c - L * s, r * s + L * c, R, D);
+    var p1 = toPx(r * c + L * s, r * s - L * c, R, D);
+    var ln = document.createElementNS(SVGNS, "line");
+    ln.setAttribute("x1", p0[0]); ln.setAttribute("y1", p0[1]);
+    ln.setAttribute("x2", p1[0]); ln.setAttribute("y2", p1[1]);
+    ln.setAttribute("stroke", color);
+    ln.setAttribute("stroke-width", "1.2");
+    ln.setAttribute("stroke-dasharray", "5 4");
+    svg.appendChild(ln);
+  }
+}
+
+function redraw() {
+  var D = img.clientWidth || svg.clientWidth || 300;
+  svg.setAttribute("viewBox", "0 0 " + D + " " + D);
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  if (beamsVisible) {
+    if (committed) drawBundle(committed[0], committed[1], committed[2], "#1f77ff", D); // blue, below
+    drawBundle(curAngle, curOffset, curNbeams, "#ff2b2b", D);                           // red, on top
+  }
+  setHeight();
+}
+
+function setHeight() {
+  var h = document.body.scrollHeight;
+  if (h === lastHeight) return;   // skip redundant iframe resizes (they disturb an active drag)
+  lastHeight = h;
+  Streamlit.setFrameHeight(h);
+}
+
+// ---- Slider wiring --------------------------------------------------------------------
+function readSliders() {
+  curAngle = parseFloat(angleEl.value);
+  curOffset = parseFloat(offsetEl.value);
+  curNbeams = parseInt(nbeamsEl.value, 10);
+}
+function updateLabels() {
+  angleVal.textContent = String(Math.round(curAngle));
+  offsetVal.textContent = (Math.round(curOffset * 10) / 10).toString();
+  nbeamsVal.textContent = String(curNbeams);
+}
+function onInput() {           // fires continuously while dragging → live redraw, NO server round-trip
+  readSliders(); updateLabels(); redraw();
+}
+function onRelease() {         // mouse-up → report the value so Python can sync session_state
+  readSliders();
+  Streamlit.setComponentValue({ angle: curAngle, offset: curOffset, nbeams: curNbeams });
+}
+function endDrag() {
+  dragging = false;
+  // Apply the render we deferred during the drag (if any). mounted is already true, so this refreshes
+  // the background image / blue bundle / redraw but does NOT touch the thumbs — no snap-back.
+  if (pendingArgs) { var a = pendingArgs; pendingArgs = null; onRender(a); }
+}
+[angleEl, offsetEl, nbeamsEl].forEach(function (el) {
+  el.addEventListener("pointerdown", function () { dragging = true; });
+  el.addEventListener("pointerup", endDrag);
+  el.addEventListener("pointercancel", endDrag);   // a cancelled drag must still clear dragging
+  el.addEventListener("input", onInput);
+  el.addEventListener("change", onRelease);
+});
+
+// ---- Receive args from Python ---------------------------------------------------------
+function applyTheme(t) {
+  if (!t) return;
+  if (t.textColor) document.body.style.color = t.textColor;
+  if (t.font) document.body.style.fontFamily = t.font;
+}
+
+function onRender(args) {
+  if (!args) return;
+  // A render landing mid-drag must not mutate the DOM (a redraw/iframe-resize reflows the page and
+  // drops the in-progress range drag). Stash it and replay on pointerup/pointercancel via endDrag().
+  if (dragging) { pendingArgs = args; return; }
+  imageRes = args.image_res != null ? args.image_res : imageRes;
+  committed = args.committed != null ? args.committed : null;
+  beamsVisible = args.beams_visible !== false;
+  titleEl.textContent = "Number of measurements: " + (args.k != null ? args.k : 0);
+
+  // Seed the thumbs from the server ONLY on the first render; afterwards the component owns them (see
+  // `mounted`). readSliders()/updateLabels() always run so curAngle/... track the real thumb state.
+  if (!mounted) {
+    if (args.angle != null) angleEl.value = args.angle;
+    if (args.offset != null) offsetEl.value = args.offset;
+    if (args.nbeams != null) nbeamsEl.value = args.nbeams;
+    mounted = true;
+  }
+  readSliders(); updateLabels();
+
+  if (args.image_uri) {
+    if (img.src !== args.image_uri) {
+      img.onload = redraw;       // wait for natural size so clientWidth is valid
+      img.src = args.image_uri;
+    } else {
+      redraw();
+    }
+  } else {
+    redraw();
+  }
+}
+
+window.addEventListener("message", function (event) {
+  if (!event.data || event.data.type !== "streamlit:render") return;
+  applyTheme(event.data.theme);
+  onRender(event.data.args);
+});
+
+// Redraw on container resize (responsive column width).
+if (window.ResizeObserver) {
+  new ResizeObserver(function () { redraw(); }).observe(document.getElementById("stage"));
+}
+window.addEventListener("resize", redraw);
+
+// Announce readiness last, so we don't miss the first render event.
+Streamlit.setComponentReady();
+setHeight();
+</script>
+</body>
+</html>

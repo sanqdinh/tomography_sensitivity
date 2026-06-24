@@ -26,7 +26,9 @@ backend: it imports the vendored geometry primitives and re-implements one small
 (the dose-response degradation) for the live preview.
 """
 
+import base64
 import html as _html
+import io
 import os
 import time
 
@@ -40,6 +42,7 @@ import streamlit.components.v1 as components
 from tomography_uq import UQParams, BeamStep, run_simple_uq
 
 import matplotlib.pyplot as plt  # after tomography_uq sets the Agg backend
+import matplotlib.image as mpimg
 
 # Vendored geometry primitives (importing them is not a backend change).
 from senDOE.helpers.geometry import (
@@ -62,6 +65,26 @@ st.caption(
 
 # Fixed sim/reconstruction resolution (was the sidebar slider; equals the UQParams default).
 IMAGE_RES = 30
+
+# Live-simulator preview is a custom browser component (no-build static component): it holds the
+# Angle/Offset/#Beams sliders + the beam overlay and redraws the red preview lines *while* dragging,
+# client-side, so there is no server round-trip per drag (st.slider only reports on release). The
+# component reports the values back on release; Python renders only the static background image and
+# the committed (blue) bundle. See live_sim_component/index.html.
+_LIVE_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_sim_component")
+_live_sim = components.declare_component("live_sim", path=_LIVE_SIM_DIR)
+
+
+def _live_background_uri(img, vmin, vmax) -> str:
+    """PNG data-URI of the grayscale phantom view (no axes/lines) for the live component background.
+
+    ``mpimg.imsave`` writes exactly the array's pixels (here image_res×image_res), so the data rect
+    maps 1:1 to the component's image box and the JS overlay aligns to it. The component upscales it
+    with ``image-rendering: pixelated`` to match the backend's ``interpolation="nearest"``.
+    """
+    buf = io.BytesIO()
+    mpimg.imsave(buf, np.asarray(img), cmap="gray", vmin=vmin, vmax=vmax, format="png")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 # Solver-log box: a scrollable monospace div force-scrolled to the bottom on every update. Rendered
 # via components.html (sandboxed iframe) so the trailing <script> actually runs — st.html strips
@@ -389,7 +412,7 @@ st.session_state.setdefault("view_k", 0)  # number of measurements currently dis
 # Live control values live in session_state so the central figure (rendered before the
 # widgets exist in script order) can read them, and callbacks have a single source of truth.
 for _k, _v in {
-    "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 48,
+    "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 30,
     "live_I0": 0.0, "live_alpha": 0.3, "live_beta": 0.01, "live_tv_weight": 0.1,
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -426,15 +449,30 @@ with left:
     nav[1].button("Next Measurement ➡", on_click=_cb_next,
                   use_container_width=True, disabled=(_k >= _n))
     st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
-    _live = _live_figure(
-        _view_image, IMAGE_RES, _k, _vmin, _vmax,
-        preview=_preview, committed=_committed,
-        beams_visible=st.session_state["beams_visible"],
+    # Interactive browser preview: the Angle/Offset/#Beams sliders live here and the red preview
+    # dashes redraw *while* dragging (client-side). Python only supplies the static background image
+    # and the committed (blue) bundle. On release the component returns the values so the rest of the
+    # app (Take measurement / Reconstruct) reads them from session_state below.
+    _live_val = _live_sim(
+        image_uri=_live_background_uri(_view_image, _vmin, _vmax),
+        image_res=IMAGE_RES,
+        k=_k,
+        angle=float(st.session_state["live_angle"]),
+        offset=float(st.session_state["live_offset"]),
+        nbeams=int(st.session_state["live_nbeams"]),
+        committed=(list(_committed) if _committed is not None else None),
+        beams_visible=bool(st.session_state["beams_visible"]),
+        default={
+            "angle": float(st.session_state["live_angle"]),
+            "offset": float(st.session_state["live_offset"]),
+            "nbeams": int(st.session_state["live_nbeams"]),
+        },
+        key="live_sim",
     )
-    st.pyplot(_live, use_container_width=True)
-    plt.close(_live)
-    st.caption("**Red** dashes = next-measurement preview (sliders); **blue** dashes = "
-               "the measurement shown.")
+    if isinstance(_live_val, dict):  # released slider values → sync so Take/Reconstruct use them
+        st.session_state["live_angle"] = float(_live_val["angle"])
+        st.session_state["live_offset"] = float(_live_val["offset"])
+        st.session_state["live_nbeams"] = int(_live_val["nbeams"])
     st.latex(
         r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
         r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
@@ -442,13 +480,9 @@ with left:
 
 with mid:
     st.subheader("Live simulator")
-    st.caption("Set the projection below, then **➕ Take measurement** to add it to the sequence.")
-    st.slider("Angle (deg)", 0.0, 359.0, step=1.0, key="live_angle")
-    st.slider("Offset (bundle center)", -24.0, 24.0, step=0.5, key="live_offset",
-              help="Radial center of the ray bundle (image units). Rays outside the grid are "
-                   "dropped.")
-    st.slider("# Beams", 1, 48, step=1, key="live_nbeams",
-              help="Rays spaced one image-unit apart, centered at the offset.")
+    st.caption("Set the projection with the **Angle / Offset / # Beams** sliders under the image "
+               "(they update the red preview live), then **➕ Take measurement** to add it to the "
+               "sequence.")
     cc = st.columns(3)
     cc[0].number_input("I0", min_value=0.0, step=0.5, key="live_I0",
                        help="Beam intensity (≥ 0). 0 → no dose degradation (the image is not "

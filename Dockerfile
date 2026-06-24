@@ -56,6 +56,7 @@ RUN /opt/idaes/bin/ipopt --version \
 # 6) Application code + vendored senDOE (senDOE/ at /app => importable as top-level `senDOE`).
 COPY senDOE/ ./senDOE/
 COPY .streamlit/ ./.streamlit/
+COPY live_sim_component/ ./live_sim_component/
 COPY tomography_uq.py app.py ./
 
 # 7) Build-time make-or-break checks: vendored package imports, and IPOPT solves end-to-end.

@@ -12,13 +12,34 @@ lives in `Dockerfile`/`fly.toml`); this file is for working *in* the code.
 
 ## Architecture (three layers, read top-down)
 
-1. **`app.py`** — Streamlit UI and the only entrypoint. Sidebar → `UQParams`; the geometry is
-   an editable `st.data_editor` beam table (one row per step: angle / offset / #beams) persisted
-   in `st.session_state["beam_table"]`, with a live matplotlib dial preview that updates on every
-   edit (not gated on Run). The heavy solve runs **only on the Run button press**. Streamlit
-   re-executes the whole script on every widget interaction, so results are stashed in
-   `st.session_state["results"]` to survive reruns without re-solving. IPOPT output streams live
-   to a `log_callback` that renders a rolling tail (last 8000 chars).
+1. **`app.py`** — Streamlit UI and the only entrypoint. **Two modes share one page**, laid out
+   as picture (left) | dials + buttons (mid) | read-only sequence table (right):
+   - **Live dose-response simulator** (runs entirely in the browser, no solver). The picture is a
+     *derived view* of the table, never the solve output: the cumulative dose-response degradation
+     `pixel·exp(-α·I_local − β·I_local²)` of the first `view_k` measurements (a small numpy helper,
+     `_degraded_image`, reusing the vendored geometry — not a backend change). The measurement
+     sequence lives in `st.session_state["beam_table"]` and is built up **only** by the **➕ Take
+     measurement** / **Reset** buttons (it's a read-only `st.dataframe`, no longer an editable
+     `data_editor`). **Previous/Next Measurement** scrub `view_k` over `0..N` to replay history:
+     blue dashes = the viewed measurement, red dashes = the live next-measurement preview.
+   - **Reconstruct** (the heavy solve; the old "Run") — converts the table to `BeamStep`s with the
+     **same** `_table_to_seq` mapping the live image uses (so the solve matches the picture), then
+     calls `run_simple_uq` with the live `I0/α/β/tv_weight`. Runs **only on the button press**.
+   Streamlit re-executes the whole script on every widget interaction, so results are stashed in
+   `st.session_state["results"]` to survive reruns without re-solving. IPOPT output streams live to
+   a `log_callback` that renders a rolling tail (last 8000 chars). `IMAGE_RES = 30` is now a fixed
+   module constant (was a sidebar slider); the sidebar is gone.
+
+   - **`live_sim_component/index.html`** — a **no-build static Streamlit component** (raw
+     `postMessage` bridge, no npm/React) declared via `components.declare_component(path=…)`. It
+     owns the **Angle / Offset / # Beams sliders and the SVG beam overlay**, redrawing the red
+     preview dashes **client-side while dragging** — Python only supplies the PNG background
+     (`_live_background_uri`, a 1:1 `image_res×image_res` data-URI upscaled `pixelated` to match
+     `interpolation="nearest"`) and the committed (blue) bundle. This exists because `st.slider`
+     only reports on release (one server round-trip per drag = no live overlay); the component
+     reports the values back on release so `Take measurement`/`Reconstruct` read them from
+     `session_state`. Its geometry JS mirrors `_bundle_r_values` and must stay in sync. The old
+     matplotlib version (`_live_figure`) is now **dead code** left in `app.py`.
 
 2. **`tomography_uq.py`** — `run_simple_uq(params: UQParams, log_callback=None) -> UQResults`,
    the parameterized re-implementation of Example2. Contract it deliberately upholds: takes
