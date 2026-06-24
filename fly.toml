@@ -1,39 +1,33 @@
-# Fly.io configuration — on-demand (scale-to-zero) Streamlit container.
-# `fly launch` will confirm/replace the app name and primary region.
+# fly.toml app configuration file generated for tomography-sensitivity on 2026-06-24T20:03:22Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "tomography-sensitivity"
-primary_region = "ord"
+app = 'tomography-sensitivity'
+primary_region = 'ord'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [http_service]
-  internal_port = 8501
+  internal_port = 8080
   force_https = true
-  # Scale to zero when idle; cold-start a machine on the next incoming request.
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
-  # Streamlit holds a long-lived websocket per active user. Connection-based concurrency
-  # keeps a machine "busy" while a solve streams its log, so it is NOT autostopped mid-solve.
   [http_service.concurrency]
-    type = "connections"
-    soft_limit = 20
+    type = 'connections'
     hard_limit = 25
+    soft_limit = 20
 
-  # Streamlit's health endpoint returns 200 "ok". Generous grace covers cold-start +
-  # importing pyomo/idaes/skimage.
   [[http_service.checks]]
-    grace_period = "30s"
-    interval = "15s"
-    method = "get"
-    path = "/_stcore/health"
-    timeout = "5s"
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '30s'
+    method = 'get'
+    path = '/_stcore/health'
 
-# Sizing for the default problem (~9k vars, 270 measurements: two IPOPT solves + k_aug).
-# 2 GB / 2 shared vCPU is comfortable and cheap for scale-to-zero. If users push image_res
-# up (cost ~ N²·n_horizon), bump to shared-cpu-4x / 4gb. Watch `fly logs` for OOM.
 [[vm]]
-  size = "shared-cpu-2x"
-  memory = "2gb"
+  size = 'shared-cpu-2x'
+  memory = '2gb'
