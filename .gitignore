@@ -217,3 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 /.dockerignore
+
+# Local-only files (untracked from GitHub, kept on disk)
+CLAUDE.md
+SENDOE_VENDOR.md
