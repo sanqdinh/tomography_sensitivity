@@ -139,15 +139,17 @@ def _degradation_dose_response(image, r, theta, I0, alpha, beta):
     """numpy port of ``util.HelperTools.degradation_Dose_Response`` (numpy branch).
 
     Degrades the image along the ray ``x·cosθ + y·sinθ = r`` using the dose-response model
-    ``pixel·exp(-α·I_local - β·I_local²)`` with ``I_local = I0·exp(-Σ radon)``. Reuses the
-    vendored ``get_line_abc_from_r_theta`` / ``line_grid_intersections``. Returns the image
-    unchanged if the ray misses the grid (the vendored intersection routine raises IndexError
-    on an empty hit, mirrored by the backend's |r| clamp).
+    ``pixel·exp(-α·I_local - β·I_local²)`` with ``I_local = I0·exp(-Σ radon)``, where Σ runs in
+    the beam **travel direction** ``(-sinθ, cosθ)`` — so the entry pixel sees full ``I0`` and 0°
+    (bottom-up) differs from 180° (top-down). Reuses the vendored ``get_line_abc_from_r_theta`` /
+    ``line_grid_intersections``. Returns the image unchanged if the ray misses the grid (the
+    vendored intersection routine raises IndexError on an empty hit, mirrored by the backend's
+    |r| clamp).
     """
     h, w = image.shape
     a, b, c = get_line_abc_from_r_theta(r, theta)
     try:
-        _, image_intersection, radon, _ = line_grid_intersections(
+        intersection_result, image_intersection, radon, _ = line_grid_intersections(
             a, b, c, image, x_range=[-w / 2, w / 2], y_range=[-h / 2, h / 2]
         )
     except IndexError:
@@ -155,11 +157,25 @@ def _degradation_dose_response(image, r, theta, I0, alpha, beta):
     if len(image_intersection) == 0:
         return image
     out = image.copy()
-    for i in range(len(image_intersection)):
+    n = len(image_intersection)
+    # The beam travels along the line tangent (-sinθ, cosθ); the vendored intersection list is
+    # always sorted by ascending (x, y) regardless of θ, so θ and θ+180 are the same line and
+    # would otherwise deposit dose in the same order. Walk the pixels in travel order so 0°=
+    # bottom-up and 180°=top-down differ (and 0°==360°). The points are colinear, so the vendored
+    # order is either aligned with the tangent or exactly reversed.
+    dx = intersection_result[-1][0] - intersection_result[0][0]
+    dy = intersection_result[-1][1] - intersection_result[0][1]
+    forward = dx * (-np.sin(theta)) + dy * np.cos(theta) >= 0
+    indices = range(n) if forward else range(n - 1, -1, -1)
+    dose = 0.0
+    for i in indices:
         ix = int(image_intersection[i, 0])  # row
         iy = int(image_intersection[i, 1])  # col
-        local = I0 * np.exp(-sum(radon[j] for j in range(i)))
+        local = I0 * np.exp(-dose)
         out[ix, iy] = image[ix, iy] * np.exp(-alpha * local - beta * local**2)
+        seg = i if forward else i - 1  # segment crossed to reach the next pixel in travel order
+        if 0 <= seg < len(radon):
+            dose += radon[seg]
     return out
 
 
