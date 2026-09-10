@@ -385,199 +385,209 @@ for _k, _v in {
     st.session_state.setdefault(_k, _v)
 
 
-# --- main: live dose-response simulator (the image is a derived view of the table) -----
-# image (left) | live-simulator dials + buttons (middle) | measurement-sequence table (right)
-left, mid, right = st.columns([3, 2, 2])
+# --- two modes, two tabs --------------------------------------------------------------
+tab_2d, tab_3d = st.tabs(["2D dose-response + reconstruction", "3D degradation"])
 
-_ph = _phantom(IMAGE_RES)
-_vmin, _vmax = float(_ph.min()), float(_ph.max())
+# The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
+# path that can call st.stop() (empty geometry), which would otherwise leave this tab blank
+# on that rerun. Display order is set by the st.tabs() list above, not by population order.
+with tab_3d:
+    st.info("3D degradation simulator — arriving in the next commit.")
 
-# The single source of truth: the table → sequence. The picture shows the first `_k`
-# measurements (Previous/Next scrub `_k` over 0..N); the table highlights measurement `_k`.
-_seq = _table_to_seq(st.session_state["beam_table"])
-_n = len(_seq)
-_k = max(0, min(int(st.session_state["view_k"]), _n))  # clamp (table may have shrunk)
-st.session_state["view_k"] = _k
-_view_image = _degraded_image(
-    _seq[:_k], float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
-    float(st.session_state["live_beta"]), IMAGE_RES,
-)
-# Two overlays: red = live next-measurement preview (sliders); blue = the viewed measurement.
-_preview = (
-    float(st.session_state["live_angle"]), float(st.session_state["live_offset"]),
-    int(st.session_state["live_nbeams"]),
-)
-_committed = _seq[_k - 1] if _k >= 1 else None
+with tab_2d:
+    # --- main: live dose-response simulator (the image is a derived view of the table) -----
+    # image (left) | live-simulator dials + buttons (middle) | measurement-sequence table (right)
+    left, mid, right = st.columns([3, 2, 2])
 
-with left:
-    nav = st.columns(2)
-    nav[0].button("⬅ Previous Measurement", on_click=_cb_prev,
-                  use_container_width=True, disabled=(_k == 0))
-    nav[1].button("Next Measurement ➡", on_click=_cb_next,
-                  use_container_width=True, disabled=(_k >= _n))
-    st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
-    # Interactive browser preview: the Angle/Offset/#Beams sliders live here and the red preview
-    # dashes redraw *while* dragging (client-side). Python only supplies the static background image
-    # and the committed (blue) bundle. On release the component returns the values so the rest of the
-    # app (Take measurement / Reconstruct) reads them from session_state below.
-    _live_val = _live_sim(
-        image_uri=_live_background_uri(_view_image, _vmin, _vmax),
-        image_res=IMAGE_RES,
-        k=_k,
-        angle=float(st.session_state["live_angle"]),
-        offset=float(st.session_state["live_offset"]),
-        nbeams=int(st.session_state["live_nbeams"]),
-        committed=(list(_committed) if _committed is not None else None),
-        beams_visible=bool(st.session_state["beams_visible"]),
-        default={
-            "angle": float(st.session_state["live_angle"]),
-            "offset": float(st.session_state["live_offset"]),
-            "nbeams": int(st.session_state["live_nbeams"]),
-        },
-        key="live_sim",
+    _ph = _phantom(IMAGE_RES)
+    _vmin, _vmax = float(_ph.min()), float(_ph.max())
+
+    # The single source of truth: the table → sequence. The picture shows the first `_k`
+    # measurements (Previous/Next scrub `_k` over 0..N); the table highlights measurement `_k`.
+    _seq = _table_to_seq(st.session_state["beam_table"])
+    _n = len(_seq)
+    _k = max(0, min(int(st.session_state["view_k"]), _n))  # clamp (table may have shrunk)
+    st.session_state["view_k"] = _k
+    _view_image = _degraded_image(
+        _seq[:_k], float(st.session_state["live_I0"]), float(st.session_state["live_alpha"]),
+        float(st.session_state["live_beta"]), IMAGE_RES,
     )
-    if isinstance(_live_val, dict):  # released slider values → sync so Take/Reconstruct use them
-        st.session_state["live_angle"] = float(_live_val["angle"])
-        st.session_state["live_offset"] = float(_live_val["offset"])
-        st.session_state["live_nbeams"] = int(_live_val["nbeams"])
-    st.latex(
-        r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
-        r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
+    # Two overlays: red = live next-measurement preview (sliders); blue = the viewed measurement.
+    _preview = (
+        float(st.session_state["live_angle"]), float(st.session_state["live_offset"]),
+        int(st.session_state["live_nbeams"]),
     )
+    _committed = _seq[_k - 1] if _k >= 1 else None
 
-with mid:
-    st.subheader("Live simulator")
-    st.caption("Set the projection with the **Angle / Offset / # Beams** sliders under the image "
-               "(they update the red preview live), then **➕ Take measurement** to add it to the "
-               "sequence.")
-    cc = st.columns(3)
-    cc[0].number_input("I0", min_value=0.0, step=0.5, key="live_I0",
-                       help="Beam intensity (≥ 0). 0 → no dose degradation (the image is not "
-                            "darkened by measurements).")
-    cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
-    cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
+    with left:
+        nav = st.columns(2)
+        nav[0].button("⬅ Previous Measurement", on_click=_cb_prev,
+                      use_container_width=True, disabled=(_k == 0))
+        nav[1].button("Next Measurement ➡", on_click=_cb_next,
+                      use_container_width=True, disabled=(_k >= _n))
+        st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
+        # Interactive browser preview: the Angle/Offset/#Beams sliders live here and the red preview
+        # dashes redraw *while* dragging (client-side). Python only supplies the static background image
+        # and the committed (blue) bundle. On release the component returns the values so the rest of the
+        # app (Take measurement / Reconstruct) reads them from session_state below.
+        _live_val = _live_sim(
+            image_uri=_live_background_uri(_view_image, _vmin, _vmax),
+            image_res=IMAGE_RES,
+            k=_k,
+            angle=float(st.session_state["live_angle"]),
+            offset=float(st.session_state["live_offset"]),
+            nbeams=int(st.session_state["live_nbeams"]),
+            committed=(list(_committed) if _committed is not None else None),
+            beams_visible=bool(st.session_state["beams_visible"]),
+            default={
+                "angle": float(st.session_state["live_angle"]),
+                "offset": float(st.session_state["live_offset"]),
+                "nbeams": int(st.session_state["live_nbeams"]),
+            },
+            key="live_sim",
+        )
+        if isinstance(_live_val, dict):  # released slider values → sync so Take/Reconstruct use them
+            st.session_state["live_angle"] = float(_live_val["angle"])
+            st.session_state["live_offset"] = float(_live_val["offset"])
+            st.session_state["live_nbeams"] = int(_live_val["nbeams"])
+        st.latex(
+            r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
+            r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
+        )
 
-    b = st.columns(3)
-    b[0].button("➕ Take measurement", on_click=_cb_step, use_container_width=True,
-                help="Apply a measurement at the current angle/offset/#beams and append it to "
-                     "the sequence table.")
-    b[1].button("Reset", on_click=_cb_reset, use_container_width=True,
-                help="Clear the sequence — back to the clean phantom.")
-    b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
+    with mid:
+        st.subheader("Live simulator")
+        st.caption("Set the projection with the **Angle / Offset / # Beams** sliders under the image "
+                   "(they update the red preview live), then **➕ Take measurement** to add it to the "
+                   "sequence.")
+        cc = st.columns(3)
+        cc[0].number_input("I0", min_value=0.0, step=0.5, key="live_I0",
+                           help="Beam intensity (≥ 0). 0 → no dose degradation (the image is not "
+                                "darkened by measurements).")
+        cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
+        cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
 
-    st.subheader("Solver Tuning")
-    st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
-              help="Total-variation penalty in the reconstruction objective (higher = smoother; "
-                   "0 disables it). Used only by Reconstruct. Very low values with few or clustered "
-                   "angles can make the UQ/sensitivity step fail (singular system) — raise this or "
-                   "add more evenly-spaced angles if Reconstruct reports a UQ failure.")
+        b = st.columns(3)
+        b[0].button("➕ Take measurement", on_click=_cb_step, use_container_width=True,
+                    help="Apply a measurement at the current angle/offset/#beams and append it to "
+                         "the sequence table.")
+        b[1].button("Reset", on_click=_cb_reset, use_container_width=True,
+                    help="Clear the sequence — back to the clean phantom.")
+        b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
-    reconstruct_clicked = st.button("Reconstruct", type="primary",
-                                    use_container_width=True)
-    st.caption("⏱️ Reconstruct solves exactly the table's sequence (takes a few minutes). It uses "
-               "the live I0/α/β; set I0=0 to reconstruct without modeling dose degradation.")
+        st.subheader("Solver Tuning")
+        st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
+                  help="Total-variation penalty in the reconstruction objective (higher = smoother; "
+                       "0 disables it). Used only by Reconstruct. Very low values with few or clustered "
+                       "angles can make the UQ/sensitivity step fail (singular system) — raise this or "
+                       "add more evenly-spaced angles if Reconstruct reports a UQ failure.")
 
-with right:
-    st.subheader("Measurement sequence")
-    st.caption(
-        "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
-        "(0 = full fan). The **highlighted** row is the one currently shown on the left."
-    )
-    # Read-only view (st.dataframe, not st.data_editor) so the sequence can't be edited by an
-    # accidental click — it is driven solely by the Take measurement / Reset buttons. The Styler
-    # highlights the currently-viewed measurement (Previous/Next).
-    st.dataframe(
-        _style_sequence(st.session_state["beam_table"], _k),
-        use_container_width=True,
-        column_config={
-            "angle_deg": st.column_config.NumberColumn("Angle °", format="%.2f"),
-            "offset": st.column_config.NumberColumn("Offset", format="%.2f"),
-            "n_beams": st.column_config.NumberColumn("# Beams", format="%d"),
-        },
-    )
+        reconstruct_clicked = st.button("Reconstruct", type="primary",
+                                        use_container_width=True)
+        st.caption("⏱️ Reconstruct solves exactly the table's sequence (takes a few minutes). It uses "
+                   "the live I0/α/β; set I0=0 to reconstruct without modeling dose degradation.")
 
-st.divider()
+    with right:
+        st.subheader("Measurement sequence")
+        st.caption(
+            "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
+            "(0 = full fan). The **highlighted** row is the one currently shown on the left."
+        )
+        # Read-only view (st.dataframe, not st.data_editor) so the sequence can't be edited by an
+        # accidental click — it is driven solely by the Take measurement / Reset buttons. The Styler
+        # highlights the currently-viewed measurement (Previous/Next).
+        st.dataframe(
+            _style_sequence(st.session_state["beam_table"], _k),
+            use_container_width=True,
+            column_config={
+                "angle_deg": st.column_config.NumberColumn("Angle °", format="%.2f"),
+                "offset": st.column_config.NumberColumn("Offset", format="%.2f"),
+                "n_beams": st.column_config.NumberColumn("# Beams", format="%d"),
+            },
+        )
 
-# Fixed placeholders so a fresh Reconstruct clears the previous output up-front: reaching these
-# empty() slots on the rerun removes the old figures *before* the (minutes-long) solve, so they
-# vanish while it runs instead of lingering underneath. Results are filled back in below.
-_log_slot = st.empty()
-_results_slot = st.empty()
+    st.divider()
 
-# --- heavy solve: only on Reconstruct press --------------------------------------------
-if reconstruct_clicked:
-    # Same table → sequence conversion the live image uses, so the solve matches the picture.
-    steps = [BeamStep(angle_deg=a, offset=o, n_beams=n)
-             for (a, o, n) in _table_to_seq(st.session_state["beam_table"])]
+    # Fixed placeholders so a fresh Reconstruct clears the previous output up-front: reaching these
+    # empty() slots on the rerun removes the old figures *before* the (minutes-long) solve, so they
+    # vanish while it runs instead of lingering underneath. Results are filled back in below.
+    _log_slot = st.empty()
+    _results_slot = st.empty()
 
-    if not steps:
-        st.session_state.pop("results", None)
-        _results_slot.error("Take at least one measurement (or add a table row) before "
-                            "reconstructing.")
-        st.stop()
+    # --- heavy solve: only on Reconstruct press --------------------------------------------
+    if reconstruct_clicked:
+        # Same table → sequence conversion the live image uses, so the solve matches the picture.
+        steps = [BeamStep(angle_deg=a, offset=o, n_beams=n)
+                 for (a, o, n) in _table_to_seq(st.session_state["beam_table"])]
 
-    # Cost guard: sensitivity parameters span the full (unique r × unique angle × time) product,
-    # so fractional offsets that don't reuse the detector grid inflate cost quadratically.
-    _rmax = IMAGE_RES / 2 - 0.5 + 1e-9
-    uniq_r, uniq_ang, total_rays = set(), set(), 0
-    for s in steps:
-        nb = s.n_beams if s.n_beams > 0 else IMAGE_RES
-        rv = [float(r) for r in s.offset + (np.arange(nb) - (nb - 1) / 2.0) if abs(r) <= _rmax]
-        total_rays += len(rv)
-        uniq_r.update(round(r, 6) for r in rv)
-        uniq_ang.add(round(s.angle_deg, 6))
-    param_cols = len(uniq_r) * len(uniq_ang) * (len(steps) + 1)
+        if not steps:
+            st.session_state.pop("results", None)
+            _results_slot.error("Take at least one measurement (or add a table row) before "
+                                "reconstructing.")
+            st.stop()
 
-    # noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
-    params = UQParams(
-        image_res=IMAGE_RES,
-        I0=float(st.session_state["live_I0"]),
-        alpha=float(st.session_state["live_alpha"]),
-        beta=float(st.session_state["live_beta"]),
-        tv_weight=float(st.session_state["live_tv_weight"]),
-        beam_steps=steps,
-    )
+        # Cost guard: sensitivity parameters span the full (unique r × unique angle × time) product,
+        # so fractional offsets that don't reuse the detector grid inflate cost quadratically.
+        _rmax = IMAGE_RES / 2 - 0.5 + 1e-9
+        uniq_r, uniq_ang, total_rays = set(), set(), 0
+        for s in steps:
+            nb = s.n_beams if s.n_beams > 0 else IMAGE_RES
+            rv = [float(r) for r in s.offset + (np.arange(nb) - (nb - 1) / 2.0) if abs(r) <= _rmax]
+            total_rays += len(rv)
+            uniq_r.update(round(r, 6) for r in rv)
+            uniq_ang.add(round(s.angle_deg, 6))
+        param_cols = len(uniq_r) * len(uniq_ang) * (len(steps) + 1)
 
-    with _log_slot.container():
-        if param_cols > 5000 or total_rays > 2000:
-            st.warning(
-                f"⚠️ ~{param_cols:,} sensitivity parameter columns / {total_rays:,} rays — the "
-                "sensitivity + covariance step may take many minutes or run out of memory. "
-                "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
-            )
-        st.subheader("Solver log (inverse solve)")
-        # Fixed-height box that auto-follows the newest line (see _LOG_IFRAME).
-        log_box = st.empty()
-        log_lines: list[str] = []
-        _last_render = [0.0]
+        # noise_cov_scale / ipopt_max_iter / linear_solver use the UQParams defaults.
+        params = UQParams(
+            image_res=IMAGE_RES,
+            I0=float(st.session_state["live_I0"]),
+            alpha=float(st.session_state["live_alpha"]),
+            beta=float(st.session_state["live_beta"]),
+            tv_weight=float(st.session_state["live_tv_weight"]),
+            beam_steps=steps,
+        )
 
-        def _render_log() -> None:
-            # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
-            body = _html.escape("".join(log_lines)[-8000:])
-            log_box.empty()  # drop the prior iframe so they don't stack
-            with log_box.container():
-                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+        with _log_slot.container():
+            if param_cols > 5000 or total_rays > 2000:
+                st.warning(
+                    f"⚠️ ~{param_cols:,} sensitivity parameter columns / {total_rays:,} rays — the "
+                    "sensitivity + covariance step may take many minutes or run out of memory. "
+                    "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
+                )
+            st.subheader("Solver log (inverse solve)")
+            # Fixed-height box that auto-follows the newest line (see _LOG_IFRAME).
+            log_box = st.empty()
+            log_lines: list[str] = []
+            _last_render = [0.0]
 
-        def log_callback(chunk: str) -> None:
-            log_lines.append(chunk)
-            now = time.time()
-            if now - _last_render[0] >= 0.2:  # throttle so the iframe rebuild doesn't flicker
-                _last_render[0] = now
-                _render_log()
+            def _render_log() -> None:
+                # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
+                body = _html.escape("".join(log_lines)[-8000:])
+                log_box.empty()  # drop the prior iframe so they don't stack
+                with log_box.container():
+                    components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
 
-        with st.spinner("Solving forward + inverse problem and extracting sensitivity…"):
-            try:
-                results = run_simple_uq(params, log_callback=log_callback)
-                st.session_state["results"] = results
-            except RuntimeError as exc:  # curated, user-facing guidance (e.g. singular-KKT UQ failure)
-                st.session_state.pop("results", None)
-                st.error(str(exc))  # message is already actionable; skip the scary chained traceback
-            except Exception as exc:  # unexpected bug: surface the full traceback
-                st.session_state.pop("results", None)
-                st.error(f"Run failed: {exc}")
-                st.exception(exc)
-            finally:
-                _render_log()  # final flush: last lines always shown and pinned to the bottom
+            def log_callback(chunk: str) -> None:
+                log_lines.append(chunk)
+                now = time.time()
+                if now - _last_render[0] >= 0.2:  # throttle so the iframe rebuild doesn't flicker
+                    _last_render[0] = now
+                    _render_log()
 
-# Render current results into the fixed slot (new ones after a solve; persisted on a plain rerun).
-_render_results(_results_slot, st.session_state.get("results"))
+            with st.spinner("Solving forward + inverse problem and extracting sensitivity…"):
+                try:
+                    results = run_simple_uq(params, log_callback=log_callback)
+                    st.session_state["results"] = results
+                except RuntimeError as exc:  # curated, user-facing guidance (e.g. singular-KKT UQ failure)
+                    st.session_state.pop("results", None)
+                    st.error(str(exc))  # message is already actionable; skip the scary chained traceback
+                except Exception as exc:  # unexpected bug: surface the full traceback
+                    st.session_state.pop("results", None)
+                    st.error(f"Run failed: {exc}")
+                    st.exception(exc)
+                finally:
+                    _render_log()  # final flush: last lines always shown and pinned to the bottom
+
+    # Render current results into the fixed slot (new ones after a solve; persisted on a plain rerun).
+    _render_results(_results_slot, st.session_state.get("results"))
