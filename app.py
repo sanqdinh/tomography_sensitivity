@@ -440,6 +440,17 @@ def _cb3d_reset():
     st.session_state["beam_table_3d"] = _empty_beam_table()
 
 
+def _cb3d_sync_z(source_key: str):
+    """Fold one of the slice pickers back into the canonical ``live3d_z``.
+
+    The Slice view and the per-slice sinogram both select a slice, but Streamlit renders every
+    tab on every run, so one widget ``key`` cannot appear in both. Each view therefore owns its
+    own slider and writes through to a single shared value, which is re-seeded into both before
+    they are re-created. Two controls, one slice — they can never disagree.
+    """
+    st.session_state["live3d_z"] = int(st.session_state[source_key])
+
+
 def _slice_figure(img, image_res, k, n_slices, n_meas, vmin, vmax, preview=None):
     """One z-slice as a grayscale image + colorbar, with the live beam bundle overlaid in red.
 
@@ -640,6 +651,9 @@ def _render_3d_tab():
     s["live3d_z"] = k
     if n_meas:
         s["live3d_meas"] = max(0, min(int(s["live3d_meas"]), n_meas - 1))
+    # Seed both slice pickers from the canonical value. Safe because it happens before either
+    # widget is instantiated this run; Streamlit only objects to writing a widget key after.
+    s["live3d_z_slice"] = s["live3d_z_sino"] = k
 
     with left3d:
         view_slice, view_vol, view_sino = st.tabs(["Slice", "Volume", "Sinogram"])
@@ -652,6 +666,8 @@ def _render_3d_tab():
                 ),
                 use_container_width=True,
             )
+            st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z_slice",
+                      on_change=_cb3d_sync_z, args=("live3d_z_slice",))
 
         with view_vol:
             src = s["live3d_volsrc"]
@@ -724,6 +740,9 @@ def _render_3d_tab():
                     ),
                     use_container_width=True,
                 )
+                st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z_sino",
+                          on_change=_cb3d_sync_z, args=("live3d_z_sino",),
+                          help="Shared with the Slice view — both track the same slice.")
             else:
                 m = int(s["live3d_meas"])
                 ang, off, nb = seq3d[m]
@@ -743,10 +762,6 @@ def _render_3d_tab():
                 )
 
     with mid3d:
-        st.markdown("**View**")
-        st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z",
-                  help="Drives both the Slice view and the per-slice sinogram.")
-
         st.markdown("**Next measurement**")
         st.slider("Angle (deg)", 0.0, 360.0, step=1.0, key="live3d_angle")
         st.slider("Offset", -float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, step=0.5,
@@ -758,7 +773,10 @@ def _render_3d_tab():
                   use_container_width=True)
 
         st.markdown("**Volume & dose**")
-        st.slider("Slices (z)", _N_SLICES_MIN, _N_SLICES_MAX, step=1, key="live3d_nslices")
+        st.slider("Number of slices", _N_SLICES_MIN, _N_SLICES_MAX, step=1,
+                  key="live3d_nslices",
+                  help="How many z-slices the volume is built from. Not to be confused with "
+                       "\"Slice (z)\" in the Slice / Sinogram views, which picks which one to show.")
         st.selectbox("Phantom contrast", ("modified", "classic"), key="live3d_variant",
                      help="'classic' is the textbook Kak & Slaney table; its interior "
                           "features sit ~2% above background and wash out under dose.")
