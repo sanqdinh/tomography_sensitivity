@@ -467,6 +467,40 @@ def _slice_figure(img, image_res, k, n_slices, n_meas, vmin, vmax, preview=None)
     return fig
 
 
+def _sinogram_figure(panel, image_res, xlabel, xticklabels, title):
+    """A sinogram panel: detector position (rows) against ``xlabel`` (columns).
+
+    ``panel`` is a slice of the ``(detector, measurement, slice)`` array from
+    :func:`tomography_3d.simulate_3d`, so unmeasured cells are ``NaN``. A hand-built sequence
+    samples only a few of the ``image_res`` detector slots, so most of the panel is genuinely
+    unmeasured — those cells are drawn in a flat off-colour via ``set_bad`` so they read as
+    "no data" rather than as a real low line-integral.
+    """
+    r_grid = detector_grid(image_res)
+    fig, ax = plt.subplots(figsize=(7.6, 6.2))
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("#2b2b3a")  # unmeasured — deliberately not part of the viridis ramp
+    finite = np.isfinite(panel)
+    im = ax.imshow(
+        np.ma.masked_invalid(panel), cmap=cmap, aspect="auto", interpolation="nearest",
+        origin="lower", vmin=(np.nanmin(panel) if finite.any() else 0.0),
+        vmax=(np.nanmax(panel) if finite.any() else 1.0),
+        extent=[-0.5, panel.shape[1] - 0.5, r_grid[0] - 0.5, r_grid[-1] + 0.5],
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Line integral  ∫ pixel dl")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Detector position r")
+    ax.set_title(title)
+    if xticklabels is not None and 0 < len(xticklabels) <= 24:
+        ax.set_xticks(range(len(xticklabels)))
+        ax.set_xticklabels(xticklabels, fontsize=8, rotation=45 if len(xticklabels) > 8 else 0)
+    if not finite.any():
+        ax.text(0.5, 0.5, "no measurements yet", transform=ax.transAxes,
+                ha="center", va="center", color="white", fontsize=13)
+    return fig
+
+
 def _volume_figure(vol, opacity: float, isomin: float, title: str, colorscale: str):
     """Translucent 3D voxel rendering — the "look inside" view.
 
@@ -541,7 +575,6 @@ def _render_3d_tab():
                 ),
                 use_container_width=True,
             )
-            st.slider("Viewed slice (z)", 0, max(n_slices - 1, 0), key="live3d_z")
 
         with view_vol:
             src = s["live3d_volsrc"]
@@ -575,9 +608,48 @@ def _render_3d_tab():
             st.caption("Drag to rotate · scroll to zoom · double-click to reset.")
 
         with view_sino:
-            st.info("Sinogram view — next commit.")
+            st.radio("View", ("Per-slice sinogram", "Per-measurement projection"),
+                     key="live3d_sinoview", horizontal=True,
+                     help="A sinogram is one slice's readings across every measurement. A "
+                          "projection is one measurement's readings across every slice — what "
+                          "a 2D detector panel behind the volume would record.")
+            if n_meas == 0:
+                st.pyplot(_sinogram_figure(np.full((IMAGE_RES, 1), np.nan), IMAGE_RES,
+                                           "Measurement", None,
+                                           "Take a measurement to populate the sinogram"),
+                          use_container_width=True)
+            elif s["live3d_sinoview"] == "Per-slice sinogram":
+                st.pyplot(
+                    _sinogram_figure(
+                        sino[:, :, k], IMAGE_RES, "Measurement (angle)",
+                        ["%d\n%.0f°" % (i, a) for i, (a, _o, _n) in enumerate(seq3d)],
+                        "Sinogram of slice z = %d / %d" % (k, n_slices - 1),
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                m = int(s["live3d_meas"])
+                ang, off, nb = seq3d[m]
+                st.pyplot(
+                    _sinogram_figure(
+                        sino[:, m, :], IMAGE_RES, "Slice z", None,
+                        "2D projection of measurement %d  ·  %.0f°, offset %.1f, %s"
+                        % (m, ang, off, "full fan" if nb == 0 else "%d beams" % nb),
+                    ),
+                    use_container_width=True,
+                )
+                if n_meas > 1:
+                    st.slider("Measurement", 0, n_meas - 1, key="live3d_meas")
+                st.caption(
+                    "Every slice's reading for this one measurement, stacked — the image a 2D "
+                    "detector panel behind the volume would record."
+                )
 
     with mid3d:
+        st.markdown("**View**")
+        st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z",
+                  help="Drives both the Slice view and the per-slice sinogram.")
+
         st.markdown("**Next measurement**")
         st.slider("Angle (deg)", 0.0, 360.0, step=1.0, key="live3d_angle")
         st.slider("Offset", -float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, step=0.5,
