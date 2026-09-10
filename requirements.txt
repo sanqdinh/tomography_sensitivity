@@ -14,3 +14,6 @@ pandas==2.2.2
 
 # Web UI
 streamlit==1.38.0
+# Interactive 3D volume rendering (st.plotly_chart) in the 3D degradation tab.
+# Pure-python wheel + a bundled JS asset; no native build, no solver interaction.
+plotly==5.24.1

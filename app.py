@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import plotly.graph_objects as go
 
 from tomography_uq import UQParams, BeamStep, run_simple_uq
 
@@ -466,6 +467,44 @@ def _slice_figure(img, image_res, k, n_slices, n_meas, vmin, vmax, preview=None)
     return fig
 
 
+def _volume_figure(vol, opacity: float, isomin: float, title: str, colorscale: str):
+    """Translucent 3D voxel rendering — the "look inside" view.
+
+    Plotly composites the whole volume with per-voxel alpha, so interior structure shows
+    through the skull instead of being hidden by it, and the user can drag to rotate. ``caps``
+    are off so the volume reads as open rather than shrink-wrapped in solid end faces, and
+    ``isomin`` clips the air around the head (which would otherwise fog the view).
+
+    Axes follow the array: x = column, y = row, z = slice.
+    """
+    nr, nc, nz = vol.shape
+    yy, xx, zz = np.meshgrid(np.arange(nr), np.arange(nc), np.arange(nz), indexing="ij")
+    fig = go.Figure(
+        data=go.Volume(
+            x=xx.ravel(), y=yy.ravel(), z=zz.ravel(), value=vol.ravel(),
+            isomin=float(isomin), isomax=float(max(vol.max(), isomin + 1e-6)),
+            opacity=float(opacity),
+            surface=dict(count=17),
+            colorscale=colorscale,
+            caps=dict(x_show=False, y_show=False, z_show=False),
+            colorbar=dict(title="Intensity", thickness=14),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=620,
+        margin=dict(l=0, r=0, t=40, b=0),
+        scene=dict(
+            xaxis_title="x (col)", yaxis_title="y (row)", zaxis_title="z (slice)",
+            # Equal data scaling in x/y; z is exaggerated when there are few slices so a thin
+            # stack is still legible rather than a pancake.
+            aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=max(0.35, min(1.0, nz / max(nr, 1)))),
+        ),
+    )
+    return fig
+
+
 def _render_3d_tab():
     """The 3D degradation simulator: build a sequence, scrub slices, watch the dose land."""
     s = st.session_state
@@ -505,7 +544,35 @@ def _render_3d_tab():
             st.slider("Viewed slice (z)", 0, max(n_slices - 1, 0), key="live3d_z")
 
         with view_vol:
-            st.info("Volume view — next commit.")
+            src = s["live3d_volsrc"]
+            if src == "Original":
+                data, cmap_name = vol0, "Gray"
+                title = "Phantom (no dose applied)"
+            elif src == "Dose removed":
+                data, cmap_name = vol0 - vol, "Inferno"
+                title = "Dose removed (original − degraded) — where the beams landed"
+            else:
+                data, cmap_name = vol, "Gray"
+                title = "Degraded volume · %d measurement%s" % (
+                    n_meas, "" if n_meas == 1 else "s")
+            st.plotly_chart(
+                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"], title, cmap_name),
+                use_container_width=True,
+            )
+            vc1, vc2, vc3 = st.columns(3)
+            with vc1:
+                st.radio("Show", ("Degraded", "Original", "Dose removed"),
+                         key="live3d_volsrc",
+                         help="'Dose removed' is the clearest view of where the beams "
+                              "deposited energy.")
+            with vc2:
+                st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity",
+                          help="Lower = more see-through. This is the 'look inside' knob.")
+            with vc3:
+                st.slider("Hide below", 0.0, 0.9, step=0.01, key="live3d_isomin",
+                          help="Clip low values (the air around the head) so they do not "
+                               "fog the view.")
+            st.caption("Drag to rotate · scroll to zoom · double-click to reset.")
 
         with view_sino:
             st.info("Sinogram view — next commit.")

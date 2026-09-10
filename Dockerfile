@@ -61,6 +61,7 @@ COPY tomography_uq.py tomography_3d.py dose_response.py app.py ./
 
 # 7) Build-time make-or-break checks: vendored package imports, and IPOPT solves end-to-end.
 RUN python3 -c "import senDOE; print('senDOE import OK')" \
+    && python3 -c "import plotly.graph_objects as go; go.Volume(); print('plotly OK')" \
     && python3 -c "from tomography_3d import shepp_logan_3d, degrade_volume; \
 v=shepp_logan_3d(16,4); d=degrade_volume(v,((0.0,0.0,0),),5.0,0.3,0.01,16); \
 assert v.shape==(16,16,4) and d.sum()<v.sum(); print('3D degradation sim OK')" \
