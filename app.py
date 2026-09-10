@@ -534,7 +534,7 @@ def _exposed_faces(mask, axis, positive):
     return mask & ~nb
 
 
-def _volume_figure(vol, opacity, isomin, isomax, title, colorscale,
+def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
                    cut_axis="none", cut_frac=0.0):
     """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
 
@@ -551,6 +551,12 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale,
     ``isomin``/``isomax`` keep only voxels in that intensity band. Hiding *above* is what peels
     the uniform crust off: set it just under the crust value and the shell disappears, leaving
     the interior structures standing on their own.
+
+    ``cmax`` is supplied by the caller and is deliberately **independent of the sliders**: the
+    colour scale must not move when you hide, cut or fade voxels, or the same intensity would
+    render as a different colour at every slider position and nothing could be compared. Fixing
+    it costs some contrast when only the dim interior is left on screen — that is the intended
+    trade: a stable, readable scale beats a pretty but meaningless one.
     """
     nr, nc, nz = vol.shape
     mask = (vol >= isomin) & (vol <= isomax)
@@ -584,13 +590,10 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale,
                 k=np.stack([base + 2, base + 3], 1).ravel(),
                 intensity=np.repeat(vals, 2), intensitymode="cell",
                 colorscale=colorscale,
-                # Ramp runs 0 -> brightest VISIBLE voxel. Anchoring the top to the slider
-                # cutoff instead would squash the interior (0.2-0.3) into the bottom of the
-                # ramp once the crust is hidden; anchoring the bottom to the visible minimum
-                # would push the bulk brain value to pure black. Intensity is physically
-                # non-negative, so 0 is the natural dark end.
+                # Fixed 0 -> cmax, set by the caller and never by the mask, so no slider can
+                # rescale the bar. Intensity is physically non-negative, so 0 is the dark end.
                 cmin=0.0,
-                cmax=float(max(vals.max(), 1e-6)),
+                cmax=float(max(cmax, 1e-6)),
                 opacity=float(opacity), flatshading=True,
                 lighting=dict(ambient=0.62, diffuse=0.58, specular=0.12, roughness=0.7),
                 lightposition=dict(x=2 * nc, y=-2 * nr, z=2 * nz),
@@ -652,6 +655,12 @@ def _render_3d_tab():
 
         with view_vol:
             src = s["live3d_volsrc"]
+            # Colour ceilings are pinned to the UNDEGRADED phantom, not to whatever is on
+            # screen, so the bar holds still while you work the sliders. Original and Degraded
+            # share one scale (same physical quantity), which also keeps them comparable as
+            # dose accumulates and the degraded maximum drifts down. Dose removed is a
+            # difference, bounded by the same maximum, so it uses it too.
+            fixed_cmax = float(vol0.max())
             if src == "Original":
                 data, cmap_name = vol0, "Gray"
                 title = "Phantom (no dose applied)"
@@ -664,7 +673,7 @@ def _render_3d_tab():
                     n_meas, "" if n_meas == 1 else "s")
             st.plotly_chart(
                 _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"],
-                               s["live3d_isomax"], title, cmap_name,
+                               s["live3d_isomax"], title, cmap_name, fixed_cmax,
                                s["live3d_cutaxis"], s["live3d_cut"]),
                 use_container_width=True,
             )
