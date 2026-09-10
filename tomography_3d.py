@@ -34,15 +34,19 @@ from dose_response import (
 # One row per ellipsoid: (a, b, c, x0, y0, z0, phi_deg, theta_deg, psi_deg, value).
 # a/b/c are semi-axes and x0/y0/z0 the center, all in the normalized [-1, 1] head frame;
 # the three Euler angles orient the ellipsoid (ZYZ). Voxels inside an ellipsoid have its
-# ``value`` ADDED, so the tables are read top-to-bottom: the skull is laid down first and the
-# interior structures are carved out of it by later, negative entries.
+# ``value`` ADDED, so the table is read top-to-bottom: the skull is laid down first, the second
+# row pulls the interior down to the brain background, and each later row lifts its structure
+# above that background. The table entry is therefore NOT the tissue value -- see
+# :func:`shepp_logan_table`.
 #
-# theta == 0 for every row in both tables, so the ZYZ rotation collapses to a rotation about z
+# theta == 0 for every row, so the ZYZ rotation collapses to a rotation about z
 # (i.e. within the slice plane) -- the general rotation is implemented anyway so a caller can add
 # genuinely out-of-plane ellipsoids without touching the rasterizer.
 
-# Textbook contrast (Kak & Slaney). Faithful to the literature, but the interior features sit
-# within ~2% of the surrounding tissue, so they wash out as soon as degradation dims the image.
+# Geometry and provenance: the textbook Kak & Slaney table. The first NINE columns -- semi-axes,
+# centre and Euler angles -- are used VERBATIM and are never modified. The tenth column is the
+# published intensity, kept for reference only; what this module actually renders comes from
+# _TISSUE_TARGETS below.
 SHEPP_LOGAN_3D_CLASSIC = (
     (0.6900, 0.920, 0.810, 0.000, 0.0000, 0.00, 0.0, 0.0, 0.0, 1.00),
     (0.6624, 0.874, 0.780, 0.000, -0.0184, 0.00, 0.0, 0.0, 0.0, -0.98),
@@ -56,41 +60,66 @@ SHEPP_LOGAN_3D_CLASSIC = (
     (0.0230, 0.046, 0.020, 0.060, -0.6050, 0.00, 0.0, 0.0, 0.0, 0.01),
 )
 
-# Same geometry, boosted contrast (Toft-style). This is the default: the point of the app is to
-# *see* dose damage, and structures at 2% of background vanish under the exp() dimming.
-SHEPP_LOGAN_3D_MODIFIED = tuple(
-    row[:9] + (value,)
-    for row, value in zip(
-        SHEPP_LOGAN_3D_CLASSIC,
-        (1.0, -0.8, -0.2, -0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
-    )
+# --- intensity scheme ---------------------------------------------------------------------
+# Tissue values at contrast = 1. Every interior structure sits ABOVE the brain background, so no
+# voxel inside the skull is ever 0. That is deliberate: 0 is also the value of air, so a
+# zero-valued cavity is indistinguishable from empty space in the Volume view. The textbook
+# table put the ventricles at exactly brain - 0.2 = 0.0, which made the interior read as part
+# solid, part empty and hid the structures behind a featureless shell.
+CRUST_VALUE = 1.0      # outer skull; also the intensity the crust shell is painted with
+BRAIN_VALUE = 0.1      # the bulk of the skull interior
+FEATURE_VALUE = 0.3    # ventricles, upper blob, bottom cluster
+EYE_VALUE = 0.4        # the two small floating spheres at z = +0.25
+
+# Tissue target per ellipsoid, in table order. These are the values a voxel ENDS UP with, not
+# the additive table entries -- shepp_logan_table() converts between the two.
+_TISSUE_TARGETS = (
+    CRUST_VALUE,     # 1  outer skull
+    BRAIN_VALUE,     # 2  inner skull -> sets the interior background
+    FEATURE_VALUE,   # 3  right ventricle
+    FEATURE_VALUE,   # 4  left ventricle
+    FEATURE_VALUE,   # 5  upper blob
+    EYE_VALUE,       # 6  floating sphere ("eye")
+    EYE_VALUE,       # 7  floating sphere ("eye")
+    FEATURE_VALUE,   # 8  bottom cluster
+    FEATURE_VALUE,   # 9  bottom cluster
+    FEATURE_VALUE,   # 10 bottom cluster
 )
 
-PHANTOM_VARIANTS = {
-    "modified": SHEPP_LOGAN_3D_MODIFIED,
-    "classic": SHEPP_LOGAN_3D_CLASSIC,
-}
-
-# Contrast is continuous rather than a two-way choice: the tables share identical geometry and
-# differ only in the value column, so any point between them is a valid phantom. 0 = classic,
-# 1 = modified, above 1 extrapolates past the modified table for a deliberately exaggerated
-# phantom. The skull value is 1.0 in both, so it -- and therefore the crust and the Volume
-# view's colour ceiling -- is unaffected by this slider.
+# Contrast scales how far each interior structure sits above the brain background. 0 leaves a
+# uniform BRAIN_VALUE interior, 1 gives the targets above, higher exaggerates. The skull and the
+# brain are NOT scaled, so the crust -- and therefore the Volume view's colour ceiling -- holds
+# still, and no structure ever passes back through the background value on the way.
 DEFAULT_CONTRAST = 1.0
 
 
 def shepp_logan_table(contrast: float = DEFAULT_CONTRAST) -> tuple:
-    """Ellipsoid table with the value column blended between classic and modified contrast.
+    """Ellipsoid table whose value column yields :data:`_TISSUE_TARGETS` at ``contrast=1``.
 
-    Written as ``(1 - t)*classic + t*modified`` rather than ``classic + t*(modified - classic)``
-    so that ``contrast=0`` and ``contrast=1`` reproduce the two published tables *exactly* in
-    floating point, not to within a rounding error.
+    Values are ADDED where ellipsoids overlap, so a structure's table entry is its offset from
+    whatever is already there, not its final intensity:
+
+    * row 1 (outer skull) is absolute -- ``CRUST_VALUE``;
+    * row 2 (inner skull) is ``BRAIN_VALUE - CRUST_VALUE``, which pulls everything inside the
+      skull down to the brain background;
+    * every later row is ``contrast * (target - BRAIN_VALUE)`` -- its height above that
+      background, scaled by the slider.
+
+    Rows 1 and 2 are deliberately left unscaled so the crust and the brain are the same at every
+    contrast, and every feature approaches the background from one side only.
     """
     t = float(contrast)
-    return tuple(
-        row[:9] + ((1.0 - t) * row[9] + t * mod_row[9],)
-        for row, mod_row in zip(SHEPP_LOGAN_3D_CLASSIC, SHEPP_LOGAN_3D_MODIFIED)
-    )
+    rows = []
+    for n, (row, target) in enumerate(zip(SHEPP_LOGAN_3D_CLASSIC, _TISSUE_TARGETS)):
+        if n == 0:
+            value = CRUST_VALUE
+        elif n == 1:
+            value = BRAIN_VALUE - CRUST_VALUE
+        else:
+            value = t * (target - BRAIN_VALUE)
+        rows.append(row[:9] + (value,))
+    return tuple(rows)
+
 
 # Half-height of the sampled z range, in the normalized head frame. The outer skull ellipsoid has
 # c = 0.81, so sampling out to 0.8 keeps every slice inside the head (a full [-1, 1] span would
@@ -134,9 +163,17 @@ def shepp_logan_3d(
     Values are clipped to ``[0, 1]`` to match the range of the 2D ``shepp_logan_phantom`` and to
     keep the dose-response model on non-negative pixels.
 
-    ``contrast`` is continuous: 0 gives the textbook Kak & Slaney values (interior features ~2%
-    above background, which vanish under dose), 1 the modified/Toft values, and above 1
-    exaggerates further. See :func:`shepp_logan_table`.
+    Tissue values at ``contrast=1``: crust/skull 1.0, brain 0.1, ventricles + upper blob +
+    bottom cluster 0.3, and the two floating "eye" spheres 0.4. **Nothing inside the skull is
+    0** -- 0 is air, and a zero-valued cavity is indistinguishable from empty space in the
+    Volume view. ``contrast`` scales each structure's height above the 0.1 background; see
+    :func:`shepp_logan_table`.
+
+    Resolution caveat: the eye spheres are r = 0.046, about 0.7 voxel at ``image_res=30``, so
+    they land on only ~2 voxels at the app's default grid (4 at ``n_slices=48``); the three
+    bottom-cluster ellipsoids are smaller still and render **no** voxels at any grid this app
+    offers. Their values are therefore nominal at low resolution -- the published geometry is
+    kept as-is rather than inflated to suit the display.
 
     **Crust.** The outermost ``crust_voxels`` layer of the head is forced to one constant
     intensity (``crust_value``, defaulting to the table's skull value). The analytic skull --

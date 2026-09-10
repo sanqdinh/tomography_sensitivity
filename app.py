@@ -785,11 +785,11 @@ def _render_3d_tab():
                   help="How many z-slices the volume is built from. Not to be confused with "
                        "\"Slice (z)\" in the Slice / Sinogram views, which picks which one to show.")
         st.slider("Phantom contrast", 0.0, 2.0, step=0.05, key="live3d_contrast",
-                  help="How far the interior structures stand out from brain tissue. "
-                       "0 = textbook Kak & Slaney (features ~2% above background, so they "
-                       "wash out as soon as dose dims the image); 1 = modified/Toft; above 1 "
-                       "exaggerates further. The skull stays at 1.0 throughout, so the crust "
-                       "and the Volume colour scale do not move.")
+                  help="How far the interior structures stand above the brain background. "
+                       "0 leaves a uniform 0.1 interior; 1 gives ventricles/blobs 0.3 and the "
+                       "two floating spheres 0.4; above 1 exaggerates. Brain and skull are not "
+                       "scaled, so the crust stays at 1.0 and the Volume colour scale never "
+                       "moves. Nothing inside the skull is ever 0 — that value means air.")
         st.number_input("I0 (0 = no degradation)", min_value=0.0, step=0.5,
                         key="live3d_I0")
         st.number_input("alpha", min_value=0.0, step=0.05, format="%.3f", key="live3d_alpha")
