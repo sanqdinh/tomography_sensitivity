@@ -57,10 +57,13 @@ RUN /opt/idaes/bin/ipopt --version \
 COPY senDOE/ ./senDOE/
 COPY .streamlit/ ./.streamlit/
 COPY live_sim_component/ ./live_sim_component/
-COPY tomography_uq.py app.py ./
+COPY tomography_uq.py tomography_3d.py dose_response.py app.py ./
 
 # 7) Build-time make-or-break checks: vendored package imports, and IPOPT solves end-to-end.
 RUN python3 -c "import senDOE; print('senDOE import OK')" \
+    && python3 -c "from tomography_3d import shepp_logan_3d, degrade_volume; \
+v=shepp_logan_3d(16,4); d=degrade_volume(v,((0.0,0.0,0),),5.0,0.3,0.01,16); \
+assert v.shape==(16,16,4) and d.sum()<v.sum(); print('3D degradation sim OK')" \
     && python3 -c "import pyomo.environ as pyo; \
 m=pyo.ConcreteModel(); m.x=pyo.Var(initialize=1.0); \
 m.c=pyo.Constraint(expr=m.x>=2.0); m.o=pyo.Objective(expr=(m.x-3.0)**2); \

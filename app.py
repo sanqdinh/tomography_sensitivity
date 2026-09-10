@@ -1,6 +1,6 @@
 """Streamlit UI for the tomographic uncertainty-quantification pipeline.
 
-Two modes share one page:
+The page has two tabs. The **2D** tab holds two modes that share it:
 
 1. **Live dose-response simulator** (main area) — an interactive playground laid
    out as picture | dials/buttons | sequence table. The read-only table is the single measurement
@@ -22,7 +22,7 @@ Two modes share one page:
 Streamlit reruns the whole script on every widget interaction, so the degraded image and the
 solve results are stashed in ``st.session_state`` to survive reruns. The heavy solve runs ONLY
 on the Reconstruct button press. This file is the only entrypoint and changes nothing in the
-backend: it imports the vendored geometry primitives and re-implements one small numpy helper
+backend: it imports the vendored geometry primitives and the shared numpy helpers
 (the dose-response degradation) for the live preview.
 """
 
