@@ -394,7 +394,7 @@ for _k, _v in {
     "live3d_nslices": 16, "live3d_contrast": 1.0,
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
     "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
-    "live3d_isomax": 1.0, "live3d_cutaxis": "x (col)", "live3d_cut": 0.3,
+    "live3d_isomax": 1.0, "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -713,11 +713,18 @@ def _render_3d_tab():
                 st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis",
                              help="Slice the volume open along an axis to expose the interior "
                                   "as a solid cut face.")
-                st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut")
+                st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut",
+                          help="How much of the axis to slice away. ~0.5 puts the cut plane "
+                               "through the middle of the head, which is where the ventricles "
+                               "and blobs are; below ~0.35 it stays outboard of them and the "
+                               "exposed face is solid brain.")
             st.caption(
                 "Every voxel is a solid cube — no interpolation. Faces between two drawn voxels "
                 "are culled, so you see surfaces rather than a fog of stacked quads. "
-                "Drag to rotate · scroll to zoom · double-click to reset."
+                "**A cavity is only visible where the cut plane passes through it**: the "
+                "ventricles sit at x ≈ ±0.22, so a shallow cut exposes nothing but solid brain. "
+                "Hiding the crust does not help on its own — the brain underneath is itself a "
+                "closed mass wrapping them. Drag to rotate · scroll to zoom · double-click to reset."
             )
 
         with view_sino:
