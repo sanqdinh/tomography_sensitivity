@@ -58,7 +58,7 @@ from dose_response import (
     bundle_r_values as _bundle_r_values,
     degradation_dose_response as _degradation_dose_response,
 )
-from tomography_3d import shepp_logan_3d, degrade_volume
+from tomography_3d import shepp_logan_3d, simulate_3d, detector_grid
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -392,6 +392,8 @@ for _k, _v in {
     "live3d_angle": 45.0, "live3d_offset": 0.0, "live3d_nbeams": 30, "live3d_z": 0,
     "live3d_nslices": 16, "live3d_variant": "modified",
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
+    "live3d_meas": 0, "live3d_opacity": 0.15, "live3d_isomin": 0.05,
+    "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -405,15 +407,17 @@ _N_SLICES_MIN, _N_SLICES_MAX = 4, 48
 
 
 @st.cache_data(show_spinner=False)
-def _degraded_volume(seq: tuple, I0: float, alpha: float, beta: float,
-                     image_res: int, n_slices: int, variant: str) -> np.ndarray:
-    """Cumulative degradation of the 3D phantom over the sequence (cached like the 2D image).
+def _simulate_3d(seq: tuple, I0: float, alpha: float, beta: float,
+                 image_res: int, n_slices: int, variant: str):
+    """``(original, degraded, sinogram)`` for the sequence (cached like the 2D image).
 
-    Pure function of the table + dose params + volume size, so scrubbing the z slider is a
-    cache hit and only taking a measurement or changing a parameter recomputes.
+    Pure function of the table + dose params + volume size, so scrubbing z, switching sub-tab,
+    rotating the volume and changing the measurement index are all cache hits; only taking a
+    measurement or changing a parameter recomputes.
     """
-    vol = shepp_logan_3d(image_res, n_slices, variant=variant)
-    return degrade_volume(vol, seq, I0, alpha, beta, image_res)
+    vol0 = shepp_logan_3d(image_res, n_slices, variant=variant)
+    vol1, sino = simulate_3d(vol0, seq, I0, alpha, beta, image_res)
+    return vol0, vol1, sino
 
 
 def _cb3d_step():
@@ -477,23 +481,34 @@ def _render_3d_tab():
     n_meas = len(seq3d)
     n_slices = int(s["live3d_nslices"])
 
-    vol = _degraded_volume(
+    vol0, vol, sino = _simulate_3d(
         seq3d, float(s["live3d_I0"]), float(s["live3d_alpha"]), float(s["live3d_beta"]),
         IMAGE_RES, n_slices, s["live3d_variant"],
     )
-    # Clamp the viewed slice: n_slices may have shrunk since it was set.
+    # Clamp the viewed slice / measurement: either may have shrunk since it was set.
     k = max(0, min(int(s["live3d_z"]), n_slices - 1))
     s["live3d_z"] = k
+    if n_meas:
+        s["live3d_meas"] = max(0, min(int(s["live3d_meas"]), n_meas - 1))
 
     with left3d:
-        st.pyplot(
-            _slice_figure(
-                vol[:, :, k], IMAGE_RES, k, n_slices, n_meas, 0.0, 1.0,
-                preview=(s["live3d_angle"], s["live3d_offset"], s["live3d_nbeams"]),
-            ),
-            use_container_width=True,
-        )
-        st.slider("Viewed slice (z)", 0, max(n_slices - 1, 0), key="live3d_z")
+        view_slice, view_vol, view_sino = st.tabs(["Slice", "Volume", "Sinogram"])
+
+        with view_slice:
+            st.pyplot(
+                _slice_figure(
+                    vol[:, :, k], IMAGE_RES, k, n_slices, n_meas, 0.0, 1.0,
+                    preview=(s["live3d_angle"], s["live3d_offset"], s["live3d_nbeams"]),
+                ),
+                use_container_width=True,
+            )
+            st.slider("Viewed slice (z)", 0, max(n_slices - 1, 0), key="live3d_z")
+
+        with view_vol:
+            st.info("Volume view — next commit.")
+
+        with view_sino:
+            st.info("Sinogram view — next commit.")
 
     with mid3d:
         st.markdown("**Next measurement**")
@@ -519,7 +534,7 @@ def _render_3d_tab():
     with right3d:
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
-        total0 = float(shepp_logan_3d(IMAGE_RES, n_slices, s["live3d_variant"]).sum())
+        total0 = float(vol0.sum())
         total1 = float(vol.sum())
         lost = 0.0 if total0 == 0 else 100.0 * (1.0 - total1 / total0)
         st.metric("Intensity removed", "%.1f%%" % lost,
