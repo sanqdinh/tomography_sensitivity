@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -53,6 +54,32 @@ from senDOE.models.tomography_pyomo_pixel_intersection import (  # noqa: E402
 )
 from senDOE.helpers.statistics import d_optimality  # noqa: E402
 from senDOE.sensitivity.pyomo_sensitivity import extract_sensitivity_matrix  # noqa: E402
+
+
+# --- DIAGNOSTIC: stream k_aug's own solver log ---------------------------------------------
+# The vendored extract_sensitivity_matrix() runs k_aug with tee=False, which buries k_aug's
+# native stdout (which linear solver it picked, the KKT inertia, and any singular/ill-conditioned
+# warnings) in a temp file that is then deleted -- precisely the output needed to diagnose a
+# singular-KKT sensitivity failure on Fly. We must NOT edit the vendored file, so flip tee on by
+# wrapping K_augInterface.k_aug once at import. This is logging-only: it changes no numerics, just
+# echoes the subprocess output to this process's stdout (where `flyctl logs` captures it).
+try:
+    from pyomo.contrib.sensitivity_toolbox.k_aug import (  # noqa: E402
+        K_augInterface as _K_augInterface,
+    )
+
+    if not getattr(_K_augInterface, "_tomo_verbose_patched", False):
+        _orig_k_aug_solve = _K_augInterface.k_aug
+
+        def _verbose_k_aug_solve(self, model, **kwargs):
+            kwargs["tee"] = True  # override the vendored tee=False; stream k_aug's log
+            print("\n----- k_aug solver log (tee) -----", flush=True)
+            return _orig_k_aug_solve(self, model, **kwargs)
+
+        _K_augInterface.k_aug = _verbose_k_aug_solve
+        _K_augInterface._tomo_verbose_patched = True
+except Exception:  # never let a diagnostics shim break the import or the pipeline
+    pass
 
 
 # Linear solvers available in the IDAES IPOPT extensions, in preference order. ``ma27`` is
@@ -391,6 +418,65 @@ def run_simple_uq(
             sinogram_vars.append(var)
         elif not var.fixed:
             var.fix()
+
+    # --- DIAGNOSTIC: conditioning picture right before k_aug --------------------------
+    # Emitted to BOTH the UI live log (writer) and this process's stdout, so a failing run
+    # on Fly is fully diagnosable from `flyctl logs`. The active-set census is the direct
+    # test of the singular-reduced-Hessian theory: k_aug factors the KKT on the subspace of
+    # pixels NOT pinned to a [0,1] bound; if the RMSE term constrains only a few directions
+    # and the rest lean on (rank-deficient) TV curvature, that reduced system can be singular
+    # on one machine and not another. Logging only -- changes no numerics.
+    def _diag(line: str) -> None:
+        writer.write(line + "\n")
+        print(line, flush=True)
+        sys.stdout.flush()
+
+    _tol = 1e-6
+    _at_lb = _at_ub = _interior = _unbounded = _no_val = 0
+    _vmin, _vmax = float("inf"), float("-inf")
+    _lb0 = _ub0 = "n/a"
+    for _v in image0_vars:
+        _val = _v.value
+        if _val is None:
+            _no_val += 1
+            continue
+        _vmin, _vmax = min(_vmin, _val), max(_vmax, _val)
+        _lb, _ub = _v.lb, _v.ub
+        if _lb0 == "n/a":
+            _lb0, _ub0 = _lb, _ub
+        if _lb is not None and abs(_val - _lb) <= _tol:
+            _at_lb += 1
+        elif _ub is not None and abs(_val - _ub) <= _tol:
+            _at_ub += 1
+        elif _lb is None and _ub is None:
+            _unbounded += 1
+        else:
+            _interior += 1
+    _n_px = image_res * image_res
+    _n_rays = len(measurement_set)
+    _free_dirs = _interior + _unbounded
+    _diag("\n===== K_AUG PRE-FLIGHT DIAGNOSTICS =====")
+    _diag(f"inverse solve: status={inv_tc}, linear_solver={inv_ls}")
+    _diag(
+        f"image0 free vars={len(image0_vars)} of {_n_px} pixels | measurement rays={_n_rays} "
+        f"| k_aug params (measured sinogram entries)={len(sinogram_vars)}"
+    )
+    _diag(f"image0 value range=[{_vmin:.4g}, {_vmax:.4g}] | pixel bounds=[{_lb0}, {_ub0}]")
+    _diag(
+        f"active-set census @ tol={_tol:g}: at_lower={_at_lb}, at_upper={_at_ub}, "
+        f"interior={_interior}, unbounded={_unbounded}, no_value={_no_val}"
+    )
+    _diag(
+        f"=> ~{_free_dirs} pixels are interior/free; the reduced Hessian must be nonsingular on "
+        f"that subspace for k_aug to factor. RMSE constrains <= {_n_rays} directions; the rest "
+        f"rely on TV curvature (tv_weight={params.tv_weight:g}, I0={params.I0:g})."
+    )
+    _diag(
+        f"binaries: ipopt={_resolve_ipopt()!r} | k_aug={shutil.which('k_aug')!r} | "
+        f"dot_sens={shutil.which('dot_sens')!r}"
+    )
+    _diag("=========================================\n")
+
     def _uq_failure(detail: str) -> RuntimeError:
         # Build a clear, actionable error for a failed sensitivity/covariance step and close the
         # figures already built above so a repeated (failing) Reconstruct does not leak them.
@@ -420,6 +506,9 @@ def run_simple_uq(
             return_type="dense",
         )
     except (TypeError, ValueError, KeyError, IndexError) as exc:
+        # DIAGNOSTIC: surface the underlying parser/extraction failure verbatim (it is otherwise
+        # only chained behind the friendly RuntimeError and never reaches the Fly log).
+        _diag(f"[k_aug raw failure] {type(exc).__name__}: {exc}")
         # k_aug produces no usable dsdp output when it cannot factor the KKT system at the solution
         # (singular / rank-deficient reduced Hessian). The vendored parser then fails cryptically:
         # np.fromstring(None, ...) -> TypeError "a bytes-like object is required, not 'NoneType'"
@@ -431,6 +520,11 @@ def run_simple_uq(
     # A near-singular factorization can still emit a file full of inf/nan, which would otherwise
     # silently poison the covariance and D-optimality below — treat it like a failed extraction.
     if not np.all(np.isfinite(dimage0_dsinogram)):
+        _n_bad = int(np.count_nonzero(~np.isfinite(dimage0_dsinogram)))
+        _diag(
+            f"[k_aug non-finite] {_n_bad}/{dimage0_dsinogram.size} sensitivity entries are "
+            f"inf/nan (near-singular factorization)."
+        )
         raise _uq_failure("k_aug returned a non-finite sensitivity matrix.")
 
     # noise covariance is sigma^2 * I, so Sigma = sigma^2 * (J*J^T) -- avoids building an
