@@ -393,7 +393,8 @@ for _k, _v in {
     "live3d_angle": 45.0, "live3d_offset": 0.0, "live3d_nbeams": 30, "live3d_z": 0,
     "live3d_nslices": 16, "live3d_variant": "modified",
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
-    "live3d_meas": 0, "live3d_opacity": 0.15, "live3d_isomin": 0.05,
+    "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
+    "live3d_cutaxis": "x (col)", "live3d_cut": 0.3,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -501,37 +502,99 @@ def _sinogram_figure(panel, image_res, xlabel, xticklabels, title):
     return fig
 
 
-def _volume_figure(vol, opacity: float, isomin: float, title: str, colorscale: str):
-    """Translucent 3D voxel rendering — the "look inside" view.
+# Corner offsets for each cube face, wound counter-clockwise seen from outside. Mask axes are
+# (row, col, slice); vertices are emitted as (x=col, y=row, z=slice) to match _volume_figure's
+# scene axes.
+_VOXEL_FACES = (
+    (1, True, ((0.5, -0.5, -0.5), (0.5, 0.5, -0.5), (0.5, 0.5, 0.5), (0.5, -0.5, 0.5))),
+    (1, False, ((-0.5, -0.5, -0.5), (-0.5, -0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, 0.5, -0.5))),
+    (0, True, ((-0.5, 0.5, -0.5), (-0.5, 0.5, 0.5), (0.5, 0.5, 0.5), (0.5, 0.5, -0.5))),
+    (0, False, ((-0.5, -0.5, -0.5), (0.5, -0.5, -0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, 0.5))),
+    (2, True, ((-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (0.5, 0.5, 0.5), (-0.5, 0.5, 0.5))),
+    (2, False, ((-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5))),
+)
 
-    Plotly composites the whole volume with per-voxel alpha, so interior structure shows
-    through the skull instead of being hidden by it, and the user can drag to rotate. ``caps``
-    are off so the volume reads as open rather than shrink-wrapped in solid end faces, and
-    ``isomin`` clips the air around the head (which would otherwise fog the view).
+_CUT_AXES = {"none": None, "x (col)": 1, "y (row)": 0, "z (slice)": 2}
 
-    Axes follow the array: x = column, y = row, z = slice.
+
+def _exposed_faces(mask, axis, positive):
+    """Voxels in ``mask`` whose neighbour along ``axis`` is absent — i.e. that face is visible.
+
+    Culling the faces between two drawn voxels is what keeps this affordable *and* legible: a
+    solid region becomes a shell instead of a stack of coincident quads, so ~12k voxels emit
+    ~5k faces rather than 76k.
+    """
+    nb = np.zeros_like(mask)
+    dst, src = [slice(None)] * 3, [slice(None)] * 3
+    if positive:
+        dst[axis], src[axis] = slice(0, -1), slice(1, None)
+    else:
+        dst[axis], src[axis] = slice(1, None), slice(0, -1)
+    nb[tuple(dst)] = mask[tuple(src)]
+    return mask & ~nb
+
+
+def _volume_figure(vol, opacity, isomin, title, colorscale, cut_axis="none", cut_frac=0.0):
+    """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
+
+    ``go.Volume`` ray-marches through the data and blends between voxel centres, which smears
+    exactly the small interior structures this view exists to show. Here each voxel above
+    ``isomin`` becomes an actual cube (``go.Mesh3d`` + ``flatshading``), so blocks read as
+    blocks and a ventricle keeps a hard edge.
+
+    Two ways to see inside, because opaque blocks hide their own interior: drop ``opacity``, or
+    ``cut_frac`` away the near part of an axis to expose a cut face. The cut is applied to the
+    mask *before* face culling, so the exposed cross-section is drawn as real faces coloured by
+    the voxel values there.
     """
     nr, nc, nz = vol.shape
-    yy, xx, zz = np.meshgrid(np.arange(nr), np.arange(nc), np.arange(nz), indexing="ij")
-    fig = go.Figure(
-        data=go.Volume(
-            x=xx.ravel(), y=yy.ravel(), z=zz.ravel(), value=vol.ravel(),
-            isomin=float(isomin), isomax=float(max(vol.max(), isomin + 1e-6)),
-            opacity=float(opacity),
-            surface=dict(count=17),
-            colorscale=colorscale,
-            caps=dict(x_show=False, y_show=False, z_show=False),
-            colorbar=dict(title="Intensity", thickness=14),
+    mask = vol >= isomin
+    ax = _CUT_AXES.get(cut_axis)
+    if ax is not None and cut_frac > 0:
+        keep = max(1, int(round(vol.shape[ax] * (1.0 - cut_frac))))
+        sl = [slice(None)] * 3
+        sl[ax] = slice(keep, None)
+        mask[tuple(sl)] = False
+
+    verts, vals = [], []
+    for axis, positive, corners in _VOXEL_FACES:
+        idx = np.argwhere(_exposed_faces(mask, axis, positive))
+        if not len(idx):
+            continue
+        centres = np.stack([idx[:, 1], idx[:, 0], idx[:, 2]], axis=1).astype(float)
+        verts.append(centres[:, None, :] + np.asarray(corners)[None, :, :])
+        vals.append(vol[idx[:, 0], idx[:, 1], idx[:, 2]])
+
+    fig = go.Figure()
+    if verts:
+        v = np.concatenate(verts).reshape(-1, 3)
+        vals = np.concatenate(vals)
+        base = np.arange(len(vals)) * 4
+        fig.add_trace(
+            go.Mesh3d(
+                x=v[:, 0], y=v[:, 1], z=v[:, 2],
+                # Each quad is two triangles: (0,1,2) and (0,2,3).
+                i=np.stack([base, base], 1).ravel(),
+                j=np.stack([base + 1, base + 2], 1).ravel(),
+                k=np.stack([base + 2, base + 3], 1).ravel(),
+                intensity=np.repeat(vals, 2), intensitymode="cell",
+                colorscale=colorscale,
+                cmin=float(isomin), cmax=float(max(vol.max(), isomin + 1e-6)),
+                opacity=float(opacity), flatshading=True,
+                lighting=dict(ambient=0.62, diffuse=0.58, specular=0.12, roughness=0.7),
+                lightposition=dict(x=2 * nc, y=-2 * nr, z=2 * nz),
+                colorbar=dict(title="Intensity", thickness=14),
+            )
         )
-    )
+    else:
+        title += "  —  nothing above the threshold"
+
     fig.update_layout(
-        title=title,
-        height=620,
-        margin=dict(l=0, r=0, t=40, b=0),
+        title=title, height=620, margin=dict(l=0, r=0, t=40, b=0),
         scene=dict(
             xaxis_title="x (col)", yaxis_title="y (row)", zaxis_title="z (slice)",
-            # Equal data scaling in x/y; z is exaggerated when there are few slices so a thin
-            # stack is still legible rather than a pancake.
+            xaxis=dict(range=[-1, nc]), yaxis=dict(range=[-1, nr]), zaxis=dict(range=[-1, nz]),
+            # Equal x/y scaling; z is exaggerated for thin stacks so they are not a pancake.
             aspectmode="manual",
             aspectratio=dict(x=1, y=1, z=max(0.35, min(1.0, nz / max(nr, 1)))),
         ),
@@ -589,10 +652,11 @@ def _render_3d_tab():
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
             st.plotly_chart(
-                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"], title, cmap_name),
+                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"], title, cmap_name,
+                               s["live3d_cutaxis"], s["live3d_cut"]),
                 use_container_width=True,
             )
-            vc1, vc2, vc3 = st.columns(3)
+            vc1, vc2, vc3, vc4 = st.columns(4)
             with vc1:
                 st.radio("Show", ("Degraded", "Original", "Dose removed"),
                          key="live3d_volsrc",
@@ -603,9 +667,18 @@ def _render_3d_tab():
                           help="Lower = more see-through. This is the 'look inside' knob.")
             with vc3:
                 st.slider("Hide below", 0.0, 0.9, step=0.01, key="live3d_isomin",
-                          help="Clip low values (the air around the head) so they do not "
-                               "fog the view.")
-            st.caption("Drag to rotate · scroll to zoom · double-click to reset.")
+                          help="Drop voxels dimmer than this — removes the air around the "
+                               "head so it does not hide the surface.")
+            with vc4:
+                st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis",
+                             help="Slice the volume open along an axis to expose the interior "
+                                  "as a solid cut face.")
+                st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut")
+            st.caption(
+                "Every voxel is a solid cube — no interpolation. Faces between two drawn voxels "
+                "are culled, so you see surfaces rather than a fog of stacked quads. "
+                "Drag to rotate · scroll to zoom · double-click to reset."
+            )
 
         with view_sino:
             st.radio("View", ("Per-slice sinogram", "Per-measurement projection"),
