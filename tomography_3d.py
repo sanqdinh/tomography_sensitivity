@@ -22,6 +22,7 @@ Run headless as a smoke test::
 from __future__ import annotations
 
 import numpy as np
+from scipy.ndimage import binary_erosion
 
 from dose_response import (
     bundle_r_values,
@@ -75,6 +76,13 @@ PHANTOM_VARIANTS = {
 # make the end slices entirely empty, which reads as a bug rather than as anatomy).
 DEFAULT_Z_EXTENT = 0.8
 
+# Thickness, IN VOXELS, of the uniform outer crust. The analytic skull is the gap between the
+# two outermost ellipsoids (a = 0.690 vs 0.6624), which at image_res = 30 is 0.41 voxels wide --
+# under a voxel, so rasterizing it directly gives a broken, aliased ring that changes with every
+# resolution and slice count. A morphological shell instead gives a closed, uniform crust that is
+# always exactly this many voxels thick, whatever the grid.
+DEFAULT_CRUST_VOXELS = 1
+
 
 def _rotation_zyz(phi_deg: float, theta_deg: float, psi_deg: float) -> np.ndarray:
     """ZYZ Euler rotation matrix (degrees) mapping ellipsoid-frame axes into world axes."""
@@ -93,6 +101,8 @@ def shepp_logan_3d(
     n_slices: int,
     variant: str = "modified",
     z_extent: float = DEFAULT_Z_EXTENT,
+    crust_voxels: int = DEFAULT_CRUST_VOXELS,
+    crust_value: float = None,
 ) -> np.ndarray:
     """Rasterize the 3D Shepp-Logan phantom onto an ``(image_res, image_res, n_slices)`` grid.
 
@@ -102,6 +112,14 @@ def shepp_logan_3d(
 
     Values are clipped to ``[0, 1]`` to match the range of the 2D ``shepp_logan_phantom`` and to
     keep the dose-response model on non-negative pixels.
+
+    **Crust.** The outermost ``crust_voxels`` layer of the head is forced to one constant
+    intensity (``crust_value``, defaulting to the table's skull value). The analytic skull --
+    the gap between the two outer ellipsoids -- is thinner than one voxel at the resolutions
+    this app uses, so rasterizing it gives a broken ring that looks different at every grid
+    size. Eroding the head mask instead yields a closed shell of exactly the requested voxel
+    thickness in *all three* directions, so it looks the same whatever ``image_res`` and
+    ``n_slices`` are. Pass ``crust_voxels=0`` for the raw ellipsoid phantom.
     """
     if image_res < 1 or n_slices < 1:
         raise ValueError("image_res and n_slices must both be >= 1")
@@ -123,14 +141,34 @@ def shepp_logan_3d(
     yy, xx, zz = np.meshgrid(row_y, col_x, sl_z, indexing="ij")
 
     vol = np.zeros((image_res, image_res, n_slices), dtype=float)
-    for a, b, c, x0, y0, z0, phi, theta, psi, value in table:
+    head_mask = inner_mask = None
+    for n, (a, b, c, x0, y0, z0, phi, theta, psi, value) in enumerate(table):
         rot = _rotation_zyz(phi, theta, psi)
         dx, dy, dz = xx - x0, yy - y0, zz - z0
         # Express the offset in the ellipsoid's own frame: R^T @ d (columns of R dotted with d).
         xr = rot[0, 0] * dx + rot[1, 0] * dy + rot[2, 0] * dz
         yr = rot[0, 1] * dx + rot[1, 1] * dy + rot[2, 1] * dz
         zr = rot[0, 2] * dx + rot[1, 2] * dy + rot[2, 2] * dz
-        vol[(xr / a) ** 2 + (yr / b) ** 2 + (zr / c) ** 2 <= 1.0] += value
+        inside = (xr / a) ** 2 + (yr / b) ** 2 + (zr / c) ** 2 <= 1.0
+        vol[inside] += value
+        if n == 0:
+            head_mask = inside      # outer skull ellipsoid = the head boundary
+        elif n == 1:
+            inner_mask = inside     # inner skull ellipsoid = start of brain tissue
+
+    vol = np.clip(vol, 0.0, 1.0)
+
+    if crust_voxels > 0 and head_mask is not None:
+        # 1. Flatten the analytic skull band to brain. At these resolutions it is a sub-voxel,
+        #    aliased ring; leaving it would sit under the crust as a second, ragged shell.
+        brain = max(float(table[0][9] + table[1][9]), 0.0)
+        vol[head_mask & ~inner_mask] = brain
+        # 2. Paint a closed shell exactly crust_voxels thick. border_value=0 treats outside the
+        #    array as background, so a head touching the grid edge is still crusted there.
+        core = binary_erosion(head_mask, iterations=int(crust_voxels), border_value=0)
+        vol[head_mask & ~core] = float(
+            table[0][9] if crust_value is None else crust_value
+        )
 
     return np.clip(vol, 0.0, 1.0)
 

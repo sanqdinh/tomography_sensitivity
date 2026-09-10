@@ -394,7 +394,7 @@ for _k, _v in {
     "live3d_nslices": 16, "live3d_variant": "modified",
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
     "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
-    "live3d_cutaxis": "x (col)", "live3d_cut": 0.3,
+    "live3d_isomax": 1.0, "live3d_cutaxis": "x (col)", "live3d_cut": 0.3,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -534,7 +534,8 @@ def _exposed_faces(mask, axis, positive):
     return mask & ~nb
 
 
-def _volume_figure(vol, opacity, isomin, title, colorscale, cut_axis="none", cut_frac=0.0):
+def _volume_figure(vol, opacity, isomin, isomax, title, colorscale,
+                   cut_axis="none", cut_frac=0.0):
     """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
 
     ``go.Volume`` ray-marches through the data and blends between voxel centres, which smears
@@ -546,9 +547,13 @@ def _volume_figure(vol, opacity, isomin, title, colorscale, cut_axis="none", cut
     ``cut_frac`` away the near part of an axis to expose a cut face. The cut is applied to the
     mask *before* face culling, so the exposed cross-section is drawn as real faces coloured by
     the voxel values there.
+
+    ``isomin``/``isomax`` keep only voxels in that intensity band. Hiding *above* is what peels
+    the uniform crust off: set it just under the crust value and the shell disappears, leaving
+    the interior structures standing on their own.
     """
     nr, nc, nz = vol.shape
-    mask = vol >= isomin
+    mask = (vol >= isomin) & (vol <= isomax)
     ax = _CUT_AXES.get(cut_axis)
     if ax is not None and cut_frac > 0:
         keep = max(1, int(round(vol.shape[ax] * (1.0 - cut_frac))))
@@ -579,7 +584,13 @@ def _volume_figure(vol, opacity, isomin, title, colorscale, cut_axis="none", cut
                 k=np.stack([base + 2, base + 3], 1).ravel(),
                 intensity=np.repeat(vals, 2), intensitymode="cell",
                 colorscale=colorscale,
-                cmin=float(isomin), cmax=float(max(vol.max(), isomin + 1e-6)),
+                # Ramp runs 0 -> brightest VISIBLE voxel. Anchoring the top to the slider
+                # cutoff instead would squash the interior (0.2-0.3) into the bottom of the
+                # ramp once the crust is hidden; anchoring the bottom to the visible minimum
+                # would push the bulk brain value to pure black. Intensity is physically
+                # non-negative, so 0 is the natural dark end.
+                cmin=0.0,
+                cmax=float(max(vals.max(), 1e-6)),
                 opacity=float(opacity), flatshading=True,
                 lighting=dict(ambient=0.62, diffuse=0.58, specular=0.12, roughness=0.7),
                 lightposition=dict(x=2 * nc, y=-2 * nr, z=2 * nz),
@@ -587,7 +598,7 @@ def _volume_figure(vol, opacity, isomin, title, colorscale, cut_axis="none", cut
             )
         )
     else:
-        title += "  —  nothing above the threshold"
+        title += "  —  no voxels in this intensity band"
 
     fig.update_layout(
         title=title, height=620, margin=dict(l=0, r=0, t=40, b=0),
@@ -652,7 +663,8 @@ def _render_3d_tab():
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
             st.plotly_chart(
-                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"], title, cmap_name,
+                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"],
+                               s["live3d_isomax"], title, cmap_name,
                                s["live3d_cutaxis"], s["live3d_cut"]),
                 use_container_width=True,
             )
@@ -666,9 +678,12 @@ def _render_3d_tab():
                 st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity",
                           help="Lower = more see-through. This is the 'look inside' knob.")
             with vc3:
-                st.slider("Hide below", 0.0, 0.9, step=0.01, key="live3d_isomin",
+                st.slider("Hide below", 0.0, 1.0, step=0.01, key="live3d_isomin",
                           help="Drop voxels dimmer than this — removes the air around the "
                                "head so it does not hide the surface.")
+                st.slider("Hide above", 0.0, 1.0, step=0.01, key="live3d_isomax",
+                          help="Drop voxels brighter than this. Set it just under the crust "
+                               "value to peel the outer shell off and expose the interior.")
             with vc4:
                 st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis",
                              help="Slice the volume open along an axis to expose the interior "
