@@ -635,6 +635,11 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
 # working as the contrast slider moves the tissue values around.
 _BANDS = ("Whole head", "Crust off", "Structures only", "Brightest only", "Custom")
 
+# "Hide below" must never reach 0. Air is exactly 0.0, so a threshold of 0 admits every empty
+# voxel in the bounding box and the volume fills into a featureless block -- the opposite of
+# what the control is for. 0.001 is below any real tissue value and above air.
+_ISOMIN_FLOOR = 0.001
+
 
 def _band_window(preset, vol, isomin, isomax):
     """``(lo, hi)`` intensity window for a named preset; falls back to the sliders on Custom."""
@@ -714,6 +719,9 @@ def _render_3d_tab():
                 data, cmap_name = vol, "Gray"
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
+            # Clamp any value carried over from before the floor existed, before the widget
+            # that owns this key is created -- Streamlit rejects a value below min_value.
+            s["live3d_isomin"] = max(_ISOMIN_FLOOR, float(s["live3d_isomin"]))
             band_lo, band_hi = _band_window(
                 s["live3d_band"], vol0, s["live3d_isomin"], s["live3d_isomax"])
             st.plotly_chart(
@@ -739,9 +747,12 @@ def _render_3d_tab():
                                   "Thresholds come from the phantom's own levels, so these "
                                   "keep working as you move Phantom contrast.")
                 if s["live3d_band"] == "Custom":
-                    st.slider("Hide below", 0.0, 1.0, step=0.01, key="live3d_isomin",
+                    st.slider("Hide below", _ISOMIN_FLOOR, 1.0, step=0.001, format="%.3f",
+                              key="live3d_isomin",
                               help="Drop voxels dimmer than this. Raise it past the brain "
-                                   "value to free the structures inside.")
+                                   "value to free the structures inside. Floored at %.3f so it "
+                                   "can never admit air (which is exactly 0)."
+                                   % _ISOMIN_FLOOR)
                     st.slider("Hide above", 0.0, 1.0, step=0.01, key="live3d_isomax",
                               help="Drop voxels brighter than this — just under the crust "
                                    "value peels the outer shell.")
