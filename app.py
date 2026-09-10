@@ -391,7 +391,7 @@ if "beam_table_3d" not in st.session_state:
     st.session_state["beam_table_3d"] = _empty_beam_table()
 for _k, _v in {
     "live3d_angle": 45.0, "live3d_offset": 0.0, "live3d_nbeams": 30, "live3d_z": 0,
-    "live3d_nslices": 16, "live3d_variant": "modified",
+    "live3d_nslices": 16, "live3d_contrast": 1.0,
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
     "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
     "live3d_isomax": 1.0, "live3d_cutaxis": "x (col)", "live3d_cut": 0.3,
@@ -410,14 +410,14 @@ _N_SLICES_MIN, _N_SLICES_MAX = 4, 48
 
 @st.cache_data(show_spinner=False)
 def _simulate_3d(seq: tuple, I0: float, alpha: float, beta: float,
-                 image_res: int, n_slices: int, variant: str):
+                 image_res: int, n_slices: int, contrast: float):
     """``(original, degraded, sinogram)`` for the sequence (cached like the 2D image).
 
     Pure function of the table + dose params + volume size, so scrubbing z, switching sub-tab,
     rotating the volume and changing the measurement index are all cache hits; only taking a
     measurement or changing a parameter recomputes.
     """
-    vol0 = shepp_logan_3d(image_res, n_slices, variant=variant)
+    vol0 = shepp_logan_3d(image_res, n_slices, contrast=contrast)
     vol1, sino = simulate_3d(vol0, seq, I0, alpha, beta, image_res)
     return vol0, vol1, sino
 
@@ -644,7 +644,7 @@ def _render_3d_tab():
 
     vol0, vol, sino = _simulate_3d(
         seq3d, float(s["live3d_I0"]), float(s["live3d_alpha"]), float(s["live3d_beta"]),
-        IMAGE_RES, n_slices, s["live3d_variant"],
+        IMAGE_RES, n_slices, float(s["live3d_contrast"]),
     )
     # Clamp the viewed slice / measurement: either may have shrunk since it was set.
     k = max(0, min(int(s["live3d_z"]), n_slices - 1))
@@ -777,9 +777,12 @@ def _render_3d_tab():
                   key="live3d_nslices",
                   help="How many z-slices the volume is built from. Not to be confused with "
                        "\"Slice (z)\" in the Slice / Sinogram views, which picks which one to show.")
-        st.selectbox("Phantom contrast", ("modified", "classic"), key="live3d_variant",
-                     help="'classic' is the textbook Kak & Slaney table; its interior "
-                          "features sit ~2% above background and wash out under dose.")
+        st.slider("Phantom contrast", 0.0, 2.0, step=0.05, key="live3d_contrast",
+                  help="How far the interior structures stand out from brain tissue. "
+                       "0 = textbook Kak & Slaney (features ~2% above background, so they "
+                       "wash out as soon as dose dims the image); 1 = modified/Toft; above 1 "
+                       "exaggerates further. The skull stays at 1.0 throughout, so the crust "
+                       "and the Volume colour scale do not move.")
         st.number_input("I0 (0 = no degradation)", min_value=0.0, step=0.5,
                         key="live3d_I0")
         st.number_input("alpha", min_value=0.0, step=0.05, format="%.3f", key="live3d_alpha")

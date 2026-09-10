@@ -71,6 +71,27 @@ PHANTOM_VARIANTS = {
     "classic": SHEPP_LOGAN_3D_CLASSIC,
 }
 
+# Contrast is continuous rather than a two-way choice: the tables share identical geometry and
+# differ only in the value column, so any point between them is a valid phantom. 0 = classic,
+# 1 = modified, above 1 extrapolates past the modified table for a deliberately exaggerated
+# phantom. The skull value is 1.0 in both, so it -- and therefore the crust and the Volume
+# view's colour ceiling -- is unaffected by this slider.
+DEFAULT_CONTRAST = 1.0
+
+
+def shepp_logan_table(contrast: float = DEFAULT_CONTRAST) -> tuple:
+    """Ellipsoid table with the value column blended between classic and modified contrast.
+
+    Written as ``(1 - t)*classic + t*modified`` rather than ``classic + t*(modified - classic)``
+    so that ``contrast=0`` and ``contrast=1`` reproduce the two published tables *exactly* in
+    floating point, not to within a rounding error.
+    """
+    t = float(contrast)
+    return tuple(
+        row[:9] + ((1.0 - t) * row[9] + t * mod_row[9],)
+        for row, mod_row in zip(SHEPP_LOGAN_3D_CLASSIC, SHEPP_LOGAN_3D_MODIFIED)
+    )
+
 # Half-height of the sampled z range, in the normalized head frame. The outer skull ellipsoid has
 # c = 0.81, so sampling out to 0.8 keeps every slice inside the head (a full [-1, 1] span would
 # make the end slices entirely empty, which reads as a bug rather than as anatomy).
@@ -99,7 +120,7 @@ def _rotation_zyz(phi_deg: float, theta_deg: float, psi_deg: float) -> np.ndarra
 def shepp_logan_3d(
     image_res: int,
     n_slices: int,
-    variant: str = "modified",
+    contrast: float = DEFAULT_CONTRAST,
     z_extent: float = DEFAULT_Z_EXTENT,
     crust_voxels: int = DEFAULT_CRUST_VOXELS,
     crust_value: float = None,
@@ -113,6 +134,10 @@ def shepp_logan_3d(
     Values are clipped to ``[0, 1]`` to match the range of the 2D ``shepp_logan_phantom`` and to
     keep the dose-response model on non-negative pixels.
 
+    ``contrast`` is continuous: 0 gives the textbook Kak & Slaney values (interior features ~2%
+    above background, which vanish under dose), 1 the modified/Toft values, and above 1
+    exaggerates further. See :func:`shepp_logan_table`.
+
     **Crust.** The outermost ``crust_voxels`` layer of the head is forced to one constant
     intensity (``crust_value``, defaulting to the table's skull value). The analytic skull --
     the gap between the two outer ellipsoids -- is thinner than one voxel at the resolutions
@@ -123,12 +148,7 @@ def shepp_logan_3d(
     """
     if image_res < 1 or n_slices < 1:
         raise ValueError("image_res and n_slices must both be >= 1")
-    try:
-        table = PHANTOM_VARIANTS[variant]
-    except KeyError:
-        raise ValueError(
-            "variant must be one of %s, got %r" % (sorted(PHANTOM_VARIANTS), variant)
-        ) from None
+    table = shepp_logan_table(contrast)
 
     # Rows run +y (top) -> -y (bottom); columns run -x -> +x. A single slice is the mid-plane.
     row_y = np.linspace(1.0, -1.0, image_res)
