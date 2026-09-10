@@ -58,6 +58,7 @@ from dose_response import (
     bundle_r_values as _bundle_r_values,
     degradation_dose_response as _degradation_dose_response,
 )
+from tomography_3d import shepp_logan_3d, degrade_volume
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -384,6 +385,147 @@ for _k, _v in {
 }.items():
     st.session_state.setdefault(_k, _v)
 
+# 3D tab keeps its own namespace so the two tabs never clobber each other's controls.
+if "beam_table_3d" not in st.session_state:
+    st.session_state["beam_table_3d"] = _empty_beam_table()
+for _k, _v in {
+    "live3d_angle": 45.0, "live3d_offset": 0.0, "live3d_nbeams": 30, "live3d_z": 0,
+    "live3d_nslices": 16, "live3d_variant": "modified",
+    "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+
+# --- 3D degradation tab (2.5D: same bundle through every slice; no reconstruction) ------
+# Own session_state namespace (live3d_*, beam_table_3d) so the two tabs never clobber each
+# other. The measurement table schema is identical to the 2D one, so _empty_beam_table /
+# _table_to_seq are reused as-is.
+
+_N_SLICES_MIN, _N_SLICES_MAX = 4, 48
+
+
+@st.cache_data(show_spinner=False)
+def _degraded_volume(seq: tuple, I0: float, alpha: float, beta: float,
+                     image_res: int, n_slices: int, variant: str) -> np.ndarray:
+    """Cumulative degradation of the 3D phantom over the sequence (cached like the 2D image).
+
+    Pure function of the table + dose params + volume size, so scrubbing the z slider is a
+    cache hit and only taking a measurement or changing a parameter recomputes.
+    """
+    vol = shepp_logan_3d(image_res, n_slices, variant=variant)
+    return degrade_volume(vol, seq, I0, alpha, beta, image_res)
+
+
+def _cb3d_step():
+    """Take a 3D measurement: append the current bundle to the 3D sequence table."""
+    s = st.session_state
+    new_row = pd.DataFrame(
+        [{
+            "angle_deg": float(s["live3d_angle"]),
+            "offset": float(s["live3d_offset"]),
+            "n_beams": int(s["live3d_nbeams"]),
+        }]
+    )
+    s["beam_table_3d"] = pd.concat([s["beam_table_3d"], new_row], ignore_index=True)
+
+
+def _cb3d_reset():
+    """Clear the 3D sequence — back to the clean volume."""
+    st.session_state["beam_table_3d"] = _empty_beam_table()
+
+
+def _slice_figure(img, image_res, k, n_slices, n_meas, vmin, vmax, preview=None):
+    """One z-slice as a grayscale image + colorbar, with the live beam bundle overlaid in red.
+
+    Same recipe as the 2D live view (extent-mapped, ``origin="upper"``, nearest-neighbour so
+    voxels stay square), so a slice here is directly comparable to the 2D tab's picture.
+    """
+    h, w = img.shape
+    extent = [-w / 2, w / 2, -h / 2, h / 2]
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    cax = ax.imshow(img, cmap="gray", extent=extent, origin="upper",
+                    vmin=vmin, vmax=vmax, interpolation="nearest")
+    fig.colorbar(cax, ax=ax, label="Intensity")
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect("equal")
+    ax.set_title("Slice z = %d / %d   ·   %d measurement%s applied"
+                 % (k, n_slices - 1, n_meas, "" if n_meas == 1 else "s"))
+    if preview is not None:
+        angle_deg, offset, n_beams = preview
+        seg_n = 200
+        seg_range = [-(seg_n - 1) / 2.0, (seg_n - 1) / 2.0]
+        for r in _bundle_r_values(offset, n_beams, image_res):
+            seg = get_segment_polar(r_distance=r, angle=np.deg2rad(angle_deg),
+                                    seg_range=seg_range, num_points=seg_n)
+            ax.plot(seg[:, 0], seg[:, 1], color="red", linestyle="--", linewidth=0.8)
+    return fig
+
+
+def _render_3d_tab():
+    """The 3D degradation simulator: build a sequence, scrub slices, watch the dose land."""
+    s = st.session_state
+    st.caption(
+        "**2.5D forward simulation.** The phantom is a true 3D Shepp-Logan volume, but each "
+        "measurement fires the *same* beam bundle through every slice — rays never cross "
+        "slices. Dose still varies with depth because each slice attenuates the beam "
+        "differently. Reconstruction is not part of this tab."
+    )
+    left3d, mid3d, right3d = st.columns([3, 2, 2])
+
+    seq3d = _table_to_seq(s["beam_table_3d"])
+    n_meas = len(seq3d)
+    n_slices = int(s["live3d_nslices"])
+
+    vol = _degraded_volume(
+        seq3d, float(s["live3d_I0"]), float(s["live3d_alpha"]), float(s["live3d_beta"]),
+        IMAGE_RES, n_slices, s["live3d_variant"],
+    )
+    # Clamp the viewed slice: n_slices may have shrunk since it was set.
+    k = max(0, min(int(s["live3d_z"]), n_slices - 1))
+    s["live3d_z"] = k
+
+    with left3d:
+        st.pyplot(
+            _slice_figure(
+                vol[:, :, k], IMAGE_RES, k, n_slices, n_meas, 0.0, 1.0,
+                preview=(s["live3d_angle"], s["live3d_offset"], s["live3d_nbeams"]),
+            ),
+            use_container_width=True,
+        )
+        st.slider("Viewed slice (z)", 0, max(n_slices - 1, 0), key="live3d_z")
+
+    with mid3d:
+        st.markdown("**Next measurement**")
+        st.slider("Angle (deg)", 0.0, 360.0, step=1.0, key="live3d_angle")
+        st.slider("Offset", -float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, step=0.5,
+                  key="live3d_offset")
+        st.slider("# Beams (0 = full fan)", 0, IMAGE_RES, step=1, key="live3d_nbeams")
+        st.button("➕ Take measurement", key="btn3d_step", on_click=_cb3d_step,
+                  use_container_width=True)
+        st.button("Reset", key="btn3d_reset", on_click=_cb3d_reset,
+                  use_container_width=True)
+
+        st.markdown("**Volume & dose**")
+        st.slider("Slices (z)", _N_SLICES_MIN, _N_SLICES_MAX, step=1, key="live3d_nslices")
+        st.selectbox("Phantom contrast", ("modified", "classic"), key="live3d_variant",
+                     help="'classic' is the textbook Kak & Slaney table; its interior "
+                          "features sit ~2% above background and wash out under dose.")
+        st.number_input("I0 (0 = no degradation)", min_value=0.0, step=0.5,
+                        key="live3d_I0")
+        st.number_input("alpha", min_value=0.0, step=0.05, format="%.3f", key="live3d_alpha")
+        st.number_input("beta", min_value=0.0, step=0.005, format="%.3f", key="live3d_beta")
+
+    with right3d:
+        st.markdown("**Measurement sequence**")
+        st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
+        total0 = float(shepp_logan_3d(IMAGE_RES, n_slices, s["live3d_variant"]).sum())
+        total1 = float(vol.sum())
+        lost = 0.0 if total0 == 0 else 100.0 * (1.0 - total1 / total0)
+        st.metric("Intensity removed", "%.1f%%" % lost,
+                  help="Total volume intensity lost to dose across all slices.")
+        st.caption("Slice z=%d mean: %.4f" % (k, float(vol[:, :, k].mean())))
+
 
 # --- two modes, two tabs --------------------------------------------------------------
 tab_2d, tab_3d = st.tabs(["2D dose-response + reconstruction", "3D degradation"])
@@ -392,7 +534,7 @@ tab_2d, tab_3d = st.tabs(["2D dose-response + reconstruction", "3D degradation"]
 # path that can call st.stop() (empty geometry), which would otherwise leave this tab blank
 # on that rerun. Display order is set by the st.tabs() list above, not by population order.
 with tab_3d:
-    st.info("3D degradation simulator — arriving in the next commit.")
+    _render_3d_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----
