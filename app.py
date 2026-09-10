@@ -394,7 +394,8 @@ for _k, _v in {
     "live3d_nslices": 16, "live3d_contrast": 1.0,
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
     "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
-    "live3d_isomax": 1.0, "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
+    "live3d_isomax": 1.0, "live3d_band": "Whole head",
+    "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -627,6 +628,32 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
     return fig
 
 
+# Named intensity windows for the Volume view. Peeling the crust with "Hide above" only exposes
+# the brain, which is itself a closed mass wrapping everything -- reaching the structures needs
+# "Hide below" raised past the brain too. These presets do both at once, and derive their
+# thresholds from the volume's OWN distinct levels rather than hardcoded numbers, so they keep
+# working as the contrast slider moves the tissue values around.
+_BANDS = ("Whole head", "Crust off", "Structures only", "Brightest only", "Custom")
+
+
+def _band_window(preset, vol, isomin, isomax):
+    """``(lo, hi)`` intensity window for a named preset; falls back to the sliders on Custom."""
+    if preset == "Custom":
+        return float(isomin), float(isomax)
+    levels = np.unique(np.round(vol[vol > 1e-9], 6))
+    if levels.size == 0:
+        return float(isomin), float(isomax)
+    lo, hi = float(levels[0]) - 1e-6, float(levels[-1]) + 1e-6
+    mid = lambda i: float(levels[i] + levels[i + 1]) / 2.0   # split between adjacent levels
+    if preset != "Whole head" and levels.size >= 2:
+        hi = mid(levels.size - 2)                            # drop the crust (top level)
+    if preset == "Structures only" and levels.size >= 3:
+        lo = mid(0)                                          # drop the brain (bottom level)
+    if preset == "Brightest only" and levels.size >= 4:
+        lo = mid(levels.size - 3)                            # keep only the top non-crust level
+    return lo, hi
+
+
 def _render_3d_tab():
     """The 3D degradation simulator: build a sequence, scrub slices, watch the dose land."""
     s = st.session_state
@@ -687,9 +714,11 @@ def _render_3d_tab():
                 data, cmap_name = vol, "Gray"
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
+            band_lo, band_hi = _band_window(
+                s["live3d_band"], vol0, s["live3d_isomin"], s["live3d_isomax"])
             st.plotly_chart(
-                _volume_figure(data, s["live3d_opacity"], s["live3d_isomin"],
-                               s["live3d_isomax"], title, cmap_name, fixed_cmax,
+                _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
+                               title, cmap_name, fixed_cmax,
                                s["live3d_cutaxis"], s["live3d_cut"]),
                 use_container_width=True,
             )
@@ -703,12 +732,21 @@ def _render_3d_tab():
                 st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity",
                           help="Lower = more see-through. This is the 'look inside' knob.")
             with vc3:
-                st.slider("Hide below", 0.0, 1.0, step=0.01, key="live3d_isomin",
-                          help="Drop voxels dimmer than this — removes the air around the "
-                               "head so it does not hide the surface.")
-                st.slider("Hide above", 0.0, 1.0, step=0.01, key="live3d_isomax",
-                          help="Drop voxels brighter than this. Set it just under the crust "
-                               "value to peel the outer shell off and expose the interior.")
+                st.selectbox("Layers", _BANDS, key="live3d_band",
+                             help="Which tissue to draw. 'Structures only' is the one that "
+                                  "shows the floating ellipses: removing the crust alone is "
+                                  "not enough, because the brain underneath is also solid. "
+                                  "Thresholds come from the phantom's own levels, so these "
+                                  "keep working as you move Phantom contrast.")
+                if s["live3d_band"] == "Custom":
+                    st.slider("Hide below", 0.0, 1.0, step=0.01, key="live3d_isomin",
+                              help="Drop voxels dimmer than this. Raise it past the brain "
+                                   "value to free the structures inside.")
+                    st.slider("Hide above", 0.0, 1.0, step=0.01, key="live3d_isomax",
+                              help="Drop voxels brighter than this — just under the crust "
+                                   "value peels the outer shell.")
+                else:
+                    st.caption("window %.2f – %.2f" % (band_lo, band_hi))
             with vc4:
                 st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis",
                              help="Slice the volume open along an axis to expose the interior "
@@ -721,10 +759,11 @@ def _render_3d_tab():
             st.caption(
                 "Every voxel is a solid cube — no interpolation. Faces between two drawn voxels "
                 "are culled, so you see surfaces rather than a fog of stacked quads. "
-                "**A cavity is only visible where the cut plane passes through it**: the "
-                "ventricles sit at x ≈ ±0.22, so a shallow cut exposes nothing but solid brain. "
-                "Hiding the crust does not help on its own — the brain underneath is itself a "
-                "closed mass wrapping them. Drag to rotate · scroll to zoom · double-click to reset."
+                "**To see the structures floating inside, use Layers → Structures only.** "
+                "Removing the crust alone will not do it: the brain underneath is a closed mass "
+                "wrapping them, so it has to go too. The cut-away is the other route — but a "
+                "cavity is only visible where the cut plane actually passes through it. "
+                "Drag to rotate · scroll to zoom · double-click to reset."
             )
 
         with view_sino:
