@@ -13,6 +13,8 @@ copy at ``tomography_uq.py`` (inside the geometry build loop) and the JS ``bundl
 ``live_sim_component/index.html``.
 """
 
+from functools import lru_cache
+
 import numpy as np
 
 # Vendored geometry primitives (importing them is not a backend change).
@@ -22,6 +24,68 @@ from senDOE.helpers.geometry import (
 )
 
 
+@lru_cache(maxsize=8192)
+def ray_geometry(r: float, theta: float, h: int, w: int):
+    """Pixels and chord lengths a ray crosses — ``(rows, cols, seg_lengths, forward)``.
+
+    Depends only on the ray and the grid **shape**, never on pixel values, so one result is
+    valid for every z-slice and for every point in time. That is what makes the 3D simulator
+    affordable: the expensive part of the vendored ``line_grid_intersections`` (a Python set,
+    a sort and a loop) runs once per distinct ray instead of once per ray *per slice*.
+
+    ``rows``/``cols`` are the pixels at the ``len(rows)`` grid crossings in the vendored
+    ascending-``(x, y)`` order; ``seg_lengths`` has ``len(rows) - 1`` entries, one per segment
+    between consecutive crossings. The vendored ``radon`` is recovered exactly as
+    ``seg_lengths * image[rows[:-1], cols[:-1]]``.
+
+    ``forward`` says whether that ascending order already runs along the beam-travel tangent
+    ``(-sinθ, cosθ)``. Returns ``None`` if the ray never enters the grid.
+    """
+    a, b, c = get_line_abc_from_r_theta(r, theta)
+    probe = np.zeros((h, w))  # values are irrelevant here; we only want the geometry
+    try:
+        crossings, pixels, _radon, seg_lengths = line_grid_intersections(
+            a, b, c, probe, x_range=[-w / 2, w / 2], y_range=[-h / 2, h / 2]
+        )
+    except IndexError:
+        return None  # line never enters the grid
+    if len(pixels) == 0:
+        return None
+    # The vendored list is always sorted by ascending (x, y) regardless of θ, so θ and θ+180
+    # are the same line and would deposit dose in the same order. The points are colinear, so
+    # that order is either aligned with the travel tangent or exactly reversed.
+    dx = crossings[-1][0] - crossings[0][0]
+    dy = crossings[-1][1] - crossings[0][1]
+    forward = bool(dx * (-np.sin(theta)) + dy * np.cos(theta) >= 0)
+    return (pixels[:, 0].astype(int), pixels[:, 1].astype(int),
+            np.asarray(seg_lengths, dtype=float), forward)
+
+
+def ray_line_integral(image, r, theta) -> float:
+    """Line integral of one ray through a 2D image — the vendored ``sum(radon)``.
+
+    This is the sinogram value for that ray. Returns 0.0 if the ray misses the grid.
+    """
+    g = ray_geometry(float(r), float(theta), *image.shape)
+    if g is None:
+        return 0.0
+    rows, cols, seg_lengths, _ = g
+    m = len(seg_lengths)
+    return float(seg_lengths @ image[rows[:m], cols[:m]])
+
+
+def ray_line_integral_stack(vol, r, theta):
+    """Line integrals of one ray through **every** slice of a ``(row, col, slice)`` volume.
+
+    The ray path is shared across slices, so all of them collapse into a single ``einsum``.
+    Returns a length-``n_slices`` array, or ``None`` if the ray misses the grid.
+    """
+    g = ray_geometry(float(r), float(theta), vol.shape[0], vol.shape[1])
+    if g is None:
+        return None
+    rows, cols, seg_lengths, _ = g
+    m = len(seg_lengths)
+    return np.einsum("i,ik->k", seg_lengths, vol[rows[:m], cols[:m], :])
 
 
 def degradation_dose_response(image, r, theta, I0, alpha, beta):
@@ -30,38 +94,29 @@ def degradation_dose_response(image, r, theta, I0, alpha, beta):
     Degrades the image along the ray ``x·cosθ + y·sinθ = r`` using the dose-response model
     ``pixel·exp(-α·I_local - β·I_local²)`` with ``I_local = I0·exp(-Σ radon)``, where Σ runs in
     the beam **travel direction** ``(-sinθ, cosθ)`` — so the entry pixel sees full ``I0`` and 0°
-    (bottom-up) differs from 180° (top-down). Reuses the vendored ``get_line_abc_from_r_theta`` /
-    ``line_grid_intersections``. Returns the image unchanged if the ray misses the grid (the
-    vendored intersection routine raises IndexError on an empty hit, mirrored by the backend's
-    |r| clamp).
+    (bottom-up) differs from 180° (top-down). The ray path comes from the cached
+    :func:`ray_geometry` (which wraps the vendored intersection routine). Returns the image
+    unchanged if the ray misses the grid, mirroring the backend's |r| clamp.
     """
-    h, w = image.shape
-    a, b, c = get_line_abc_from_r_theta(r, theta)
-    try:
-        intersection_result, image_intersection, radon, _ = line_grid_intersections(
-            a, b, c, image, x_range=[-w / 2, w / 2], y_range=[-h / 2, h / 2]
-        )
-    except IndexError:
+    g = ray_geometry(float(r), float(theta), *image.shape)
+    if g is None:
         return image  # line never enters the grid → no-op
-    if len(image_intersection) == 0:
-        return image
+    rows, cols, seg_lengths, forward = g
+    # radon[i] = chord_length_i * pixel_value_at_crossing_i, exactly as the vendored routine
+    # builds it — but from the cached geometry, and read off the ORIGINAL image so the walk
+    # below (which writes into a copy) sees undamaged values, as it always has.
+    values = image[rows, cols]
+    radon = seg_lengths * values[: len(seg_lengths)]
+
     out = image.copy()
-    n = len(image_intersection)
-    # The beam travels along the line tangent (-sinθ, cosθ); the vendored intersection list is
-    # always sorted by ascending (x, y) regardless of θ, so θ and θ+180 are the same line and
-    # would otherwise deposit dose in the same order. Walk the pixels in travel order so 0°=
-    # bottom-up and 180°=top-down differ (and 0°==360°). The points are colinear, so the vendored
-    # order is either aligned with the tangent or exactly reversed.
-    dx = intersection_result[-1][0] - intersection_result[0][0]
-    dy = intersection_result[-1][1] - intersection_result[0][1]
-    forward = dx * (-np.sin(theta)) + dy * np.cos(theta) >= 0
+    n = len(rows)
+    # Walk the pixels in beam-travel order so 0° (bottom-up) differs from 180° (top-down); see
+    # ``ray_geometry`` for why the cached order may need reversing.
     indices = range(n) if forward else range(n - 1, -1, -1)
     dose = 0.0
     for i in indices:
-        ix = int(image_intersection[i, 0])  # row
-        iy = int(image_intersection[i, 1])  # col
         local = I0 * np.exp(-dose)
-        out[ix, iy] = image[ix, iy] * np.exp(-alpha * local - beta * local**2)
+        out[rows[i], cols[i]] = values[i] * np.exp(-alpha * local - beta * local**2)
         seg = i if forward else i - 1  # segment crossed to reach the next pixel in travel order
         if 0 <= seg < len(radon):
             dose += radon[seg]
