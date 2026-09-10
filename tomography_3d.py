@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from dose_response import bundle_r_values, degradation_dose_response
+from dose_response import (
+    bundle_r_values,
+    degradation_dose_response,
+    ray_line_integral_stack,
+)
 
 # --- 3D Shepp-Logan ellipsoid tables ----------------------------------------------------
 # One row per ellipsoid: (a, b, c, x0, y0, z0, phi_deg, theta_deg, psi_deg, value).
@@ -131,6 +135,80 @@ def shepp_logan_3d(
     return np.clip(vol, 0.0, 1.0)
 
 
+# --- detector axis ----------------------------------------------------------------------
+# ``bundle_r_values`` snaps every ray onto a half-integer, for any offset, so the set of
+# reachable detector positions is a FIXED lattice that does not depend on the geometry the user
+# builds. That gives every measurement a common r axis to plot against.
+
+
+def detector_grid(image_res: int) -> np.ndarray:
+    """The complete detector lattice: ``image_res`` half-integer positions, spacing 1.0.
+
+    For ``image_res = 30`` that is ``-14.5, -13.5, ..., 14.5``. Any ray bundle, at any offset,
+    is a subset of this.
+    """
+    return np.arange(image_res) - image_res / 2.0 + 0.5
+
+
+def detector_index(r: float, image_res: int) -> int:
+    """Row of :func:`detector_grid` that a ray at radius ``r`` lands on."""
+    return int(round(r + image_res / 2.0 - 0.5))
+
+
+def simulate_3d(vol, seq, I0: float, alpha: float, beta: float, image_res: int = None):
+    """Degrade a volume over a measurement sequence and record what each measurement saw.
+
+    Returns ``(degraded_vol, sino)``.
+
+    ``sino`` has shape ``(image_res, n_measurements, n_slices)`` and holds the line integral
+    (the vendored ``sum(radon)``) for every measured ray. Cells the user never sampled are
+    **NaN, not 0** -- a 0 would be indistinguishable from a genuine low reading, which is the
+    trap that makes the vendored ``extract_sinogram_value`` misleading. A hand-built sequence
+    samples only a handful of detector slots, so most of the array is legitimately unmeasured.
+
+    Two useful views fall straight out of it:
+
+    * ``sino[:, :, k]``  -- the sinogram of slice ``k`` (detector r vs measurement).
+    * ``sino[:, m, :]``  -- the 2D projection of measurement ``m`` (detector r vs slice z),
+      i.e. what a 2D detector panel behind the volume would record.
+
+    **Timing:** every ray of one measurement integrates the volume as it stood at the *start*
+    of that measurement, so rays within a measurement do not see each other's damage. That
+    treats a measurement as simultaneous and matches the Pyomo backend, where each ray of a
+    step reads ``image_array[injection_time]`` and their intensities superpose. Degradation
+    itself stays strictly sequential, exactly as the 2D live picture applies it.
+    """
+    if vol.ndim != 3:
+        raise ValueError("expected a (row, col, slice) volume, got shape %r" % (vol.shape,))
+    if image_res is None:
+        image_res = vol.shape[1]
+
+    out = vol.copy()
+    n_slices = out.shape[2]
+    seq = tuple(seq)
+    sino = np.full((image_res, len(seq), n_slices), np.nan, dtype=float)
+
+    for m, (angle_deg, offset, n_beams) in enumerate(seq):
+        theta = np.deg2rad(angle_deg)
+        rs = bundle_r_values(offset, n_beams, image_res)
+
+        # Measure first, against the volume as it is BEFORE this measurement damages it.
+        snapshot = out.copy()
+        for r in rs:
+            integrals = ray_line_integral_stack(snapshot, r, theta)
+            if integrals is not None:
+                sino[detector_index(r, image_res), m, :] = integrals
+
+        # Then apply the dose, ray by ray, slice by slice (the established 2D order).
+        for r in rs:
+            for k in range(n_slices):
+                out[:, :, k] = degradation_dose_response(
+                    out[:, :, k], r, theta, I0, alpha, beta
+                )
+
+    return out, sino
+
+
 def degrade_volume(
     vol: np.ndarray,
     seq,
@@ -148,22 +226,11 @@ def degrade_volume(
     Each slice is degraded by the shared 2D routine, in the same (step, ray) order the 2D live
     picture uses -- so a one-slice volume reproduces the 2D result exactly. Slices are mutually
     independent, so the order of the slice loop is irrelevant. Returns a new array.
-    """
-    if vol.ndim != 3:
-        raise ValueError("expected a (row, col, slice) volume, got shape %r" % (vol.shape,))
-    if image_res is None:
-        image_res = vol.shape[1]
 
-    out = vol.copy()
-    n_slices = out.shape[2]
-    for angle_deg, offset, n_beams in seq:
-        theta = np.deg2rad(angle_deg)
-        for r in bundle_r_values(offset, n_beams, image_res):
-            for k in range(n_slices):
-                out[:, :, k] = degradation_dose_response(
-                    out[:, :, k], r, theta, I0, alpha, beta
-                )
-    return out
+    Thin wrapper over :func:`simulate_3d` that discards the sinogram — recording it costs
+    almost nothing, since the ray geometry is cached and shared across slices.
+    """
+    return simulate_3d(vol, seq, I0, alpha, beta, image_res)[0]
 
 
 if __name__ == "__main__":
@@ -178,7 +245,7 @@ if __name__ == "__main__":
         % (vol0.shape, vol0.min(), vol0.max(), 100.0 * np.count_nonzero(vol0) / vol0.size)
     )
 
-    vol1 = degrade_volume(vol0, SEQ, I0, ALPHA, BETA, IMAGE_RES)
+    vol1, sino = simulate_3d(vol0, SEQ, I0, ALPHA, BETA, IMAGE_RES)
     print(
         "after %d measurements (I0=%.1f): range=[%.4f, %.4f]  total %.3f -> %.3f (-%.2f%%)"
         % (
@@ -197,4 +264,21 @@ if __name__ == "__main__":
 
     # I0 == 0 is the app default and must be an exact no-op.
     assert np.array_equal(degrade_volume(vol0, SEQ, 0.0, ALPHA, BETA, IMAGE_RES), vol0)
+
+    # --- sinogram ------------------------------------------------------------------------
+    measured = ~np.isnan(sino)
+    assert sino.shape == (IMAGE_RES, len(SEQ), N_SLICES), sino.shape
+    print(
+        "\nsinogram: shape=%s  measured cells=%d of %d (%.0f%%)  range=[%.3f, %.3f]"
+        % (sino.shape, measured.sum(), sino.size,
+           100.0 * measured.sum() / sino.size,
+           np.nanmin(sino), np.nanmax(sino))
+    )
+    # Exactly the sampled detector slots are non-NaN, and nothing else.
+    for m, (angle_deg, offset, n_beams) in enumerate(SEQ):
+        want = {detector_index(r, IMAGE_RES) for r in bundle_r_values(offset, n_beams, IMAGE_RES)}
+        got = {int(i) for i in np.where(measured[:, m, 0])[0]}
+        assert want == got, (m, sorted(want ^ got))
+    print("  detector slots recorded match bundle_r_values for every measurement")
+
     print("\nOK: I0=0 is a no-op; degradation is monotone and strictly lossy.")
