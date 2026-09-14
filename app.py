@@ -397,6 +397,7 @@ for _k, _v in {
     "live3d_isomax": 1.0, "live3d_band": "Whole head", "live3d_band_prev": None,
     "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
+    "live3d_showbeams": True,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -546,8 +547,82 @@ def _exposed_faces(mask, axis, positive):
     return mask & ~nb
 
 
+def _clip_ray_to_box(r, theta, half_w, half_h):
+    """``(t0, t1)``: where the ray ``x·cosθ + y·sinθ = r`` enters and leaves the image box.
+
+    The ray is parameterized along the beam-travel tangent,
+    ``p(t) = (r·cosθ − t·sinθ, r·sinθ + t·cosθ)``, the same convention the vendored geometry and
+    ``get_segment_polar`` use. Slab method: intersect the admissible ``t`` interval of the x and
+    y slabs. Returns ``None`` if the ray never enters the box.
+
+    Clipping analytically instead of drawing a long segment and letting plotly trim it keeps the
+    endpoints exact and independent of how the renderer treats ``scene.*axis.range``.
+    """
+    c, sn = np.cos(theta), np.sin(theta)
+    t0, t1 = -np.inf, np.inf
+    for p0, d, lo, hi in ((r * c, -sn, -half_w, half_w), (r * sn, c, -half_h, half_h)):
+        if abs(d) < 1e-12:          # parallel to this slab: in or out for every t
+            if p0 < lo or p0 > hi:
+                return None
+            continue
+        a, b = (lo - p0) / d, (hi - p0) / d
+        if a > b:
+            a, b = b, a
+        t0, t1 = max(t0, a), min(t1, b)
+    return (t0, t1) if t1 > t0 else None
+
+
+def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color):
+    """Each ray of a bundle as a dashed rectangle spanning the whole z-stack.
+
+    2.5D means one measurement fires the same bundle through *every* slice, so inside the volume
+    a ray is not a line — it is a vertical plane. Outlining that plane (bottom edge, top edge,
+    two verticals) shows the geometry honestly without a translucent sheet hiding the voxels
+    behind it.
+
+    Physical ``(x, y)`` become scene indices with the vendored convention from
+    ``senDOE/helpers/geometry.py`` (``col = int(x + w/2)``, ``row = int(h/2 − y)``) evaluated at
+    pixel centres — the same mapping ``_slice_figure``'s overlay uses, hence the −0.5 and the
+    flipped row axis. Every segment goes into ONE trace separated by ``NaN`` breaks, so a 30-ray
+    fan costs one trace rather than 120.
+
+    Returns ``None`` when the bundle is empty (every ray clamped off the grid).
+    """
+    theta = np.deg2rad(float(angle_deg))
+    c, sn = np.cos(theta), np.sin(theta)
+    zb, zt = -0.5, nz - 0.5
+    xs, ys, zs = [], [], []
+    for r in r_values:
+        clip = _clip_ray_to_box(float(r), theta, nc / 2.0, nr / 2.0)
+        if clip is None:
+            continue
+        ends = []
+        for t in clip:
+            x, y = r * c - t * sn, r * sn + t * c
+            ends.append((x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y))
+        (x0, y0), (x1, y1) = ends
+        for seg in (((x0, y0, zb), (x1, y1, zb)),      # bottom edge
+                    ((x0, y0, zt), (x1, y1, zt)),      # top edge
+                    ((x0, y0, zb), (x0, y0, zt)),      # the two verticals that close the curtain
+                    ((x1, y1, zb), (x1, y1, zt))):
+            for px, py, pz in seg:
+                xs.append(px)
+                ys.append(py)
+                zs.append(pz)
+            xs.append(np.nan)      # break the polyline between segments
+            ys.append(np.nan)
+            zs.append(np.nan)
+    if not xs:
+        return None
+    return go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="lines",
+        line=dict(color=color, width=3, dash="dash"),
+        hoverinfo="skip", showlegend=False,
+    )
+
+
 def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
-                   cut_axis="none", cut_frac=0.0):
+                   cut_axis="none", cut_frac=0.0, beams=()):
     """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
 
     ``go.Volume`` ray-marches through the data and blends between voxel centres, which smears
@@ -569,6 +644,9 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
     render as a different colour at every slider position and nothing could be compared. Fixing
     it costs some contrast when only the dim interior is left on screen — that is the intended
     trade: a stable, readable scale beats a pretty but meaningless one.
+
+    ``beams`` are ready-made traces from :func:`_beam_curtain_trace`; the geometry is built
+    outside so this stays a pure renderer.
     """
     nr, nc, nz = vol.shape
     mask = (vol >= isomin) & (vol <= isomax)
@@ -614,6 +692,9 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
         )
     else:
         title += "  —  no voxels in this intensity band"
+
+    for trace in beams:
+        fig.add_trace(trace)
 
     fig.update_layout(
         title=title, height=620, margin=dict(l=0, r=0, t=40, b=0),
@@ -691,13 +772,47 @@ def _render_3d_tab():
         view_slice, view_vol, view_sino = st.tabs(["Slice", "Volume", "Sinogram"])
 
         with view_slice:
-            st.pyplot(
-                _slice_figure(
-                    vol[:, :, k], IMAGE_RES, k, n_slices, n_meas, 0.0, 1.0,
-                    preview=(s["live3d_angle"], s["live3d_offset"], s["live3d_nbeams"]),
-                ),
-                use_container_width=True,
+            # The 2D tab's live component, second instance. It OWNS the Angle/Offset/#Beams
+            # sliders and redraws the red dashes client-side while the thumb is held; st.slider
+            # only reports on release, so a Python-owned slider cannot track a drag at all. That
+            # is why those three sliders moved out of the controls column to sit under this
+            # picture -- the same arrangement the 2D tab already uses.
+            _v3d = _live_sim(
+                image_uri=_live_background_uri(vol[:, :, k], 0.0, 1.0),
+                image_res=IMAGE_RES,
+                k=n_meas,
+                angle=float(s["live3d_angle"]),
+                offset=float(s["live3d_offset"]),
+                nbeams=int(s["live3d_nbeams"]),
+                # There is no view_k scrubbing here -- every measurement is always applied -- so
+                # 2D's "the measurement shown" has no analogue. The last one taken is the useful
+                # one to keep on screen next to the preview.
+                committed=(list(seq3d[-1]) if n_meas else None),
+                beams_visible=bool(s["live3d_showbeams"]),
+                # This tab's own ranges, wider than 2D's: half-unit offsets and the BeamStep
+                # "0 = full fan" case, both of which its st.sliders offered before the move.
+                angle_range=[0, 360, 1],
+                offset_range=[-float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, 0.5],
+                nbeams_range=[0, IMAGE_RES, 1],
+                title="Slice z = %d / %d   \u00b7   %d measurement%s applied"
+                      % (k, n_slices - 1, n_meas, "" if n_meas == 1 else "s"),
+                hint='<b style="color:#ff2b2b">Red</b> dashes = next-measurement preview '
+                     '(these sliders); <b style="color:#1f77ff">blue</b> dashes = the last '
+                     'measurement taken. # Beams at 0 means the full fan.',
+                legend="1.00",
+                default={
+                    "angle": float(s["live3d_angle"]),
+                    "offset": float(s["live3d_offset"]),
+                    "nbeams": int(s["live3d_nbeams"]),
+                },
+                key="live_sim_3d",
             )
+            if isinstance(_v3d, dict):   # released slider values -> the rest of the tab reads these
+                s["live3d_angle"] = float(_v3d["angle"])
+                s["live3d_offset"] = float(_v3d["offset"])
+                s["live3d_nbeams"] = int(_v3d["nbeams"])
+            # Stays server-side: a new z needs a new background PNG, so there is nothing a
+            # client-side slider could redraw without a round-trip anyway.
             st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z_slice",
                       on_change=_cb3d_sync_z, args=("live3d_z_slice",))
 
@@ -739,10 +854,26 @@ def _render_3d_tab():
             s["live3d_isomin"] = max(_ISOMIN_FLOOR, float(s["live3d_isomin"]))
             band_lo, band_hi = _band_window(
                 s["live3d_band"], vol0, s["live3d_isomin"], s["live3d_isomax"])
+            # Beam curtains. Plotly is server-rendered, so unlike the Slice overlay these only
+            # refresh when a slider is RELEASED -- never mid-drag.
+            beams = []
+            if s["live3d_showbeams"]:
+                nz = vol0.shape[2]
+                if n_meas:           # blue: the last measurement taken, as in the Slice view
+                    _a, _o, _n = seq3d[-1]
+                    _tr = _beam_curtain_trace(_bundle_r_values(_o, _n, IMAGE_RES), _a,
+                                              IMAGE_RES, IMAGE_RES, nz, "#1f77ff")
+                    if _tr is not None:
+                        beams.append(_tr)
+                _tr = _beam_curtain_trace(                    # red: the live preview
+                    _bundle_r_values(s["live3d_offset"], s["live3d_nbeams"], IMAGE_RES),
+                    s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b")
+                if _tr is not None:
+                    beams.append(_tr)
             st.plotly_chart(
                 _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
                                title, cmap_name, fixed_cmax,
-                               s["live3d_cutaxis"], s["live3d_cut"]),
+                               s["live3d_cutaxis"], s["live3d_cut"], beams=beams),
                 use_container_width=True,
             )
             vc1, vc2, vc3, vc4 = st.columns(4)
@@ -789,6 +920,10 @@ def _render_3d_tab():
                 "Removing the crust alone will not do it: the brain underneath is a closed mass "
                 "wrapping them, so it has to go too. The cut-away is the other route — but a "
                 "cavity is only visible where the cut plane actually passes through it. "
+                "The **red curtains** are the next measurement's bundle and the blue ones the "
+                "last one taken: in 2.5D a ray fires through every slice, so each one is a "
+                "vertical plane, not a line. They follow the sliders on release, not mid-drag "
+                "(this view is rendered server-side) — the Slice view is the live one. "
                 "Drag to rotate · scroll to zoom · double-click to reset."
             )
 
@@ -835,10 +970,19 @@ def _render_3d_tab():
 
     with mid3d:
         st.markdown("**Next measurement**")
-        st.slider("Angle (deg)", 0.0, 360.0, step=1.0, key="live3d_angle")
-        st.slider("Offset", -float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, step=0.5,
-                  key="live3d_offset")
-        st.slider("# Beams (0 = full fan)", 0, IMAGE_RES, step=1, key="live3d_nbeams")
+        # The three bundle sliders live inside the component under the Slice picture (they have
+        # to -- see there). This is the read-out, so the current aim is legible from any sub-tab.
+        st.caption(
+            "Angle **%.0f\u00b0** \u00b7 offset **%.1f** \u00b7 **%s** \u2014 set these with the "
+            "sliders under the picture in the **Slice** view."
+            % (float(s["live3d_angle"]), float(s["live3d_offset"]),
+               "full fan" if int(s["live3d_nbeams"]) == 0
+               else "%d beams" % int(s["live3d_nbeams"]))
+        )
+        # One toggle for both overlays, kept here rather than in a sub-tab so it is reachable
+        # whichever view is open (mirrors the 2D tab's beams_visible).
+        st.checkbox("Show beams", key="live3d_showbeams",
+                    help="Draw the bundle on the Slice picture and through the Volume view.")
         st.button("➕ Take measurement", key="btn3d_step", on_click=_cb3d_step,
                   use_container_width=True)
         st.button("Reset", key="btn3d_reset", on_click=_cb3d_reset,
