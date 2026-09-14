@@ -118,11 +118,17 @@ var curAngle = 45, curOffset = 0, curNbeams = 30;
 // from another widget, or the previous release still settling) does not snap the thumb back.
 var dragging = false;
 
-// First render seeds the thumbs from Python's values; afterwards the component OWNS them and never
-// reassigns from render args. Python only ever echoes back the value we sent (app.py:472-475), so a
-// later reassign can only be a no-op or — when a stale render lands just after release — a snap-back
-// to the previous value. (If Python ever sets the sliders out-of-band, replace this with an
-// "echo-pending" scheme: ignore slider args until they match the last value we sent.)
+// The thumbs now FOLLOW the server, because a second control surface exists: the 3D tab duplicates
+// these three sliders in its Volume sub-tab. What makes that safe is ordering — Python folds our
+// released value into its canonical state inside this component's on_change callback, which runs
+// before the script body builds the next render args. So an incoming value is either exactly what we
+// last sent (adopting it is a no-op) or a genuine out-of-band change we SHOULD adopt. Without that
+// callback Python would still hold the previous value when it built the args, and adopting would
+// snap the thumb back — which is why this used to seed once and then own the thumbs outright.
+// The two remaining ways a stale value could arrive are both handled: a render landing mid-drag is
+// deferred (see `dragging`), and its deferred replay is told to leave the thumbs alone (see
+// `endDrag`), since by then the user has just set them and `change` is about to report them.
+// `mounted` now only guards the one-time range setup.
 var mounted = false;
 // A streamlit:render that arrived while a thumb was held down, stashed to replay on release so its
 // redraw/iframe-resize never reflows the page mid-drag (which drops the native range-drag tracking).
@@ -210,9 +216,11 @@ function onRelease() {         // mouse-up → report the value so Python can sy
 }
 function endDrag() {
   dragging = false;
-  // Apply the render we deferred during the drag (if any). mounted is already true, so this refreshes
-  // the background image / blue bundle / redraw but does NOT touch the thumbs — no snap-back.
-  if (pendingArgs) { var a = pendingArgs; pendingArgs = null; onRender(a); }
+  // Apply the render we deferred during the drag (if any), with keepThumbs so it refreshes the
+  // background image / blue bundle / redraw but does NOT touch the thumbs. It predates the drag, and
+  // `change` is about to report where the user actually left them — adopting it would snap back and
+  // then send the snapped-back value. (pointerup fires before change, so this runs first.)
+  if (pendingArgs) { var a = pendingArgs; pendingArgs = null; onRender(a, true); }
 }
 [angleEl, offsetEl, nbeamsEl].forEach(function (el) {
   el.addEventListener("pointerdown", function () { dragging = true; });
@@ -239,7 +247,12 @@ function applyRange(el, spec) {
   el.min = spec[0]; el.max = spec[1]; el.step = spec[2];
 }
 
-function onRender(args) {
+function setThumb(el, v) {
+  if (v == null) return;
+  if (parseFloat(el.value) !== parseFloat(v)) el.value = v;
+}
+
+function onRender(args, keepThumbs) {
   if (!args) return;
   // A render landing mid-drag must not mutate the DOM (a redraw/iframe-resize reflows the page and
   // drops the in-progress range drag). Stash it and replay on pointerup/pointercancel via endDrag().
@@ -255,16 +268,21 @@ function onRender(args) {
   if (args.hint != null) hintEl.innerHTML = args.hint;
   if (args.legend != null) legendMaxEl.textContent = args.legend;
 
-  // Seed the thumbs from the server ONLY on the first render; afterwards the component owns them (see
-  // `mounted`). readSliders()/updateLabels() always run so curAngle/... track the real thumb state.
+  // Ranges are fixed per instance, so they are applied once, and before any value is written: a
+  // value off the step grid would be snapped by the browser.
   if (!mounted) {
     applyRange(angleEl, args.angle_range);
     applyRange(offsetEl, args.offset_range);
     applyRange(nbeamsEl, args.nbeams_range);
-    if (args.angle != null) angleEl.value = args.angle;
-    if (args.offset != null) offsetEl.value = args.offset;
-    if (args.nbeams != null) nbeamsEl.value = args.nbeams;
     mounted = true;
+  }
+  // Follow the server unless this is a deferred render being replayed after a drag (see `mounted`
+  // above for why this is safe). readSliders()/updateLabels() always run so curAngle/... track the
+  // real thumb state either way.
+  if (!keepThumbs) {
+    setThumb(angleEl, args.angle);
+    setThumb(offsetEl, args.offset);
+    setThumb(nbeamsEl, args.nbeams);
   }
   readSliders(); updateLabels();
 

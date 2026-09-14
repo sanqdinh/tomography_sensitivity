@@ -338,6 +338,34 @@ def _degraded_image(seq: tuple, I0: float, alpha: float, beta: float,
 
 # --- live simulator button callbacks (fire before the rerun body; read live_* keys) ----
 
+def _sync_live_sim(prefix: str, widget_key: str):
+    """Fold a live_sim component's released values into the canonical ``<prefix>_*`` keys.
+
+    Runs as the component's ``on_change``, i.e. BEFORE the script body rebuilds its render args —
+    which is the whole point. The component now follows the values Python sends it (so a second
+    control surface can drive it); that is only safe if Python's copy is already up to date when
+    it builds those args. Syncing after the call instead would hand the component back the
+    *previous* value and snap its thumb.
+    """
+    val = st.session_state.get(widget_key)
+    if not isinstance(val, dict):
+        return
+    st.session_state[prefix + "_angle"] = float(val["angle"])
+    st.session_state[prefix + "_offset"] = float(val["offset"])
+    st.session_state[prefix + "_nbeams"] = int(val["nbeams"])
+
+
+# Zero-argument wrappers: a custom component's on_change is handed straight to register_widget
+# with no args/kwargs (unlike st.slider's), so anything passed as args= would be swallowed by
+# **kwargs and shipped to the frontend as a render arg instead of reaching the callback.
+def _cb_sync_live_sim_2d():
+    _sync_live_sim("live", "live_sim")
+
+
+def _cb_sync_live_sim_3d():
+    _sync_live_sim("live3d", "live_sim_3d")
+
+
 def _cb_step():
     """Take a measurement: append the current slider bundle as a row in the sequence table."""
     s = st.session_state
@@ -451,6 +479,46 @@ def _cb3d_sync_z(source_key: str):
     they are re-created. Two controls, one slice — they can never disagree.
     """
     st.session_state["live3d_z"] = int(st.session_state[source_key])
+
+
+def _cb3d_sync_beam():
+    """Fold the Volume sub-tab's duplicate bundle sliders back into the canonical ``live3d_*``.
+
+    Same one-value-two-widgets pattern as :func:`_cb3d_sync_z`: Streamlit renders every tab on
+    every run, so a widget ``key`` can appear only once across all of them and the Volume view
+    cannot reuse the keys the Slice view's component owns. Each surface writes through to the
+    canonical value, which is re-seeded into both before they are rebuilt — so they can never
+    disagree, whichever one you touch.
+    """
+    s = st.session_state
+    s["live3d_angle"] = float(s["live3d_angle_vol"])
+    s["live3d_offset"] = float(s["live3d_offset_vol"])
+    s["live3d_nbeams"] = int(s["live3d_nbeams_vol"])
+
+
+def _bundle_sliders_3d(suffix: str, slots=None):
+    """The Angle / Offset / # Beams trio, in the ranges the 3D tab uses.
+
+    ``slots`` is three containers to place them in (e.g. ``st.columns(3)``); ``None`` stacks
+    them in the current one.
+
+    Seeds itself from the canonical values immediately before building the widgets, which is the
+    last moment Streamlit allows a widget key to be written. Doing it here rather than at the top
+    of the tab matters: this renders *after* the Slice view's component, so it picks up a value
+    set over there within the same run, without depending on the component's on_change having
+    fired first.
+    """
+    s = st.session_state
+    s["live3d_angle" + suffix] = float(s["live3d_angle"])
+    s["live3d_offset" + suffix] = float(s["live3d_offset"])
+    s["live3d_nbeams" + suffix] = int(s["live3d_nbeams"])
+    a, o, n = slots if slots is not None else (st, st, st)
+    a.slider("Angle (deg)", 0.0, 360.0, step=1.0, key="live3d_angle" + suffix,
+             on_change=_cb3d_sync_beam)
+    o.slider("Offset", -float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, step=0.5,
+             key="live3d_offset" + suffix, on_change=_cb3d_sync_beam)
+    n.slider("# Beams (0 = full fan)", 0, IMAGE_RES, step=1, key="live3d_nbeams" + suffix,
+             on_change=_cb3d_sync_beam)
 
 
 def _slice_figure(img, image_res, k, n_slices, n_meas, vmin, vmax, preview=None):
@@ -771,6 +839,7 @@ def _render_3d_tab():
         s["live3d_meas"] = max(0, min(int(s["live3d_meas"]), n_meas - 1))
     # Seed both slice pickers from the canonical value. Safe because it happens before either
     # widget is instantiated this run; Streamlit only objects to writing a widget key after.
+    # (The Volume sub-tab's duplicate bundle sliders seed themselves; see _bundle_sliders_3d.)
     s["live3d_z_slice"] = s["live3d_z_sino"] = k
 
     with left3d:
@@ -782,7 +851,7 @@ def _render_3d_tab():
             # only reports on release, so a Python-owned slider cannot track a drag at all. That
             # is why those three sliders moved out of the controls column to sit under this
             # picture -- the same arrangement the 2D tab already uses.
-            _v3d = _live_sim(
+            _live_sim(
                 image_uri=_live_background_uri(vol[:, :, k], 0.0, 1.0),
                 image_res=IMAGE_RES,
                 k=n_meas,
@@ -811,11 +880,12 @@ def _render_3d_tab():
                     "nbeams": int(s["live3d_nbeams"]),
                 },
                 key="live_sim_3d",
+                on_change=_cb_sync_live_sim_3d,
             )
-            if isinstance(_v3d, dict):   # released slider values -> the rest of the tab reads these
-                s["live3d_angle"] = float(_v3d["angle"])
-                s["live3d_offset"] = float(_v3d["offset"])
-                s["live3d_nbeams"] = int(_v3d["nbeams"])
+            # Return value deliberately unused -- see the 2D instance. Writing it back each run
+            # would undo a change just made with the Volume sub-tab's sliders.
+            # _cb_sync_live_sim_3d owns the sync, and runs early enough that the args above
+            # already carry the result.
             # Stays server-side: a new z needs a new background PNG, so there is nothing a
             # client-side slider could redraw without a round-trip anyway.
             st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z_slice",
@@ -881,6 +951,14 @@ def _render_3d_tab():
                                s["live3d_cutaxis"], s["live3d_cut"], beams=beams),
                 use_container_width=True,
             )
+            # The same three values the Slice view's component owns, mirrored here so the bundle
+            # can be aimed without leaving the volume. Separate keys folded back into the canonical
+            # ones by _cb3d_sync_beam -- one widget key cannot appear in two tabs. Their own full
+            # width row: squeezed into a column beside the view controls the labels barely fit.
+            st.markdown("**Aim the next measurement**")
+            _bundle_sliders_3d("_vol", slots=st.columns(3))
+            st.caption("The same bundle as under the Slice picture — where the red preview is "
+                       "live, rather than redrawn on release as it is here.")
             vc1, vc2, vc3, vc4 = st.columns(4)
             with vc1:
                 st.radio("Show", ("Degraded", "Original", "Dose removed"),
@@ -978,8 +1056,9 @@ def _render_3d_tab():
         # The three bundle sliders live inside the component under the Slice picture (they have
         # to -- see there). This is the read-out, so the current aim is legible from any sub-tab.
         st.caption(
-            "Angle **%.0f\u00b0** \u00b7 offset **%.1f** \u00b7 **%s** \u2014 set these with the "
-            "sliders under the picture in the **Slice** view."
+            "Angle **%.0f\u00b0** \u00b7 offset **%.1f** \u00b7 **%s** \u2014 set these under the "
+            "picture in the **Slice** view (live preview) or in the **Volume** view\'s *Aim* "
+            "column."
             % (float(s["live3d_angle"]), float(s["live3d_offset"]),
                "full fan" if int(s["live3d_nbeams"]) == 0
                else "%d beams" % int(s["live3d_nbeams"]))
@@ -1065,7 +1144,7 @@ with tab_2d:
         # dashes redraw *while* dragging (client-side). Python only supplies the static background image
         # and the committed (blue) bundle. On release the component returns the values so the rest of the
         # app (Take measurement / Reconstruct) reads them from session_state below.
-        _live_val = _live_sim(
+        _live_sim(
             image_uri=_live_background_uri(_view_image, _vmin, _vmax),
             image_res=IMAGE_RES,
             k=_k,
@@ -1080,11 +1159,13 @@ with tab_2d:
                 "nbeams": int(st.session_state["live_nbeams"]),
             },
             key="live_sim",
+            on_change=_cb_sync_live_sim_2d,
         )
-        if isinstance(_live_val, dict):  # released slider values → sync so Take/Reconstruct use them
-            st.session_state["live_angle"] = float(_live_val["angle"])
-            st.session_state["live_offset"] = float(_live_val["offset"])
-            st.session_state["live_nbeams"] = int(_live_val["nbeams"])
+        # Return value deliberately unused: it is the component's STANDING widget value and
+        # persists across reruns, so writing it back each run would resurrect the last value the
+        # component reported and overwrite anything set elsewhere. The 3D tab has a second control
+        # surface where that is an outright bug; the rule is the same here so the two instances
+        # cannot diverge. _cb_sync_live_sim_2d owns the sync.
         st.latex(
             r"\mathrm{pixel\_new} = \mathrm{pixel}\cdot"
             r"\exp\!\left(-\alpha\,I_{\mathrm{local}} - \beta\,I_{\mathrm{local}}^2\right)"
