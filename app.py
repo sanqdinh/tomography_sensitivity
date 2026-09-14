@@ -647,11 +647,6 @@ _CUT_AXES = {"none": None, "x (col)": 1, "y (row)": 0, "z (slice)": 2}
 # beams are toggled off.
 _BEAM_FLOOR_Z = -1.0
 
-# Arrowhead size on the floor preview, in voxels. The head is a plain "V" of two segments in the
-# floor plane rather than a go.Cone: it stays in a Scatter3d, which is what the browser can
-# restyle by name during a drag, and it reads correctly from any camera above the floor.
-_ARROW_LEN, _ARROW_HALF_W = 1.8, 0.8
-
 
 def _exposed_faces(mask, axis, positive):
     """Voxels in ``mask`` whose neighbour along ``axis`` is absent — i.e. that face is visible.
@@ -760,60 +755,6 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
     return go.Scatter3d(
         x=xs, y=ys, z=zs, mode="lines", name=name,
         line=dict(color=color, width=2, dash="dot"),
-        hoverinfo="skip", showlegend=False,
-    )
-
-
-def _beam_arrowheads_trace(r_values, angle_deg, nr, nc, flat_z, color, name):
-    """Arrowheads for the flat beam preview, pointing along the beam's travel direction.
-
-    Direction matters physically and is invisible on a bare line: the dose model integrates along
-    the travel tangent ``(-sinθ, cosθ)``, so 0° (bottom-up) and 180° (top-down) deposit dose in
-    opposite orders while drawing the exact same line. The head marks which way the beam runs.
-
-    It sits at the **exit** end, which is the larger ``t`` from :func:`_clip_ray_to_box` —
-    ``p(t)``'s derivative there is the travel tangent by construction. The head direction is taken
-    from the two *scene* endpoints rather than recomputed from θ, so the row axis flip cannot be
-    got wrong twice.
-
-    A separate trace from the shaft so it can be drawn solid: the shaft's dotted pattern would
-    render a 1.8-voxel head as a couple of specks.
-    """
-    theta = np.deg2rad(float(angle_deg))
-    c, sn = np.cos(theta), np.sin(theta)
-    z = float(flat_z)
-    xs, ys, zs = [], [], []
-    for r in r_values:
-        clip = _clip_ray_to_box(float(r), theta, nc / 2.0, nr / 2.0)
-        if clip is None:
-            continue
-        ends = []
-        for t in clip:
-            x, y = r * c - t * sn, r * sn + t * c
-            ends.append((x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y))
-        (x0, y0), (x1, y1) = ends          # ends[1] is the larger t, i.e. where the beam leaves
-        dx, dy = x1 - x0, y1 - y0
-        chord = float(np.hypot(dx, dy))
-        if chord < 1e-9:
-            continue                        # ray only grazes a corner: nothing to point along
-        ux, uy = dx / chord, dy / chord
-        # Shrink the head on a short chord so it cannot overrun the shaft it belongs to.
-        ln = min(_ARROW_LEN, chord * 0.5)
-        wd = _ARROW_HALF_W * (ln / _ARROW_LEN)
-        bx, by = x1 - ln * ux, y1 - ln * uy
-        px, py = -uy, ux                    # in-plane perpendicular
-        for pt in ((bx + wd * px, by + wd * py, z), (x1, y1, z), (bx - wd * px, by - wd * py, z)):
-            xs.append(pt[0])
-            ys.append(pt[1])
-            zs.append(pt[2])
-        xs.append(np.nan)
-        ys.append(np.nan)
-        zs.append(np.nan)
-    if not xs:
-        xs = ys = zs = []                   # must still exist: the browser restyles it by name
-    return go.Scatter3d(
-        x=xs, y=ys, z=zs, mode="lines", name=name,
-        line=dict(color=color, width=3),    # solid, unlike the shaft
         hoverinfo="skip", showlegend=False,
     )
 
@@ -1072,13 +1013,10 @@ def _render_3d_tab():
                 # Red: the live preview. Python still builds it, so the plot is correct the moment
                 # it loads and stays correct if the browser-side redraw never runs; the component
                 # only restyles THIS trace (found by name) while a slider is dragged.
-                _rs = _bundle_r_values(s["live3d_offset"], s["live3d_nbeams"], IMAGE_RES)
                 beams.append(_beam_curtain_trace(
-                    _rs, s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b",
+                    _bundle_r_values(s["live3d_offset"], s["live3d_nbeams"], IMAGE_RES),
+                    s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b",
                     name="beam_preview", flat_z=_BEAM_FLOOR_Z))
-                beams.append(_beam_arrowheads_trace(
-                    _rs, s["live3d_angle"], IMAGE_RES, IMAGE_RES, _BEAM_FLOOR_Z, "#ff2b2b",
-                    name="beam_preview_head"))
             fig3d = _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
                                    title, cmap_name, fixed_cmax,
                                    s["live3d_cutaxis"], s["live3d_cut"], beams=beams)
@@ -1087,7 +1025,6 @@ def _render_3d_tab():
                     figure=fig3d.to_json(),
                     image_res=IMAGE_RES, nr=IMAGE_RES, nc=IMAGE_RES, nz=nz,
                     flat_z=_BEAM_FLOOR_Z,
-                    arrow=[_ARROW_LEN, _ARROW_HALF_W],
                     angle=float(s["live3d_angle"]),
                     offset=float(s["live3d_offset"]),
                     nbeams=int(s["live3d_nbeams"]),
