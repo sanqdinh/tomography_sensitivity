@@ -52,7 +52,7 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from dose_response import ray_geometry, bundle_r_values
+from dose_response import bundle_r_values, ray_geometry, ray_line_integral
 
 
 @dataclass(frozen=True)
@@ -313,6 +313,56 @@ def simulate(theta, seq, p: V2Params, image_res: int):
     return f, Q, infos
 
 
+def peak_optical_depth(theta, image_res: int, n_angles: int = 12) -> float:
+    """Largest line integral ``sum_p f_p*delta_p`` over a full fan at ``n_angles`` angles.
+
+    The sample's opacity, and the one number that decides whether the model is in a sensible
+    regime at all.  ``f`` is an attenuation coefficient, i.e. a reciprocal *length*, so its
+    numerical size is meaningless without the pixel pitch: this app measures geometry in pixels
+    (``x_range = [-w/2, w/2]`` over ``w`` pixels, so a chord through one pixel is ~1), where the
+    manuscript's reference script used a ``[-1, 1]`` box on a 64 grid (chord ~0.03).  A phantom
+    with O(1) values therefore has a peak optical depth near 34 here against ~1.1 there, and
+    ``exp(-34)`` means the beam is entirely absorbed within the first couple of pixels: all dose
+    lands in a two-pixel entry rim, nothing downstream is ever measured, and every diagnostic the
+    manuscript quotes is off by an order of magnitude.  Real tomography sits at ``mu*L`` of order
+    one, which is what :func:`scale_to_optical_depth` restores.
+    """
+    theta = np.asarray(theta, dtype=float)
+    best = 0.0
+    for a in range(n_angles):
+        angle = np.pi * a / n_angles
+        for r in bundle_r_values(0.0, 0, int(image_res)):
+            best = max(best, ray_line_integral(theta, r, angle))
+    return float(best)
+
+
+def scale_to_optical_depth(theta, target: float, image_res: int, n_angles: int = 12):
+    """Rescale ``theta`` so its peak optical depth is ``target``; see :func:`peak_optical_depth`.
+
+    Self-normalising, so the same ``target`` means the same physics at any grid resolution.
+    """
+    depth = peak_optical_depth(theta, image_res, n_angles)
+    if depth <= 0.0:
+        return np.asarray(theta, dtype=float).copy()
+    return np.asarray(theta, dtype=float) * (float(target) / depth)
+
+
+def radius_of_gyration(f) -> float:
+    """``sqrt(sum f r^2 / sum f)`` about the field's own centroid, in pixels.
+
+    The compactness diagnostic: it is what "the sample shrinks" means quantitatively.  At
+    ``c_cp = 0`` nothing moves, so it must come out *exactly* unchanged; above zero it must fall.
+    """
+    f = np.asarray(f, dtype=float)
+    nr, nc = f.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m = f.sum()
+    if m <= 0:
+        return float("nan")
+    xc, yc = (xx * f).sum() / m, (yy * f).sum() / m
+    return float(np.sqrt((f * ((xx - xc) ** 2 + (yy - yc) ** 2)).sum() / m))
+
+
 # --- invariants -------------------------------------------------------------------------
 # Three properties the model must have.  There is no test suite in this repo (see CLAUDE.md),
 # so this is the verification path, in the same "run the module" style as tomography_3d.py.
@@ -433,5 +483,58 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     return out
 
 
+def check_reference_numbers(image_res: int = 64, verbose: bool = True):
+    """Reproduce the manuscript's measured numbers on its own test object.
+
+    The invariants above are structural -- they would pass for a model that was self-consistent
+    but wrong.  These are the quantitative cross-check against an independently written reference
+    (a plane-wave, bilinear-resampling script; this module is ray-based over the app's own cached
+    geometry), so agreement to a few percent is evidence the port is faithful rather than merely
+    coherent.  The residual is the discretisation difference and is expected.
+
+    The disc is placed in the manuscript's regime first: diameter 1.1 in a ``[-1,1]`` box with
+    ``f = 1`` is a peak optical depth of 1.1, which in pixel units means rescaling ``f``.  Run at
+    the reference's own ``c_q``.
+    """
+    lin = np.linspace(-1.0, 1.0, image_res)
+    X, Y = np.meshgrid(lin, lin)
+    r = np.hypot(X, Y)
+    disc = scale_to_optical_depth(np.where(r < 0.55, 1.0, 0.0), 1.1, image_res)
+    seq = _demo_sequence(12)
+    out = {}
+
+    def say(msg):
+        if verbose:
+            print(msg)
+
+    say("reference numbers (manuscript value in brackets)")
+    for c_cp, want in ((0.0, 0.0), (0.3, -2.3), (0.8, -5.9)):
+        p = V2Params(c_q=0.0317, c_cp=c_cp, gamma_esc=0.0, eps_up=0.0)
+        f, _, infos = simulate(disc, seq, p, image_res)
+        g0, g1 = radius_of_gyration(disc), radius_of_gyration(f)
+        got = 100.0 * (g1 - g0) / g0
+        out["rg_%.1f" % c_cp] = got
+        say("    c_cp=%.1f  radius of gyration %+7.3f%%  [%+.1f%%]   Courant %.2f"
+            % (c_cp, got, want, max(i.courant for i in infos)))
+        if c_cp == 0.0:
+            assert got == 0.0, "c_cp = 0 must not move anything at all"
+        else:
+            assert got < 0.0, "contraction must shrink the sample"
+            assert abs(got - want) / abs(want) < 0.15, "shrinkage is off the reference value"
+
+    p = V2Params(c_q=0.0317, c_cp=0.0, eps_up=0.0)
+    _, Q, _ = simulate(disc, seq, p, image_res)
+    core, rim = (r < 0.20) & (disc > 0), (r > 0.45) & (disc > 0)
+    ratio = float(Q[rim].mean() / Q[core].mean())
+    out["rim_core"] = ratio
+    say("    rim/core accumulated dose %.3f  [1.22]" % ratio)
+    assert abs(ratio - 1.22) / 1.22 < 0.05, "rim-vs-core dose gradient is off the reference value"
+
+    say("reference numbers reproduced")
+    return out
+
+
 if __name__ == "__main__":
     check_invariants()
+    print()
+    check_reference_numbers()
