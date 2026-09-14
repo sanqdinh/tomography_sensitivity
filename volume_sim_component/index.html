@@ -44,8 +44,9 @@
     </div>
     <div class="hint"><b style="color:#ff2b2b">Red</b> curtains = next-measurement preview, redrawn
       in the browser as you drag, projected onto the floor below the head so they never sit in
-      front of it; <b style="color:#1f77ff">blue</b> = the last measurement taken, drawn as full
-      curtains through the stack.
+      front of it. Each dash is an arrow pointing the way the beam travels — 0° and 180° draw the
+      same line but deposit dose in opposite order. <b style="color:#1f77ff">Blue</b> = the last
+      measurement taken, drawn as full curtains through the stack.
       Drag the plot to rotate · scroll to zoom · double-click to reset.</div>
   </div>
 
@@ -78,6 +79,8 @@ var nbeamsVal = document.getElementById("nbeamsVal");
 var imageRes = 30, nr = 30, nc = 30, nz = 16;
 // null = full curtains; a number = one line per ray at that height (app.py _BEAM_FLOOR_Z).
 var flatZ = null;
+// app.py _ARROW_PERIOD / _ARROW_SHAFT / _ARROW_HEAD / _ARROW_HALF_W, in voxels along a ray.
+var arrowPeriod = 4.0, arrowShaft = 2.2, arrowHead = 0.9, arrowHalfW = 0.35;
 var theme = null;
 var curAngle = 45, curOffset = 0, curNbeams = 30;
 var dragging = false, pendingArgs = null, mounted = false, plotted = false;
@@ -120,6 +123,33 @@ function clipRay(r, theta, halfW, halfH) {
   return t1 > t0 ? [t0, t1] : null;
 }
 
+// One ray's flat line as a row of arrows -- the dash pattern drawn as geometry, because plotly
+// has no arrowhead dash style. Mirror of app.py _arrow_dashes. Direction comes from the two scene
+// endpoints, never recomputed from the angle, so the flipped row axis cannot be applied twice.
+function arrowDashes(x0, y0, x1, y1, z) {
+  var dx = x1 - x0, dy = y1 - y0;
+  var chord = Math.sqrt(dx * dx + dy * dy);
+  if (chord < 1e-9) return [];
+  var ux = dx / chord, uy = dy / chord;
+  var px = -uy, py = ux;
+  var n = Math.max(1, Math.floor(chord / arrowPeriod));
+  var step = chord / n;
+  var scale = Math.min(1.0, step / arrowPeriod);
+  var shaft = arrowShaft * scale, head = arrowHead * scale, halfW = arrowHalfW * scale;
+  var segs = [];
+  for (var i = 0; i < n; i++) {
+    var s = step * (i + 1);
+    var tx = x0 + s * ux, ty = y0 + s * uy;
+    var back = Math.max(0.0, s - shaft);
+    var sx = x0 + back * ux, sy = y0 + back * uy;
+    var bx = tx - head * ux, by = ty - head * uy;
+    segs.push([[sx, sy, z], [tx, ty, z]]);
+    segs.push([[bx + halfW * px, by + halfW * py, z], [tx, ty, z],
+               [bx - halfW * px, by - halfW * py, z]]);
+  }
+  return segs;
+}
+
 function curtain(offset, nbeams, angleDeg) {
   var rs = bundleR(offset, nbeams, imageRes);
   var th = angleDeg * Math.PI / 180.0, c = Math.cos(th), sn = Math.sin(th);
@@ -142,10 +172,13 @@ function curtain(offset, nbeams, angleDeg) {
               [[e[0][0], e[0][1], zb], [e[0][0], e[0][1], zt]],
               [[e[1][0], e[1][1], zb], [e[1][0], e[1][1], zt]]];
     } else {
-      segs = [[[e[0][0], e[0][1], flatZ], [e[1][0], e[1][1], flatZ]]];
+      segs = arrowDashes(e[0][0], e[0][1], e[1][0], e[1][1], flatZ);
     }
     for (var k = 0; k < segs.length; k++) {
-      for (var m = 0; m < 2; m++) { xs.push(segs[k][m][0]); ys.push(segs[k][m][1]); zs.push(segs[k][m][2]); }
+      // Segments are no longer all 2 points: an arrow head is barb -> tip -> barb.
+      for (var m = 0; m < segs[k].length; m++) {
+        xs.push(segs[k][m][0]); ys.push(segs[k][m][1]); zs.push(segs[k][m][2]);
+      }
       xs.push(null); ys.push(null); zs.push(null);   // JSON null == the NaN break Python emits
     }
   }
@@ -256,6 +289,10 @@ function onRender(args, keepThumbs) {
   // Must match the flat_z Python used to build the trace, or the beams would jump to a different
   // shape the instant a slider is touched and jump back on release.
   flatZ = args.flat_z != null ? args.flat_z : null;
+  if (args.arrow) {
+    arrowPeriod = args.arrow[0]; arrowShaft = args.arrow[1];
+    arrowHead = args.arrow[2]; arrowHalfW = args.arrow[3];
+  }
 
   if (!mounted) {
     applyRange(angleEl, args.angle_range);

@@ -647,6 +647,17 @@ _CUT_AXES = {"none": None, "x (col)": 1, "y (row)": 0, "z (slice)": 2}
 # beams are toggled off.
 _BEAM_FLOOR_Z = -1.0
 
+# The flat preview's dash pattern is built as GEOMETRY, not as a line style: plotly has no
+# "arrowhead dash", so each dash is drawn as a small arrow. That puts the travel direction along
+# the whole ray instead of only at one end, and it is the dash pattern -- there is no separate
+# glyph to keep in step. Lengths are in voxels, along the ray.
+_ARROW_PERIOD = 4.0    # centre-to-centre spacing of successive arrows
+_ARROW_SHAFT = 2.2     # length of one arrow's shaft (the rest of the period is the gap)
+_ARROW_HEAD = 0.9      # how far the barbs sit behind the tip
+# Half width must stay under half the ray spacing, which is 1 voxel: at 0.55 the heads of
+# neighbouring rays overlapped and a full 30-ray fan rendered as a solid red mat.
+_ARROW_HALF_W = 0.35
+
 
 def _exposed_faces(mask, axis, positive):
     """Voxels in ``mask`` whose neighbour along ``axis`` is absent — i.e. that face is visible.
@@ -690,6 +701,41 @@ def _clip_ray_to_box(r, theta, half_w, half_h):
     return (t0, t1) if t1 > t0 else None
 
 
+def _arrow_dashes(x0, y0, x1, y1, z):
+    """One ray's flat line as a row of arrows — the dash pattern, drawn as geometry.
+
+    Arrows march from ``(x0, y0)`` to ``(x1, y1)``, which is the beam-travel direction: the
+    caller derives both ends from ascending ``t``, whose tangent is ``(-sinθ, cosθ)``. Direction
+    therefore comes from the two *scene* endpoints and is never recomputed from θ, so the flipped
+    row axis cannot be applied twice.
+
+    The spacing is stretched to divide the chord exactly, so the last arrow always lands on the
+    exit point and the pattern does not crawl along the ray as the offset slider moves. A chord
+    too short for one full arrow still gets one, scaled down.
+    """
+    dx, dy = x1 - x0, y1 - y0
+    chord = float(np.hypot(dx, dy))
+    if chord < 1e-9:
+        return ()
+    ux, uy = dx / chord, dy / chord
+    px, py = -uy, ux                                   # in-plane perpendicular
+    n = max(1, int(chord // _ARROW_PERIOD))
+    step = chord / n
+    scale = min(1.0, step / _ARROW_PERIOD)             # shrink to fit a short chord
+    shaft, head, half_w = (_ARROW_SHAFT * scale, _ARROW_HEAD * scale, _ARROW_HALF_W * scale)
+    segs = []
+    for i in range(n):
+        s = step * (i + 1)                             # tip of this arrow, measured from the entry
+        tx, ty = x0 + s * ux, y0 + s * uy
+        sx, sy = x0 + max(0.0, s - shaft) * ux, y0 + max(0.0, s - shaft) * uy
+        bx, by = tx - head * ux, ty - head * uy
+        segs.append(((sx, sy, z), (tx, ty, z)))                       # shaft
+        segs.append(((bx + half_w * px, by + half_w * py, z),         # head: barb -> tip -> barb
+                     (tx, ty, z),
+                     (bx - half_w * px, by - half_w * py, z)))
+    return tuple(segs)
+
+
 def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_z=None):
     """Each ray of a bundle as dashed lines through the volume.
 
@@ -698,11 +744,17 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
     edge, top edge, two verticals), which shows the geometry honestly without a translucent sheet
     hiding the voxels behind it.
 
-    ``flat_z`` instead draws **one line per ray at that height**. Full curtains read as a cage
-    around the head and the rays nearest the camera sit in front of the very voxels you are
-    trying to see; dropped to the floor below the volume they read as a shadow of the bundle, and
-    the head is unobstructed. The angle and spacing are just as legible from a floor projection,
-    which is what the preview is for.
+    ``flat_z`` instead draws **one ray per line at that height, dashed with arrows**. Full
+    curtains read as a cage around the head and the rays nearest the camera sit in front of the
+    very voxels you are trying to see; dropped to the floor below the volume they read as a
+    shadow of the bundle, and the head is unobstructed.
+
+    Each dash of that line is a small arrow rather than a plain stroke, because direction is
+    physical and a plain line cannot show it: dose integrates along the travel tangent
+    ``(-sinθ, cosθ)``, so 0° and 180° draw the identical line while depositing dose in opposite
+    order. plotly has no arrowhead dash style, so the pattern is emitted as geometry and the line
+    is drawn solid — the gaps between arrows *are* the dashes. Arrows point along increasing
+    ``t``, which is that travel tangent by construction, and the last one lands on the exit point.
 
     Physical ``(x, y)`` become scene indices with the vendored convention from
     ``senDOE/helpers/geometry.py`` (``col = int(x + w/2)``, ``row = int(h/2 − y)``) evaluated at
@@ -731,7 +783,7 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
                     ((x0, y0, zb), (x0, y0, zt)),      # the two verticals that close the curtain
                     ((x1, y1, zb), (x1, y1, zt)))
         else:
-            segs = (((x0, y0, float(flat_z)), (x1, y1, float(flat_z))),)
+            segs = _arrow_dashes(x0, y0, x1, y1, float(flat_z))
         for seg in segs:
             for px, py, pz in seg:
                 xs.append(px)
@@ -754,7 +806,9 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
     # 2D overlay gets from stroke-dasharray "5 4".
     return go.Scatter3d(
         x=xs, y=ys, z=zs, mode="lines", name=name,
-        line=dict(color=color, width=2, dash="dot"),
+        # Solid in flat mode: the arrows ARE the dashes, and plotly's pattern would chew them up.
+        line=dict(color=color, width=2,
+                  dash=("solid" if flat_z is not None else "dot")),
         hoverinfo="skip", showlegend=False,
     )
 
@@ -1025,6 +1079,7 @@ def _render_3d_tab():
                     figure=fig3d.to_json(),
                     image_res=IMAGE_RES, nr=IMAGE_RES, nc=IMAGE_RES, nz=nz,
                     flat_z=_BEAM_FLOOR_Z,
+                    arrow=[_ARROW_PERIOD, _ARROW_SHAFT, _ARROW_HEAD, _ARROW_HALF_W],
                     angle=float(s["live3d_angle"]),
                     offset=float(s["live3d_offset"]),
                     nbeams=int(s["live3d_nbeams"]),
