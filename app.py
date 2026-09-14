@@ -394,7 +394,7 @@ for _k, _v in {
     "live3d_nslices": 16, "live3d_contrast": 1.0,
     "live3d_I0": 0.0, "live3d_alpha": 0.3, "live3d_beta": 0.01,
     "live3d_meas": 0, "live3d_opacity": 1.0, "live3d_isomin": 0.05,
-    "live3d_isomax": 1.0, "live3d_band": "Whole head",
+    "live3d_isomax": 1.0, "live3d_band": "Whole head", "live3d_band_prev": None,
     "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
 }.items():
@@ -719,15 +719,21 @@ def _render_3d_tab():
                 data, cmap_name = vol, "Gray"
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
-            # While a preset is active the two Custom sliders are not rendered, so their stored
-            # values are pinned to the full range here. Switching to Custom must always open on
-            # 0.001-1.00, never on a window left over from an earlier visit. Streamlit does
-            # garbage-collect un-rendered widget keys, which would have the same effect, but not
-            # dependably across a hot reload -- that keeps session_state while the code changes,
-            # which is exactly how a stale value survives.
-            if s["live3d_band"] != "Custom":
-                s["live3d_isomin"] = _ISOMIN_FLOOR
-                s["live3d_isomax"] = 1.0
+            # Reset the Custom window whenever the band CHANGES into Custom, so it always opens
+            # on the full 0.001-1.00 range instead of a stale window from an earlier visit.
+            #
+            # Keyed on the transition, not on "is a preset active": a session that was already
+            # sitting in Custom when the page reloaded never leaves Custom, so a check of the
+            # latter kind never fires and the stale value survives. The sentinel None start
+            # makes the first run of any session count as a transition, which is what catches
+            # that case -- including a hot reload, which keeps session_state across a code
+            # change. Assignments land before the sliders are built, which is the only point
+            # Streamlit allows a widget key to be written.
+            if s["live3d_band_prev"] != s["live3d_band"]:
+                if s["live3d_band"] == "Custom":
+                    s["live3d_isomin"] = _ISOMIN_FLOOR
+                    s["live3d_isomax"] = 1.0
+                s["live3d_band_prev"] = s["live3d_band"]
             # Clamp a value carried over from before the floor existed, before the widget that
             # owns this key is created -- Streamlit rejects a value below min_value.
             s["live3d_isomin"] = max(_ISOMIN_FLOOR, float(s["live3d_isomin"]))
