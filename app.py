@@ -614,9 +614,14 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color):
             zs.append(np.nan)
     if not xs:
         return None
+    # dash="dot", not "dash". plotly maps line.dash through a fixed pattern table and then
+    # SCALES it by the line width (plotly.min.js: DASHES.dash = [4, 1], each entry multiplied by
+    # line.width * pixelRatio), so "dash" at width 2 is 8px on / 2px off -- an 80% duty cycle that
+    # reads as a solid line. DASHES.dot = [1, 1] is the only even one, giving the broken look the
+    # 2D overlay gets from stroke-dasharray "5 4".
     return go.Scatter3d(
         x=xs, y=ys, z=zs, mode="lines",
-        line=dict(color=color, width=3, dash="dash"),
+        line=dict(color=color, width=2, dash="dot"),
         hoverinfo="skip", showlegend=False,
     )
 
