@@ -1,6 +1,6 @@
 """v2 damage model: dose accumulation, saturating response, and elastic mass transport.
 
-Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``bd0eab5`` of the
+Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``bfd6cba`` of the
 manuscript repo. Where v1 (:func:`dose_response.degradation_dose_response`) is a pure *local
 sink* -- ``f <- f*exp(-a*I - b*I^2)``, so mass vanishes in place and the sample fades but never
 changes shape -- v2 separates dose *accumulation* from the dose *response* and adds a mass
@@ -44,6 +44,27 @@ Discretisation choices that differ from the manuscript's scratch reference, and 
   constraints of the estimation NLP, not a projection inside the forward map, and clipping here
   would destroy both exact mass conservation and the exact collapse.  Violations are reported in
   :class:`StepInfo` instead.
+* **``eps_up`` is the constant of eq:xd_mass_transport, and defaults to zero here.**  The spec
+  now carries a relative form, ``eps_up = eps_rel * ||u_k||`` over a smooth grid norm, adopted
+  after the resting-diffusion defect below was found: scaling the smoothing to the flow makes it
+  vanish wherever the flow does, which restores both invariants to zero while keeping
+  ``phi >= |v|`` and so keeping positivity.  (A split vanishing at rest by construction, such as
+  ``phi(v) = v^2/sqrt(v^2+eps^2)``, does *not* work -- any smooth ``phi`` with ``phi(0) = 0`` dips
+  below ``|v|`` near the origin, which is locally anti-diffusive and costs positivity.)  This
+  module implements the constant form and defaults it to ``0``, which is exact and is what the
+  spec endorses for a simulator doing no sensitivity extraction.  Wire the relative form in if
+  this model is ever handed to the estimation NLP; ``eps_rel = 1e-3`` was sufficient upstream.
+
+Tuning note
+-----------
+``c_cp`` has to serve two behaviours that want opposite values, and they fight.  Shrinkage wants
+it large; a beam channel that does not refill wants it small.  Measured upstream: repeated
+thin-beam exposure in the optically thin regime drills a clean through-channel floored at
+``omega_inf`` (20% of original) at ``c_cp = 0``, while at ``c_cp = 0.8`` the same channel only
+reaches 56% and grows a densified rim at ~1.07 of the original value, because the contracting
+channel pulls its neighbours inward.  Seeing the two trade off is the model behaving correctly.
+A damage-dependent modulus is the only remaining route by which stiffness could separate them,
+since a uniform ``E`` cancels out of ``K u = B dw`` entirely.
 """
 
 from dataclasses import dataclass
