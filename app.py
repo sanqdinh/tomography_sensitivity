@@ -640,6 +640,13 @@ _VOXEL_FACES = (
 
 _CUT_AXES = {"none": None, "x (col)": 1, "y (row)": 0, "z (slice)": 2}
 
+# Where the flat beam preview is drawn. The volume occupies z = -0.5 … nz-0.5, so this sits
+# clearly beneath it — a shadow of the bundle on the floor of the scene rather than a cage through
+# the head. The z axis is given a margin below it so the line is never flush with the axis bound
+# (plotly clips there), and that margin is unconditional so the box does not resize when the
+# beams are toggled off.
+_BEAM_FLOOR_Z = -1.0
+
 
 def _exposed_faces(mask, axis, positive):
     """Voxels in ``mask`` whose neighbour along ``axis`` is absent — i.e. that face is visible.
@@ -683,13 +690,19 @@ def _clip_ray_to_box(r, theta, half_w, half_h):
     return (t0, t1) if t1 > t0 else None
 
 
-def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None):
-    """Each ray of a bundle as a dashed rectangle spanning the whole z-stack.
+def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_z=None):
+    """Each ray of a bundle as dashed lines through the volume.
 
     2.5D means one measurement fires the same bundle through *every* slice, so inside the volume
-    a ray is not a line — it is a vertical plane. Outlining that plane (bottom edge, top edge,
-    two verticals) shows the geometry honestly without a translucent sheet hiding the voxels
-    behind it.
+    a ray is not a line — it is a vertical plane. ``flat_z=None`` outlines that plane (bottom
+    edge, top edge, two verticals), which shows the geometry honestly without a translucent sheet
+    hiding the voxels behind it.
+
+    ``flat_z`` instead draws **one line per ray at that height**. Full curtains read as a cage
+    around the head and the rays nearest the camera sit in front of the very voxels you are
+    trying to see; dropped to the floor below the volume they read as a shadow of the bundle, and
+    the head is unobstructed. The angle and spacing are just as legible from a floor projection,
+    which is what the preview is for.
 
     Physical ``(x, y)`` become scene indices with the vendored convention from
     ``senDOE/helpers/geometry.py`` (``col = int(x + w/2)``, ``row = int(h/2 − y)``) evaluated at
@@ -712,10 +725,14 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None):
             x, y = r * c - t * sn, r * sn + t * c
             ends.append((x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y))
         (x0, y0), (x1, y1) = ends
-        for seg in (((x0, y0, zb), (x1, y1, zb)),      # bottom edge
+        if flat_z is None:
+            segs = (((x0, y0, zb), (x1, y1, zb)),      # bottom edge
                     ((x0, y0, zt), (x1, y1, zt)),      # top edge
                     ((x0, y0, zb), (x0, y0, zt)),      # the two verticals that close the curtain
-                    ((x1, y1, zb), (x1, y1, zt))):
+                    ((x1, y1, zb), (x1, y1, zt)))
+        else:
+            segs = (((x0, y0, float(flat_z)), (x1, y1, float(flat_z))),)
+        for seg in segs:
             for px, py, pz in seg:
                 xs.append(px)
                 ys.append(py)
@@ -824,7 +841,8 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
         uirevision="volume",
         scene=dict(
             xaxis_title="x (col)", yaxis_title="y (row)", zaxis_title="z (slice)",
-            xaxis=dict(range=[-1, nc]), yaxis=dict(range=[-1, nr]), zaxis=dict(range=[-1, nz]),
+            xaxis=dict(range=[-1, nc]), yaxis=dict(range=[-1, nr]),
+            zaxis=dict(range=[_BEAM_FLOOR_Z - 0.25, nz]),
             # Equal x/y scaling; z is exaggerated for thin stacks so they are not a pancake.
             aspectmode="manual",
             aspectratio=dict(x=1, y=1, z=max(0.35, min(1.0, nz / max(nr, 1)))),
@@ -998,7 +1016,7 @@ def _render_3d_tab():
                 beams.append(_beam_curtain_trace(
                     _bundle_r_values(s["live3d_offset"], s["live3d_nbeams"], IMAGE_RES),
                     s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b",
-                    name="beam_preview"))
+                    name="beam_preview", flat_z=_BEAM_FLOOR_Z))
             fig3d = _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
                                    title, cmap_name, fixed_cmax,
                                    s["live3d_cutaxis"], s["live3d_cut"], beams=beams)
@@ -1006,6 +1024,7 @@ def _render_3d_tab():
                 _volume_sim(
                     figure=fig3d.to_json(),
                     image_res=IMAGE_RES, nr=IMAGE_RES, nc=IMAGE_RES, nz=nz,
+                    flat_z=_BEAM_FLOOR_Z,
                     angle=float(s["live3d_angle"]),
                     offset=float(s["live3d_offset"]),
                     nbeams=int(s["live3d_nbeams"]),

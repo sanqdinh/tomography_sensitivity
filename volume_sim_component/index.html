@@ -43,7 +43,9 @@
       </div>
     </div>
     <div class="hint"><b style="color:#ff2b2b">Red</b> curtains = next-measurement preview, redrawn
-      in the browser as you drag; <b style="color:#1f77ff">blue</b> = the last measurement taken.
+      in the browser as you drag, projected onto the floor below the head so they never sit in
+      front of it; <b style="color:#1f77ff">blue</b> = the last measurement taken, drawn as full
+      curtains through the stack.
       Drag the plot to rotate · scroll to zoom · double-click to reset.</div>
   </div>
 
@@ -74,6 +76,8 @@ var offsetVal = document.getElementById("offsetVal");
 var nbeamsVal = document.getElementById("nbeamsVal");
 
 var imageRes = 30, nr = 30, nc = 30, nz = 16;
+// null = full curtains; a number = one line per ray at that height (app.py _BEAM_FLOOR_Z).
+var flatZ = null;
 var theme = null;
 var curAngle = 45, curOffset = 0, curNbeams = 30;
 var dragging = false, pendingArgs = null, mounted = false, plotted = false;
@@ -131,10 +135,15 @@ function curtain(offset, nbeams, angleDeg) {
       var x = r * c - t * sn, y = r * sn + t * c;
       e.push([x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y]);
     }
-    var segs = [[[e[0][0], e[0][1], zb], [e[1][0], e[1][1], zb]],
-                [[e[0][0], e[0][1], zt], [e[1][0], e[1][1], zt]],
-                [[e[0][0], e[0][1], zb], [e[0][0], e[0][1], zt]],
-                [[e[1][0], e[1][1], zb], [e[1][0], e[1][1], zt]]];
+    var segs;
+    if (flatZ === null || flatZ === undefined) {
+      segs = [[[e[0][0], e[0][1], zb], [e[1][0], e[1][1], zb]],
+              [[e[0][0], e[0][1], zt], [e[1][0], e[1][1], zt]],
+              [[e[0][0], e[0][1], zb], [e[0][0], e[0][1], zt]],
+              [[e[1][0], e[1][1], zb], [e[1][0], e[1][1], zt]]];
+    } else {
+      segs = [[[e[0][0], e[0][1], flatZ], [e[1][0], e[1][1], flatZ]]];
+    }
     for (var k = 0; k < segs.length; k++) {
       for (var m = 0; m < 2; m++) { xs.push(segs[k][m][0]); ys.push(segs[k][m][1]); zs.push(segs[k][m][2]); }
       xs.push(null); ys.push(null); zs.push(null);   // JSON null == the NaN break Python emits
@@ -244,6 +253,9 @@ function onRender(args, keepThumbs) {
   nr = args.nr != null ? args.nr : nr;
   nc = args.nc != null ? args.nc : nc;
   nz = args.nz != null ? args.nz : nz;
+  // Must match the flat_z Python used to build the trace, or the beams would jump to a different
+  // shape the instant a slider is touched and jump back on release.
+  flatZ = args.flat_z != null ? args.flat_z : null;
 
   if (!mounted) {
     applyRange(angleEl, args.angle_range);
