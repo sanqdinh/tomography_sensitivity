@@ -57,11 +57,24 @@ RUN /opt/idaes/bin/ipopt --version \
 COPY senDOE/ ./senDOE/
 COPY .streamlit/ ./.streamlit/
 COPY live_sim_component/ ./live_sim_component/
+COPY volume_sim_component/ ./volume_sim_component/
 COPY tomography_uq.py tomography_3d.py dose_response.py app.py ./
+
+# 6b) Materialize plotly.min.js for the 3D Volume component from THIS image's plotly, so the
+#     browser-side bundle always matches the figure JSON the app emits. app.py does the same copy
+#     at import time; doing it here means the runtime copy is a no-op and cannot fail on a
+#     read-only /app (which would silently drop the view to server-side rendering).
+RUN python3 -c "\
+import os, shutil, plotly; \
+src=os.path.join(os.path.dirname(plotly.__file__),'package_data','plotly.min.js'); \
+shutil.copyfile(src, '/app/volume_sim_component/plotly.min.js'); \
+print('plotly.min.js staged: %.1f MB' % (os.path.getsize(src)/1e6))"
 
 # 7) Build-time make-or-break checks: vendored package imports, and IPOPT solves end-to-end.
 RUN python3 -c "import senDOE; print('senDOE import OK')" \
     && python3 -c "import plotly.graph_objects as go; go.Volume(); print('plotly OK')" \
+    && test -s /app/volume_sim_component/plotly.min.js \
+    && test -s /app/volume_sim_component/index.html \
     && python3 -c "from tomography_3d import shepp_logan_3d, degrade_volume; \
 v=shepp_logan_3d(16,4); d=degrade_volume(v,((0.0,0.0,0),),5.0,0.3,0.01,16); \
 assert v.shape==(16,16,4) and d.sum()<v.sum(); print('3D degradation sim OK')" \

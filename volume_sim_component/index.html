@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>volume_sim</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #262730; background: transparent;
+  }
+  #wrap { padding: 2px; box-sizing: border-box; }
+  #plot { width: 100%; }
+  #err { display: none; padding: 10px; margin: 6px 2px; border-radius: 6px;
+         background: #4a1f1f; color: #ffd7d7; font-size: 13px; white-space: pre-wrap; }
+  #controls { margin-top: 4px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .ctl { flex: 1 1 180px; }
+  .ctl .row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 2px; }
+  .ctl .name { font-weight: 600; }
+  .ctl .val { font-variant-numeric: tabular-nums; opacity: 0.95; }
+  .ctl input[type="range"] { width: 100%; margin: 0; accent-color: #ff2b2b; cursor: pointer; }
+  .hint { font-size: 11px; opacity: 0.65; margin: 6px 2px 0 2px; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="err"></div>
+    <div id="plot"></div>
+    <div id="controls">
+      <div class="ctl">
+        <div class="row"><span class="name">Angle (deg)</span><span class="val" id="angleVal">45</span></div>
+        <input type="range" id="angle" min="0" max="360" step="1" value="45" />
+      </div>
+      <div class="ctl">
+        <div class="row"><span class="name">Offset</span><span class="val" id="offsetVal">0</span></div>
+        <input type="range" id="offset" min="-15" max="15" step="0.5" value="0" />
+      </div>
+      <div class="ctl">
+        <div class="row"><span class="name"># Beams</span><span class="val" id="nbeamsVal">30</span></div>
+        <input type="range" id="nbeams" min="0" max="30" step="1" value="30" />
+      </div>
+    </div>
+    <div class="hint"><b style="color:#ff2b2b">Red</b> curtains = next-measurement preview, redrawn
+      in the browser as you drag; <b style="color:#1f77ff">blue</b> = the last measurement taken.
+      Drag the plot to rotate · scroll to zoom · double-click to reset.</div>
+  </div>
+
+<!-- plotly.js is copied out of the installed Python plotly package at import time (see
+     _ensure_plotly_asset in app.py), so it is always the build that produced the figure JSON
+     below and there is no CDN dependency at runtime. -->
+<script src="./plotly.min.js"></script>
+<script>
+var Streamlit = {
+  setComponentReady: function () {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+  },
+  setFrameHeight: function (h) {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
+  },
+  setComponentValue: function (v) {
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*");
+  }
+};
+
+var gd = document.getElementById("plot");
+var errEl = document.getElementById("err");
+var angleEl = document.getElementById("angle");
+var offsetEl = document.getElementById("offset");
+var nbeamsEl = document.getElementById("nbeams");
+var angleVal = document.getElementById("angleVal");
+var offsetVal = document.getElementById("offsetVal");
+var nbeamsVal = document.getElementById("nbeamsVal");
+
+var imageRes = 30, nr = 30, nc = 30, nz = 16;
+var curAngle = 45, curOffset = 0, curNbeams = 30;
+var dragging = false, pendingArgs = null, mounted = false, plotted = false;
+var previewIdx = -1;               // index of the red trace, found by name (the mesh may be absent)
+var lastHeight = -1;
+
+function fail(where, e) {
+  // A broken plot must say so rather than leave an empty box: this view is the whole point of the
+  // sub-tab, and the Python side has no way to detect a silent JS failure.
+  errEl.style.display = "block";
+  errEl.textContent = "Volume view failed in " + where + ": " + (e && e.message ? e.message : e);
+  setHeight();
+}
+
+// ---- Beam geometry: mirror of app.py _bundle_r_values / _clip_ray_to_box /
+// ---- _beam_curtain_trace. Python still emits the INITIAL curtains in the figure below, so these
+// ---- must agree with it exactly; tests/curtain_js parity checks that numerically.
+function bundleR(offset, nbeams, R) {
+  var n = nbeams > 0 ? nbeams : R;
+  var rmax = R / 2 - 0.5 + 1e-9;
+  var rs = [];
+  for (var i = 0; i < n; i++) {
+    var r = Math.floor(offset + (i - (n - 1) / 2.0)) + 0.5;
+    if (Math.abs(r) <= rmax) rs.push(r);
+  }
+  return rs;
+}
+
+function clipRay(r, theta, halfW, halfH) {
+  var c = Math.cos(theta), sn = Math.sin(theta);
+  var t0 = -Infinity, t1 = Infinity;
+  var slabs = [[r * c, -sn, -halfW, halfW], [r * sn, c, -halfH, halfH]];
+  for (var i = 0; i < 2; i++) {
+    var p0 = slabs[i][0], d = slabs[i][1], lo = slabs[i][2], hi = slabs[i][3];
+    if (Math.abs(d) < 1e-12) { if (p0 < lo || p0 > hi) return null; continue; }
+    var a = (lo - p0) / d, b = (hi - p0) / d;
+    if (a > b) { var tmp = a; a = b; b = tmp; }
+    t0 = Math.max(t0, a); t1 = Math.min(t1, b);
+  }
+  return t1 > t0 ? [t0, t1] : null;
+}
+
+function curtain(offset, nbeams, angleDeg) {
+  var rs = bundleR(offset, nbeams, imageRes);
+  var th = angleDeg * Math.PI / 180.0, c = Math.cos(th), sn = Math.sin(th);
+  var zb = -0.5, zt = nz - 0.5;
+  var xs = [], ys = [], zs = [];
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    var cl = clipRay(r, th, nc / 2.0, nr / 2.0);
+    if (!cl) continue;
+    var e = [];
+    for (var j = 0; j < 2; j++) {
+      var t = cl[j];
+      var x = r * c - t * sn, y = r * sn + t * c;
+      e.push([x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y]);
+    }
+    var segs = [[[e[0][0], e[0][1], zb], [e[1][0], e[1][1], zb]],
+                [[e[0][0], e[0][1], zt], [e[1][0], e[1][1], zt]],
+                [[e[0][0], e[0][1], zb], [e[0][0], e[0][1], zt]],
+                [[e[1][0], e[1][1], zb], [e[1][0], e[1][1], zt]]];
+    for (var k = 0; k < segs.length; k++) {
+      for (var m = 0; m < 2; m++) { xs.push(segs[k][m][0]); ys.push(segs[k][m][1]); zs.push(segs[k][m][2]); }
+      xs.push(null); ys.push(null); zs.push(null);   // JSON null == the NaN break Python emits
+    }
+  }
+  return { x: xs, y: ys, z: zs };
+}
+
+function findPreview(fig) {
+  for (var i = 0; i < fig.data.length; i++) {
+    if (fig.data[i].name === "beam_preview") return i;
+  }
+  return -1;
+}
+
+// ---- Live redraw: restyle ONLY the red trace, never the mesh --------------------------------
+function redrawBeams() {
+  if (!plotted || previewIdx < 0) return;
+  try {
+    var d = curtain(curOffset, curNbeams, curAngle);
+    Plotly.restyle(gd, { x: [d.x], y: [d.y], z: [d.z] }, [previewIdx]);
+  } catch (e) { fail("beam redraw", e); }
+}
+
+function setHeight() {
+  var h = document.body.scrollHeight;
+  if (h === lastHeight) return;
+  lastHeight = h;
+  Streamlit.setFrameHeight(h);
+}
+
+function readSliders() {
+  curAngle = parseFloat(angleEl.value);
+  curOffset = parseFloat(offsetEl.value);
+  curNbeams = parseInt(nbeamsEl.value, 10);
+}
+function updateLabels() {
+  angleVal.textContent = String(Math.round(curAngle));
+  offsetVal.textContent = (Math.round(curOffset * 10) / 10).toString();
+  nbeamsVal.textContent = curNbeams > 0 ? String(curNbeams) : "full fan";
+}
+function onInput() { readSliders(); updateLabels(); redrawBeams(); }
+function onRelease() {
+  readSliders();
+  Streamlit.setComponentValue({ angle: curAngle, offset: curOffset, nbeams: curNbeams });
+}
+function endDrag() {
+  dragging = false;
+  if (pendingArgs) { var a = pendingArgs; pendingArgs = null; onRender(a, true); }
+}
+[angleEl, offsetEl, nbeamsEl].forEach(function (el) {
+  el.addEventListener("pointerdown", function () { dragging = true; });
+  el.addEventListener("pointerup", endDrag);
+  el.addEventListener("pointercancel", endDrag);
+  el.addEventListener("input", onInput);
+  el.addEventListener("change", onRelease);
+});
+
+function applyRange(el, spec) {
+  if (!spec) return;
+  el.min = spec[0]; el.max = spec[1]; el.step = spec[2];
+}
+function setThumb(el, v) {
+  if (v == null) return;
+  if (parseFloat(el.value) !== parseFloat(v)) el.value = v;
+}
+
+function onRender(args, keepThumbs) {
+  if (!args) return;
+  if (dragging) { pendingArgs = args; return; }   // never reflow mid-drag
+  if (typeof Plotly === "undefined") { fail("startup", "plotly.min.js did not load"); return; }
+  imageRes = args.image_res != null ? args.image_res : imageRes;
+  nr = args.nr != null ? args.nr : nr;
+  nc = args.nc != null ? args.nc : nc;
+  nz = args.nz != null ? args.nz : nz;
+
+  if (!mounted) {
+    applyRange(angleEl, args.angle_range);
+    applyRange(offsetEl, args.offset_range);
+    applyRange(nbeamsEl, args.nbeams_range);
+    mounted = true;
+  }
+  // Same ownership contract as live_sim: follow the server, because other surfaces set these too.
+  if (!keepThumbs) {
+    setThumb(angleEl, args.angle);
+    setThumb(offsetEl, args.offset);
+    setThumb(nbeamsEl, args.nbeams);
+  }
+  readSliders(); updateLabels();
+
+  if (args.figure) {
+    try {
+      var fig = JSON.parse(args.figure);
+      previewIdx = findPreview(fig);
+      // react() diffs against what is already drawn and, with layout.uirevision pinned by Python,
+      // leaves the camera where the user put it. newPlot would reset the view on every rerun.
+      Plotly.react(gd, fig.data, fig.layout, { responsive: true, displaylogo: false });
+      plotted = true;
+      redrawBeams();   // the thumbs may be ahead of the figure Python just built
+    } catch (e) { fail("plot", e); return; }
+  }
+  setHeight();
+}
+
+window.addEventListener("message", function (event) {
+  if (!event.data || event.data.type !== "streamlit:render") return;
+  var t = event.data.theme;
+  if (t && t.textColor) document.body.style.color = t.textColor;
+  if (t && t.font) document.body.style.fontFamily = t.font;
+  onRender(event.data.args);
+});
+
+if (window.ResizeObserver) {
+  new ResizeObserver(function () {
+    if (plotted) { try { Plotly.Plots.resize(gd); } catch (e) {} }
+    setHeight();
+  }).observe(gd);
+}
+
+Streamlit.setComponentReady();
+setHeight();
+</script>
+</body>
+</html>

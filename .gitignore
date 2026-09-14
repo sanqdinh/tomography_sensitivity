@@ -221,3 +221,7 @@ __marimo__/
 # Local-only files (untracked from GitHub, kept on disk)
 CLAUDE.md
 SENDOE_VENDOR.md
+
+# plotly.min.js is copied out of the installed plotly package at runtime (app.py
+# _ensure_plotly_asset) so the 4.8 MB minified bundle never enters git history.
+volume_sim_component/plotly.min.js

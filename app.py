@@ -30,6 +30,7 @@ import base64
 import html as _html
 import io
 import os
+import shutil
 import time
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -38,6 +39,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import plotly
 import plotly.graph_objects as go
 
 from tomography_uq import UQParams, BeamStep, run_simple_uq
@@ -83,6 +85,43 @@ IMAGE_RES = 30
 # the committed (blue) bundle. See live_sim_component/index.html.
 _LIVE_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_sim_component")
 _live_sim = components.declare_component("live_sim", path=_LIVE_SIM_DIR)
+
+# The 3D Volume view is the same idea one level up: the plot itself lives in the component, so the
+# beam curtains can be restyled in the browser while a slider is dragged. st.plotly_chart cannot do
+# that -- it is server-rendered, so the earliest it can react is the release.
+_VOLUME_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_sim_component")
+
+
+def _ensure_plotly_asset() -> bool:
+    """Put plotly.min.js next to the volume component's index.html; ``True`` if it is there.
+
+    Copied out of the installed ``plotly`` package rather than pulled from a CDN or vendored into
+    git: it is then guaranteed to be the build that produced the figure JSON we hand it, the app
+    keeps working with no outbound network, and a 4.8 MB minified blob stays out of the history.
+    The copy is idempotent and keyed on size, so a plotly upgrade refreshes it.
+
+    Setting ``TOMO_VOLUME_SERVER_RENDER=1`` makes this report failure, which drops the Volume view
+    back to ``st.plotly_chart`` plus ordinary sliders — the behaviour before the component existed.
+    It is an escape hatch: the component is the only part of this app that cannot be exercised
+    without a browser, so there is a way back that does not need a code change.
+    """
+    if os.environ.get("TOMO_VOLUME_SERVER_RENDER"):
+        return False
+    dst = os.path.join(_VOLUME_SIM_DIR, "plotly.min.js")
+    src = os.path.join(os.path.dirname(plotly.__file__), "package_data", "plotly.min.js")
+    try:
+        if not os.path.exists(src):
+            return False
+        if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+            return True
+        shutil.copyfile(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+_PLOTLY_ASSET_OK = _ensure_plotly_asset()
+_volume_sim = components.declare_component("volume_sim", path=_VOLUME_SIM_DIR)
 
 
 def _live_background_uri(img, vmin, vmax) -> str:
@@ -366,6 +405,10 @@ def _cb_sync_live_sim_3d():
     _sync_live_sim("live3d", "live_sim_3d")
 
 
+def _cb_sync_volume_sim():
+    _sync_live_sim("live3d", "volume_sim")
+
+
 def _cb_step():
     """Take a measurement: append the current slider bundle as a row in the sequence table."""
     s = st.session_state
@@ -640,7 +683,7 @@ def _clip_ray_to_box(r, theta, half_w, half_h):
     return (t0, t1) if t1 > t0 else None
 
 
-def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color):
+def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None):
     """Each ray of a bundle as a dashed rectangle spanning the whole z-stack.
 
     2.5D means one measurement fires the same bundle through *every* slice, so inside the volume
@@ -681,14 +724,19 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color):
             ys.append(np.nan)
             zs.append(np.nan)
     if not xs:
-        return None
+        # An empty trace, not None, when the caller named it: the browser restyles this trace BY
+        # NAME while dragging, so it has to exist even at an offset where every ray is clamped off
+        # the grid -- otherwise the curtains would vanish for good at the ends of that slider.
+        if name is None:
+            return None
+        xs = ys = zs = []
     # dash="dot", not "dash". plotly maps line.dash through a fixed pattern table and then
     # SCALES it by the line width (plotly.min.js: DASHES.dash = [4, 1], each entry multiplied by
     # line.width * pixelRatio), so "dash" at width 2 is 8px on / 2px off -- an 80% duty cycle that
     # reads as a solid line. DASHES.dot = [1, 1] is the only even one, giving the broken look the
     # 2D overlay gets from stroke-dasharray "5 4".
     return go.Scatter3d(
-        x=xs, y=ys, z=zs, mode="lines",
+        x=xs, y=ys, z=zs, mode="lines", name=name,
         line=dict(color=color, width=2, dash="dot"),
         hoverinfo="skip", showlegend=False,
     )
@@ -771,6 +819,9 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
 
     fig.update_layout(
         title=title, height=620, margin=dict(l=0, r=0, t=40, b=0),
+        # Pinned so the component's Plotly.react() keeps the camera across reruns; without it every
+        # rerun would snap the view back to the default angle.
+        uirevision="volume",
         scene=dict(
             xaxis_title="x (col)", yaxis_title="y (row)", zaxis_title="z (slice)",
             xaxis=dict(range=[-1, nc]), yaxis=dict(range=[-1, nr]), zaxis=dict(range=[-1, nz]),
@@ -931,34 +982,52 @@ def _render_3d_tab():
                 s["live3d_band"], vol0, s["live3d_isomin"], s["live3d_isomax"])
             # Beam curtains. Plotly is server-rendered, so unlike the Slice overlay these only
             # refresh when a slider is RELEASED -- never mid-drag.
+            nz = vol0.shape[2]
             beams = []
             if s["live3d_showbeams"]:
-                nz = vol0.shape[2]
                 if n_meas:           # blue: the last measurement taken, as in the Slice view
                     _a, _o, _n = seq3d[-1]
                     _tr = _beam_curtain_trace(_bundle_r_values(_o, _n, IMAGE_RES), _a,
-                                              IMAGE_RES, IMAGE_RES, nz, "#1f77ff")
+                                              IMAGE_RES, IMAGE_RES, nz, "#1f77ff",
+                                              name="beam_committed")
                     if _tr is not None:
                         beams.append(_tr)
-                _tr = _beam_curtain_trace(                    # red: the live preview
+                # Red: the live preview. Python still builds it, so the plot is correct the moment
+                # it loads and stays correct if the browser-side redraw never runs; the component
+                # only restyles THIS trace (found by name) while a slider is dragged.
+                beams.append(_beam_curtain_trace(
                     _bundle_r_values(s["live3d_offset"], s["live3d_nbeams"], IMAGE_RES),
-                    s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b")
-                if _tr is not None:
-                    beams.append(_tr)
-            st.plotly_chart(
-                _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
-                               title, cmap_name, fixed_cmax,
-                               s["live3d_cutaxis"], s["live3d_cut"], beams=beams),
-                use_container_width=True,
-            )
-            # The same three values the Slice view's component owns, mirrored here so the bundle
-            # can be aimed without leaving the volume. Separate keys folded back into the canonical
-            # ones by _cb3d_sync_beam -- one widget key cannot appear in two tabs. Their own full
-            # width row: squeezed into a column beside the view controls the labels barely fit.
-            st.markdown("**Aim the next measurement**")
-            _bundle_sliders_3d("_vol", slots=st.columns(3))
-            st.caption("The same bundle as under the Slice picture — where the red preview is "
-                       "live, rather than redrawn on release as it is here.")
+                    s["live3d_angle"], IMAGE_RES, IMAGE_RES, nz, "#ff2b2b",
+                    name="beam_preview"))
+            fig3d = _volume_figure(data, s["live3d_opacity"], band_lo, band_hi,
+                                   title, cmap_name, fixed_cmax,
+                                   s["live3d_cutaxis"], s["live3d_cut"], beams=beams)
+            if _PLOTLY_ASSET_OK:
+                _volume_sim(
+                    figure=fig3d.to_json(),
+                    image_res=IMAGE_RES, nr=IMAGE_RES, nc=IMAGE_RES, nz=nz,
+                    angle=float(s["live3d_angle"]),
+                    offset=float(s["live3d_offset"]),
+                    nbeams=int(s["live3d_nbeams"]),
+                    angle_range=[0, 360, 1],
+                    offset_range=[-float(IMAGE_RES) / 2, float(IMAGE_RES) / 2, 0.5],
+                    nbeams_range=[0, IMAGE_RES, 1],
+                    default={
+                        "angle": float(s["live3d_angle"]),
+                        "offset": float(s["live3d_offset"]),
+                        "nbeams": int(s["live3d_nbeams"]),
+                    },
+                    key="volume_sim",
+                    on_change=_cb_sync_volume_sim,
+                )
+            else:
+                # No plotly.min.js to hand the component: fall back to the server-rendered chart
+                # with its own sliders, which works but only redraws on release.
+                st.plotly_chart(fig3d, use_container_width=True)
+                st.warning("Live beam preview is off: plotly.min.js was not found in the "
+                           "installed plotly package, so the plot is rendered server-side.")
+                st.markdown("**Aim the next measurement**")
+                _bundle_sliders_3d("_vol", slots=st.columns(3))
             vc1, vc2, vc3, vc4 = st.columns(4)
             with vc1:
                 st.radio("Show", ("Degraded", "Original", "Dose removed"),
