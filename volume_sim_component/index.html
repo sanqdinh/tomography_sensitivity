@@ -74,6 +74,7 @@ var offsetVal = document.getElementById("offsetVal");
 var nbeamsVal = document.getElementById("nbeamsVal");
 
 var imageRes = 30, nr = 30, nc = 30, nz = 16;
+var theme = null;
 var curAngle = 45, curOffset = 0, curNbeams = 30;
 var dragging = false, pendingArgs = null, mounted = false, plotted = false;
 var previewIdx = -1;               // index of the red trace, found by name (the mesh may be absent)
@@ -140,6 +141,40 @@ function curtain(offset, nbeams, angleDeg) {
     }
   }
   return { x: xs, y: ys, z: zs };
+}
+
+// st.plotly_chart hands the figure to Streamlit's own React wrapper, which applies the app theme
+// to it in the browser (theme="streamlit" is its default). Plotly.react does not, so without this
+// the plot reverts to plotly's stock template -- white paper and light-grey 3D axis panes, which
+// is wrong under a dark app theme and merely inconsistent under a light one. Streamlit ships the
+// active theme with every render message, so reapply it here. Every field is optional: an older
+// host, or one that sends no theme, simply leaves plotly's defaults alone.
+function applyTheme(fig) {
+  if (!theme || !fig.layout) return fig;
+  var L = fig.layout;
+  // Transparent rather than theme.backgroundColor, so the plot sits on the real page background
+  // and needs no update if the host repaints behind it.
+  L.paper_bgcolor = "rgba(0,0,0,0)";
+  L.plot_bgcolor = "rgba(0,0,0,0)";
+  L.font = L.font || {};
+  if (theme.textColor) L.font.color = theme.textColor;
+  if (theme.font) L.font.family = theme.font;
+  if (L.scene) {
+    // gl3d panes and gridlines have no theme-derived colour to borrow, so derive them from the
+    // luminance flag Streamlit computes for us.
+    var dark = theme.base === "dark";
+    var grid = dark ? "rgba(255,255,255,0.16)" : "rgba(0,0,0,0.13)";
+    var zero = dark ? "rgba(255,255,255,0.34)" : "rgba(0,0,0,0.28)";
+    ["xaxis", "yaxis", "zaxis"].forEach(function (k) {
+      var ax = L.scene[k] || (L.scene[k] = {});
+      ax.showbackground = true;
+      if (theme.secondaryBackgroundColor) ax.backgroundcolor = theme.secondaryBackgroundColor;
+      ax.gridcolor = grid;
+      ax.zerolinecolor = zero;
+      if (theme.textColor) ax.color = theme.textColor;   // ticks and axis title follow this
+    });
+  }
+  return fig;
 }
 
 function findPreview(fig) {
@@ -226,7 +261,7 @@ function onRender(args, keepThumbs) {
 
   if (args.figure) {
     try {
-      var fig = JSON.parse(args.figure);
+      var fig = applyTheme(JSON.parse(args.figure));
       previewIdx = findPreview(fig);
       // react() diffs against what is already drawn and, with layout.uirevision pinned by Python,
       // leaves the camera where the user put it. newPlot would reset the view on every rerun.
@@ -240,9 +275,9 @@ function onRender(args, keepThumbs) {
 
 window.addEventListener("message", function (event) {
   if (!event.data || event.data.type !== "streamlit:render") return;
-  var t = event.data.theme;
-  if (t && t.textColor) document.body.style.color = t.textColor;
-  if (t && t.font) document.body.style.fontFamily = t.font;
+  if (event.data.theme) theme = event.data.theme;   // read by applyTheme() during onRender
+  if (theme && theme.textColor) document.body.style.color = theme.textColor;
+  if (theme && theme.font) document.body.style.fontFamily = theme.font;
   onRender(event.data.args);
 });
 
