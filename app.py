@@ -62,6 +62,12 @@ from dose_response import (
     degradation_dose_response as _degradation_dose_response,
 )
 from tomography_3d import shepp_logan_3d, simulate_3d, detector_grid
+from degrade_v2 import (
+    V2Params,
+    radius_of_gyration,
+    scale_to_optical_depth,
+    simulate as simulate_v2_seq,
+)
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -469,6 +475,19 @@ for _k, _v in {
     "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
     "live3d_showbeams": True,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+# 2D model v2 keeps its own namespace too. Its grid is NOT IMAGE_RES: the model is meaningless
+# on a coarse grid (numerical diffusion eats the moving interface), so it starts at 64.
+if "beam_table_v2" not in st.session_state:
+    st.session_state["beam_table_v2"] = _empty_beam_table()
+for _k, _v in {
+    "v2_angle": 45.0, "v2_offset": 0.0, "v2_nbeams": 0, "v2_res": 64,
+    "v2_view": "Attenuation f", "v2_showbeams": True,
+    "v2_depth": 1.1, "v2_I0": 1.0, "v2_c_q": 0.032, "v2_Q_c": 1.0,
+    "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_gamma_esc": 0.0,
+    "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -1242,14 +1261,243 @@ def _render_3d_tab():
         st.caption("Slice z=%d mean: %.4f" % (k, float(vol[:, :, k].mean())))
 
 
-# --- two modes, two tabs --------------------------------------------------------------
-tab_2d, tab_3d = st.tabs(["2D dose-response + reconstruction", "3D degradation"])
+# --- 2D model v2 tab (revised damage model: dose is a state, mass moves) ----------------
+# Own session_state namespace (v2_*, beam_table_v2) so it cannot clobber the other two tabs.
+# The measurement-table schema is identical, so _empty_beam_table / _table_to_seq are reused
+# as-is, exactly as the 3D tab reuses them.
+
+# The manuscript is explicit that coarse grids make this model meaningless: at 10x10 numerical
+# diffusion smears the moving interface across the whole sample within a step or two. So this
+# tab does NOT use IMAGE_RES (30) -- it carries its own, finer grid.
+_V2_RESOLUTIONS = (64, 96, 128)
+
+_V2_VIEWS = ("Attenuation f", "Accumulated dose Q", "Change (f - theta)")
+
+
+def _cb_v2_step():
+    """Take a v2 measurement: append the current bundle to the v2 sequence table."""
+    s = st.session_state
+    new_row = pd.DataFrame(
+        [{
+            "angle_deg": float(s["v2_angle"]),
+            "offset": float(s["v2_offset"]),
+            "n_beams": int(s["v2_nbeams"]),
+        }]
+    )
+    s["beam_table_v2"] = pd.concat([s["beam_table_v2"], new_row], ignore_index=True)
+
+
+def _cb_v2_reset():
+    """Clear the v2 sequence -- back to the undamaged sample at zero dose."""
+    st.session_state["beam_table_v2"] = _empty_beam_table()
+
+
+def _cb_sync_live_sim_v2():
+    """Fold the component's reported bundle back into the canonical ``v2_*`` values."""
+    _sync_live_sim("v2", "live_sim_v2")
+
+
+@st.cache_data(show_spinner=False)
+def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_q: float,
+                 Q_c: float, omega_inf: float, c_cp: float, gamma_esc: float, eps_up: float,
+                 E0: float, nu: float, clamp_bottom: bool):
+    """``(theta, f, Q, summary)`` for the sequence -- a pure function of the table + parameters.
+
+    Cached like ``_simulate_3d``, so panning the view, switching what is plotted and re-reading
+    the table are all cache hits; only taking a measurement or moving a parameter recomputes.
+    The stiffness factorisation, the expensive part, therefore happens once per distinct setting.
+
+    ``summary`` is plain floats rather than the ``StepInfo`` dataclasses so nothing exotic goes
+    through the cache.
+    """
+    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
+    p = V2Params(I0=float(I0), c_q=float(c_q), Q_c=float(Q_c), omega_inf=float(omega_inf),
+                 c_cp=float(c_cp), gamma_esc=float(gamma_esc), eps_up=float(eps_up),
+                 E0=float(E0), nu=float(nu), clamp_bottom=bool(clamp_bottom))
+    f, Q, infos = simulate_v2_seq(theta, seq, p, int(image_res))
+    rg0, rg1 = radius_of_gyration(theta), radius_of_gyration(f)
+    summary = {
+        "courant": max((i.courant for i in infos), default=0.0),
+        "mass0": float(theta.sum()),
+        "mass1": float(f.sum()),
+        "escaped": sum((i.escaped for i in infos), 0.0),
+        "rg0": rg0,
+        "rg1": rg1,
+        "rg_pct": (100.0 * (rg1 - rg0) / rg0) if rg0 > 0 else float("nan"),
+        "q_max": float(Q.max()),
+        "f_min": float(f.min()),
+        "dw_max": max((i.dw_max for i in infos), default=0.0),
+    }
+    return theta, f, Q, summary
+
+
+def _render_2d_v2_tab():
+    """The revised damage model: dose is a state, and mass moves instead of vanishing."""
+    s = st.session_state
+    st.caption(
+        "**Revised damage model (v2).** The 2D tab's model is a pure local sink -- "
+        "`f <- f*exp(-aI - bI^2)` -- so mass vanishes where it stands and the sample fades but "
+        "never changes shape. Here dose accumulation is split from the dose response and a mass "
+        "balance is added, so mass *moves*: converting material to void is a stress-free "
+        "contraction, linear elasticity relieves it, and the resulting displacement transports "
+        "attenuation between pixels. The sample can shrink. Forward simulation only -- no "
+        "reconstruction, no solver."
+    )
+    left, mid, right = st.columns([3, 2, 2])
+
+    res = int(s["v2_res"])
+    seq = _table_to_seq(s["beam_table_v2"])
+    n_meas = len(seq)
+
+    theta, f, Q, summary = _simulate_v2(
+        seq, res, float(s["v2_depth"]), float(s["v2_I0"]), float(s["v2_c_q"]),
+        float(s["v2_Q_c"]), float(s["v2_omega_inf"]), float(s["v2_c_cp"]),
+        float(s["v2_gamma_esc"]), float(s["v2_eps_up"]), float(s["v2_E0"]),
+        float(s["v2_nu"]), bool(s["v2_clamp"]),
+    )
+
+    view = s["v2_view"]
+    if view == _V2_VIEWS[1]:
+        panel, vlo, vhi = Q, 0.0, max(float(Q.max()), 1e-12)
+    elif view == _V2_VIEWS[2]:
+        panel = f - theta
+        span = max(float(np.abs(panel).max()), 1e-12)
+        vlo, vhi = -span, span
+    else:
+        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
+
+    with left:
+        # Third instance of the 2D tab's live component. It owns the Angle / Offset / # Beams
+        # sliders and redraws the red preview client-side while the thumb is held; st.slider only
+        # reports on release, so a Python-owned slider cannot track a drag at all.
+        _live_sim(
+            image_uri=_live_background_uri(panel, vlo, vhi),
+            image_res=res,
+            k=n_meas,
+            angle=float(s["v2_angle"]),
+            offset=float(s["v2_offset"]),
+            nbeams=int(s["v2_nbeams"]),
+            committed=(list(seq[-1]) if n_meas else None),
+            beams_visible=bool(s["v2_showbeams"]),
+            angle_range=[0, 360, 1],
+            offset_range=[-float(res) / 2, float(res) / 2, 0.5],
+            nbeams_range=[0, res, 1],
+            title="%s   \u00b7   %d measurement%s applied   \u00b7   %d\u00d7%d"
+                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
+            hint='<b style="color:#ff2b2b">Red</b> dashes = next-measurement preview '
+                 '(these sliders); <b style="color:#1f77ff">blue</b> dashes = the last '
+                 'measurement taken. # Beams at 0 means the full fan.',
+            legend="%.3g" % vhi,
+            default={
+                "angle": float(s["v2_angle"]),
+                "offset": float(s["v2_offset"]),
+                "nbeams": int(s["v2_nbeams"]),
+            },
+            key="live_sim_v2",
+            on_change=_cb_sync_live_sim_v2,
+        )
+        # Return value deliberately unused: it is the standing widget value and survives reruns,
+        # so writing it back each run would resurrect a stale bundle. _cb_sync_live_sim_v2 owns
+        # the sync and runs before the args above are rebuilt.
+        st.radio("View", _V2_VIEWS, key="v2_view", horizontal=True)
+
+    with mid:
+        act = st.columns(2)
+        act[0].button("\u2795 Take measurement", on_click=_cb_v2_step,
+                      use_container_width=True, key="v2_take")
+        act[1].button("Reset", on_click=_cb_v2_reset, use_container_width=True, key="v2_clear")
+        st.caption(
+            "Aiming at **%.0f\u00b0**, offset **%.1f**, **%s** \u2014 set these under the picture."
+            % (float(s["v2_angle"]), float(s["v2_offset"]),
+               "full fan" if int(s["v2_nbeams"]) == 0 else "%d beams" % int(s["v2_nbeams"]))
+        )
+        st.checkbox("Show beams", key="v2_showbeams")
+
+        with st.expander("Beam and dose", expanded=True):
+            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v2_I0",
+                      help="0 is the undamaged limit: the step map is exactly the identity.")
+            st.slider("c_q \u2014 fluence to dose", 0.0, 1.0, step=0.001, key="v2_c_q",
+                      format="%.3f")
+            st.slider("Q_c \u2014 characteristic dose", 0.05, 5.0, step=0.05, key="v2_Q_c")
+            st.slider("Peak optical depth \u03bcL", 0.1, 5.0, step=0.1, key="v2_depth",
+                      help="Rescales the phantom so its largest line integral is this. f is a "
+                           "reciprocal length, so its size is meaningless without the pixel "
+                           "pitch: left unscaled this phantom sits at 34, where the beam is "
+                           "fully absorbed in two pixels. Real tomography is of order 1.")
+
+        with st.expander("Response and mass", expanded=True):
+            st.slider("\u03c9\u221e \u2014 residual attenuation floor", 0.0, 0.99, step=0.01,
+                      key="v2_omega_inf",
+                      help="The interior can never fall below this: the response saturates.")
+            st.slider("c_cp \u2014 void closure", 0.0, 1.0, step=0.05, key="v2_c_cp",
+                      help="Fraction of created void the matrix closes. 1 fully compliant, "
+                           "0 a rigid skeleton in which no void ever closes and nothing moves.")
+            st.slider("\u03b3_esc \u2014 escaped fraction", 0.0, 1.0, step=0.05,
+                      key="v2_gamma_esc",
+                      help="Fraction of converted mass that leaves the specimen. At 0 the total "
+                           "attenuation is conserved exactly, whatever c_cp does.")
+
+        with st.expander("Mechanics and numerics", expanded=False):
+            st.slider("E \u2014 modulus", 0.1, 10.0, step=0.1, key="v2_E0",
+                      help="Very nearly a no-op on its own: the eigenstrain load scales with E "
+                           "too, so a uniform modulus cancels out of K u = B dw. The ersatz "
+                           "contrast between sample and background is what bites.")
+            st.slider("\u03bd \u2014 Poisson ratio", 0.0, 0.49, step=0.01, key="v2_nu")
+            st.select_slider("\u03b5_up \u2014 upwind smoothing", options=(0.0, 1e-8, 1e-6, 1e-4),
+                             key="v2_eps_up", format_func=lambda v: "%g" % v,
+                             help="Keeps the step map differentiable for the sensitivity "
+                                  "extraction. It is not free: at v = 0 the split still passes "
+                                  "0.5*eps*(f_L - f_R) across every face, so I0 = 0 stops being "
+                                  "exactly the identity. 0 is exact and fine for this tab.")
+            st.checkbox("Clamp one edge (substrate)", key="v2_clamp",
+                        help="Off is a free-floating body with three dofs pinned only to kill "
+                             "the rigid modes.")
+            st.select_slider("Grid", options=_V2_RESOLUTIONS, key="v2_res",
+                             help="Below 64 numerical diffusion smears the moving interface "
+                                  "across the sample within a step or two.")
+
+    with right:
+        st.markdown("**Measurement sequence**")
+        st.dataframe(s["beam_table_v2"], use_container_width=True, height=200)
+        if summary["courant"] > 0.5:
+            st.warning(
+                "Courant %.2f \u2014 above ~0.5 the upwind transport starts to lose positivity. "
+                "Lower c_cp, or coarsen the grid." % summary["courant"]
+            )
+        m = st.columns(2)
+        m[0].metric("Total attenuation", "%.4g" % summary["mass1"],
+                    delta="%+.3g" % (summary["mass1"] - summary["mass0"]),
+                    help="Conserved exactly at gamma_esc = 0, whatever c_cp does.")
+        m[1].metric("Radius of gyration", "%.4g" % summary["rg1"],
+                    delta="%+.2f%%" % summary["rg_pct"],
+                    help="The compactness diagnostic: this is what shrinkage means. With "
+                         "no escape it is exactly unchanged at c_cp = 0, since nothing "
+                         "moves; escape shifts it a little on its own, by removing mass "
+                         "preferentially where the dose is highest.")
+        m2 = st.columns(2)
+        m2[0].metric("Max dose Q", "%.4g" % summary["q_max"])
+        m2[1].metric("Courant", "%.2f" % summary["courant"])
+        st.caption(
+            "Escaped mass **%.4g** \u00b7 largest converted fraction in one step **%.3g** "
+            "\u00b7 min f **%.3g**" % (summary["escaped"], summary["dw_max"], summary["f_min"])
+        )
+        if float(s["v2_I0"]) == 0.0:
+            st.info("I0 = 0: the step map is the identity, so the sample stays undamaged.")
+
+
+# --- three modes, three tabs ----------------------------------------------------------
+tab_2d, tab_3d, tab_v2 = st.tabs(
+    ["2D dose-response + reconstruction", "3D degradation", "2D model v2"]
+)
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
 # path that can call st.stop() (empty geometry), which would otherwise leave this tab blank
 # on that rerun. Display order is set by the st.tabs() list above, not by population order.
 with tab_3d:
     _render_3d_tab()
+
+with tab_v2:
+    _render_2d_v2_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----
