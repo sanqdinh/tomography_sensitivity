@@ -44,8 +44,9 @@
     </div>
     <div class="hint"><b style="color:#ff2b2b">Red</b> curtains = next-measurement preview, redrawn
       in the browser as you drag, projected onto the floor below the head so they never sit in
-      front of it; <b style="color:#1f77ff">blue</b> = the last measurement taken, drawn as full
-      curtains through the stack.
+      front of it. The arrowheads point the way the beam travels — 0° and 180° draw the same line
+      but deposit dose in opposite order. <b style="color:#1f77ff">Blue</b> = the last measurement
+      taken, drawn as full curtains through the stack.
       Drag the plot to rotate · scroll to zoom · double-click to reset.</div>
   </div>
 
@@ -78,10 +79,12 @@ var nbeamsVal = document.getElementById("nbeamsVal");
 var imageRes = 30, nr = 30, nc = 30, nz = 16;
 // null = full curtains; a number = one line per ray at that height (app.py _BEAM_FLOOR_Z).
 var flatZ = null;
+var arrowLen = 1.8, arrowHalfW = 0.8;   // app.py _ARROW_LEN / _ARROW_HALF_W
 var theme = null;
 var curAngle = 45, curOffset = 0, curNbeams = 30;
 var dragging = false, pendingArgs = null, mounted = false, plotted = false;
-var previewIdx = -1;               // index of the red trace, found by name (the mesh may be absent)
+var previewIdx = -1, headIdx = -1;  // red shaft / arrowhead traces, found BY NAME: the mesh
+                                    // trace is absent whenever no voxel is in the chosen band
 var lastHeight = -1;
 
 function fail(where, e) {
@@ -186,9 +189,43 @@ function applyTheme(fig) {
   return fig;
 }
 
-function findPreview(fig) {
+// Arrowheads for the flat preview, pointing the way the beam travels -- mirror of app.py
+// _beam_arrowheads_trace. Direction is taken from the two scene endpoints, not recomputed from
+// the angle, so the flipped row axis cannot be got wrong twice.
+function arrowheads(offset, nbeams, angleDeg) {
+  var rs = bundleR(offset, nbeams, imageRes);
+  var th = angleDeg * Math.PI / 180.0, c = Math.cos(th), sn = Math.sin(th);
+  var xs = [], ys = [], zs = [];
+  if (flatZ === null || flatZ === undefined) return { x: xs, y: ys, z: zs };
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    var cl = clipRay(r, th, nc / 2.0, nr / 2.0);
+    if (!cl) continue;
+    var e = [];
+    for (var j = 0; j < 2; j++) {
+      var t = cl[j];
+      var x = r * c - t * sn, y = r * sn + t * c;
+      e.push([x + nc / 2.0 - 0.5, nr / 2.0 - 0.5 - y]);
+    }
+    var dx = e[1][0] - e[0][0], dy = e[1][1] - e[0][1];
+    var chord = Math.sqrt(dx * dx + dy * dy);
+    if (chord < 1e-9) continue;
+    var ux = dx / chord, uy = dy / chord;
+    var ln = Math.min(arrowLen, chord * 0.5);
+    var wd = arrowHalfW * (ln / arrowLen);
+    var bx = e[1][0] - ln * ux, by = e[1][1] - ln * uy;
+    var px = -uy, py = ux;
+    var pts = [[bx + wd * px, by + wd * py, flatZ], [e[1][0], e[1][1], flatZ],
+               [bx - wd * px, by - wd * py, flatZ]];
+    for (var k = 0; k < 3; k++) { xs.push(pts[k][0]); ys.push(pts[k][1]); zs.push(pts[k][2]); }
+    xs.push(null); ys.push(null); zs.push(null);
+  }
+  return { x: xs, y: ys, z: zs };
+}
+
+function traceIndex(fig, name) {
   for (var i = 0; i < fig.data.length; i++) {
-    if (fig.data[i].name === "beam_preview") return i;
+    if (fig.data[i].name === name) return i;
   }
   return -1;
 }
@@ -198,7 +235,14 @@ function redrawBeams() {
   if (!plotted || previewIdx < 0) return;
   try {
     var d = curtain(curOffset, curNbeams, curAngle);
-    Plotly.restyle(gd, { x: [d.x], y: [d.y], z: [d.z] }, [previewIdx]);
+    if (headIdx < 0) {
+      Plotly.restyle(gd, { x: [d.x], y: [d.y], z: [d.z] }, [previewIdx]);
+      return;
+    }
+    // Shaft and heads in ONE restyle: two calls would let the browser paint a frame with the
+    // head still at the previous angle.
+    var h = arrowheads(curOffset, curNbeams, curAngle);
+    Plotly.restyle(gd, { x: [d.x, h.x], y: [d.y, h.y], z: [d.z, h.z] }, [previewIdx, headIdx]);
   } catch (e) { fail("beam redraw", e); }
 }
 
@@ -256,6 +300,7 @@ function onRender(args, keepThumbs) {
   // Must match the flat_z Python used to build the trace, or the beams would jump to a different
   // shape the instant a slider is touched and jump back on release.
   flatZ = args.flat_z != null ? args.flat_z : null;
+  if (args.arrow) { arrowLen = args.arrow[0]; arrowHalfW = args.arrow[1]; }
 
   if (!mounted) {
     applyRange(angleEl, args.angle_range);
@@ -274,7 +319,8 @@ function onRender(args, keepThumbs) {
   if (args.figure) {
     try {
       var fig = applyTheme(JSON.parse(args.figure));
-      previewIdx = findPreview(fig);
+      previewIdx = traceIndex(fig, "beam_preview");
+      headIdx = traceIndex(fig, "beam_preview_head");
       // react() diffs against what is already drawn and, with layout.uirevision pinned by Python,
       // leaves the camera where the user put it. newPlot would reset the view on every rerun.
       Plotly.react(gd, fig.data, fig.layout, { responsive: true, displaylogo: false });
