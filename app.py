@@ -719,8 +719,17 @@ def _render_3d_tab():
                 data, cmap_name = vol, "Gray"
                 title = "Degraded volume · %d measurement%s" % (
                     n_meas, "" if n_meas == 1 else "s")
-            # Clamp any value carried over from before the floor existed, before the widget
-            # that owns this key is created -- Streamlit rejects a value below min_value.
+            # While a preset is active the two Custom sliders are not rendered, so their stored
+            # values are pinned to the full range here. Switching to Custom must always open on
+            # 0.001-1.00, never on a window left over from an earlier visit. Streamlit does
+            # garbage-collect un-rendered widget keys, which would have the same effect, but not
+            # dependably across a hot reload -- that keeps session_state while the code changes,
+            # which is exactly how a stale value survives.
+            if s["live3d_band"] != "Custom":
+                s["live3d_isomin"] = _ISOMIN_FLOOR
+                s["live3d_isomax"] = 1.0
+            # Clamp a value carried over from before the floor existed, before the widget that
+            # owns this key is created -- Streamlit rejects a value below min_value.
             s["live3d_isomin"] = max(_ISOMIN_FLOOR, float(s["live3d_isomin"]))
             band_lo, band_hi = _band_window(
                 s["live3d_band"], vol0, s["live3d_isomin"], s["live3d_isomax"])
