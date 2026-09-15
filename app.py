@@ -714,11 +714,17 @@ def _sinogram_figure(panel, image_res, xlabel, xticklabels, title):
     samples only a few of the ``image_res`` detector slots, so most of the panel is genuinely
     unmeasured — those cells are drawn in a flat off-colour via ``set_bad`` so they read as
     "no data" rather than as a real low line-integral.
+
+    The ramp is greyscale, matching the slice and volume views. That forces the ``set_bad``
+    colour to be **chromatic**: greyscale already spans every lightness from black to white, so
+    no shade of grey can mean "unmeasured" -- the old dark blue-grey would now read as a genuine
+    low reading, which is the one thing this mask exists to prevent. Hue is the only channel
+    left, hence the muted blue.
     """
     r_grid = detector_grid(image_res)
     fig, ax = plt.subplots(figsize=(7.6, 6.2))
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad("#2b2b3a")  # unmeasured — deliberately not part of the viridis ramp
+    cmap = plt.get_cmap("gray").copy()
+    cmap.set_bad("#3d5a80")  # unmeasured -- chromatic, so no grey level can be mistaken for it
     finite = np.isfinite(panel)
     im = ax.imshow(
         np.ma.masked_invalid(panel), cmap=cmap, aspect="auto", interpolation="nearest",
