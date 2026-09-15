@@ -491,7 +491,7 @@ for _k, _v in {
     "v2_angle": 45.0, "v2_offset": 0.0, "v2_nbeams": 0, "v2_res": 64,
     "v2_view": "Attenuation f", "v2_showbeams": True,
     "v2_depth": 1.1, "v2_I0": 1.0, "v2_c_q": 0.032, "v2_Q_c": 1.0,
-    "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_gamma_esc": 0.0,
+    "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_a": 0.05, "v2_b": 0.0,
     "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -1692,7 +1692,7 @@ def _cb_sync_live_sim_v2():
 
 @st.cache_data(show_spinner=False)
 def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_q: float,
-                 Q_c: float, omega_inf: float, c_cp: float, gamma_esc: float, eps_up: float,
+                 Q_c: float, omega_inf: float, c_cp: float, a: float, b: float, eps_up: float,
                  E0: float, nu: float, clamp_bottom: bool):
     """``(theta, f, Q, summary)`` for the sequence -- a pure function of the table + parameters.
 
@@ -1705,7 +1705,7 @@ def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     """
     theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
     p = V2Params(I0=float(I0), c_q=float(c_q), Q_c=float(Q_c), omega_inf=float(omega_inf),
-                 c_cp=float(c_cp), gamma_esc=float(gamma_esc), eps_up=float(eps_up),
+                 c_cp=float(c_cp), a=float(a), b=float(b), eps_up=float(eps_up),
                  E0=float(E0), nu=float(nu), clamp_bottom=bool(clamp_bottom))
     f, Q, infos = simulate_v2_seq(theta, seq, p, int(image_res))
     rg0, rg1 = radius_of_gyration(theta), radius_of_gyration(f)
@@ -1713,7 +1713,7 @@ def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
         "courant": max((i.courant for i in infos), default=0.0),
         "mass0": float(theta.sum()),
         "mass1": float(f.sum()),
-        "escaped": sum((i.escaped for i in infos), 0.0),
+        "lost": sum((i.lost for i in infos), 0.0),
         "rg0": rg0,
         "rg1": rg1,
         "rg_pct": (100.0 * (rg1 - rg0) / rg0) if rg0 > 0 else float("nan"),
@@ -1745,7 +1745,7 @@ def _render_2d_v2_tab():
     theta, f, Q, summary = _simulate_v2(
         seq, res, float(s["v2_depth"]), float(s["v2_I0"]), float(s["v2_c_q"]),
         float(s["v2_Q_c"]), float(s["v2_omega_inf"]), float(s["v2_c_cp"]),
-        float(s["v2_gamma_esc"]), float(s["v2_eps_up"]), float(s["v2_E0"]),
+        float(s["v2_a"]), float(s["v2_b"]), float(s["v2_eps_up"]), float(s["v2_E0"]),
         float(s["v2_nu"]), bool(s["v2_clamp"]),
     )
 
@@ -1825,10 +1825,19 @@ def _render_2d_v2_tab():
             st.slider("c_cp \u2014 void closure", 0.0, 1.0, step=0.05, key="v2_c_cp",
                       help="Fraction of created void the matrix closes. 1 fully compliant, "
                            "0 a rigid skeleton in which no void ever closes and nothing moves.")
-            st.slider("\u03b3_esc \u2014 escaped fraction", 0.0, 1.0, step=0.05,
-                      key="v2_gamma_esc",
-                      help="Fraction of converted mass that leaves the specimen. At 0 the total "
-                           "attenuation is conserved exactly, whatever c_cp does.")
+            st.slider("a \u2014 decay coefficient", 0.0, 0.5, step=0.005, format="%.3f",
+                      key="v2_a",
+                      help="Mass leaves by the v1 multiplicative decay exp(-a*I - b*I^2), "
+                           "driven by the instantaneous local fluence rather than accumulated "
+                           "dose, and with no floor. a = b = 0 conserves mass exactly, whatever "
+                           "c_cp does \u2014 that is the switch, and it replaced the old escape "
+                           "sink.")
+            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
+                      key="v2_b",
+                      help="Keep at 0. A non-zero b makes one large exposure damage more than "
+                           "many small ones of the same total fluence, which runs against the "
+                           "dose fractionation theorem; at realistic I0 it contributes well "
+                           "under a percent of the exponent anyway.")
 
         with st.expander("Mechanics and numerics", expanded=False):
             st.slider("E \u2014 modulus", 0.1, 10.0, step=0.1, key="v2_E0",
@@ -1860,19 +1869,21 @@ def _render_2d_v2_tab():
         m = st.columns(2)
         m[0].metric("Total attenuation", "%.4g" % summary["mass1"],
                     delta="%+.3g" % (summary["mass1"] - summary["mass0"]),
-                    help="Conserved exactly at gamma_esc = 0, whatever c_cp does.")
+                    help="Conserved exactly at a = b = 0, whatever c_cp does: transport moves mass, it never removes it. Above that, the whole change is the decay.")
         m[1].metric("Radius of gyration", "%.4g" % summary["rg1"],
                     delta="%+.2f%%" % summary["rg_pct"],
-                    help="The compactness diagnostic: this is what shrinkage means. With "
-                         "no escape it is exactly unchanged at c_cp = 0, since nothing "
-                         "moves; escape shifts it a little on its own, by removing mass "
-                         "preferentially where the dose is highest.")
+                    help="The compactness diagnostic: this is what shrinkage means. Read it "
+                         "against the c_cp = 0 baseline, NOT against zero: the decay fades the "
+                         "field non-uniformly because I_p varies, so c_cp = 0 already registers "
+                         "a small contraction with nothing having moved. Only at a = b = 0 is "
+                         "c_cp = 0 exactly flat.")
         m2 = st.columns(2)
         m2[0].metric("Max dose Q", "%.4g" % summary["q_max"])
         m2[1].metric("Courant", "%.2f" % summary["courant"])
         st.caption(
-            "Escaped mass **%.4g** \u00b7 largest converted fraction in one step **%.3g** "
-            "\u00b7 min f **%.3g**" % (summary["escaped"], summary["dw_max"], summary["f_min"])
+            "Mass lost to decay **%.4g** \u00b7 largest converted fraction in one step "
+            "**%.3g** \u00b7 min f **%.3g**"
+            % (summary["lost"], summary["dw_max"], summary["f_min"])
         )
         if float(s["v2_I0"]) == 0.0:
             st.info("I0 = 0: the step map is the identity, so the sample stays undamaged.")

@@ -1,33 +1,42 @@
-"""v2 damage model: dose accumulation, saturating response, and elastic mass transport.
+"""v2 damage model: dose accumulation, saturating response, decay, and elastic transport.
 
-Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``bfd6cba`` of the
+Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``f91887f`` of the
 manuscript repo. Where v1 (:func:`dose_response.degradation_dose_response`) is a pure *local
-sink* -- ``f <- f*exp(-a*I - b*I^2)``, so mass vanishes in place and the sample fades but never
-changes shape -- v2 separates dose *accumulation* from the dose *response* and adds a mass
-balance. Mass therefore moves instead of disappearing, and the sample can shrink.
+sink* -- mass vanishes in place, so the sample fades but never changes shape -- v2 separates the
+dose *accumulation* from the dose *response*, and adds a mass balance so mass also **moves**.
 
-State is ``(f, Q)``, the parameter is ``theta = f_0``, and ``Q_0 = 0``. One step, given the ray
-bundle of one measurement, is the following in order:
+State is ``(f, Q)``, parameter ``theta = f_0``, ``Q_0 = 0``. Twelve steps; the ones this module
+implements are 1-10, the dynamics map ``M``:
 
-1. photon balance  ``I_p = I0 * exp(-sum_{m<i} f_pm * delta_pm)``   Beer-Lambert over the
-   *upstream* pixels of the ray; identical to v1 and to eq:xd_local_intensity.
-2. dose            ``Q <- Q + c_q * I_p * delta_p``, in grays.  Note there is deliberately **no
-   local f factor**: specific absorbed energy is ``mu_en*Psi/rho`` and ``mu_en/rho`` does not
-   depend on density, so the factor cancels.  (``E = f*Q`` is the energy density that rides
-   algebraically alongside, reported but not fed back.)
-3. response        ``omega(Q) = omega_inf + (1-omega_inf)*exp(-Q/Q_c)`` -- saturating, with a
-   floor, which is what v1's unbounded geometric decay lacked.
-4. converted       ``dw = 1 - omega(Q_new)/omega(Q_old)``.  **Relative, not absolute.**  This is
-   what makes the collapse in `check_invariants` exact; coding it as the absolute difference
-   ``omega(Q_old) - omega(Q_new)`` is the bug that test exists to catch.
-5. eigenstrain     ``eps* = -0.5*c_cp*dw*I``, so ``tr eps* = -c_cp*dw``.
-6. equilibrium     ``K u = B dw`` -- linear elasticity, Q1 elements.  ``K`` depends only on the
-   grid, ``E``, ``nu`` and the BCs, so it is assembled and factored **once** per simulation.
-7. mass balance    ``f <- f - sum_q F_{p->q} - gamma_esc*dw*f`` with antisymmetric face fluxes
-   ``F_{p->q} = -F_{q->p}`` built from the face-normal component of ``u``.
+1.  photon balance   ``I_p = I0*exp(-sum_{m<i} f_pm*delta_pm)``, Beer-Lambert over the *upstream*
+    pixels of each ray; contributions of simultaneous rays add.  eq:xd_local_intensity.
+2.  dose             ``Q <- Q + c_q*I_p*delta_p``, in grays.  Deliberately **no local f factor**:
+    specific absorbed energy is ``mu_en*Psi/rho`` and ``mu_en/rho`` is density independent, so it
+    cancels.  eq:xd_dose_state.
+3.  energy density   ``E = f*Q``, algebraic and read-only; no later step uses it.
+4.  response         ``omega(Q) = omega_inf + (1-omega_inf)*exp(-Q/Q_c)``, saturating with a
+    floor -- what v1's unbounded geometric decay lacked.  eq:xd_response.
+5.  converted        ``dw = 1 - omega(Q_new)/omega(Q_old)``.  **Relative, not absolute.**
+6.  eigenstrain      ``eps* = -0.5*c_cp*dw*I``, trace ``-c_cp*dw``.  The only point damage enters
+    the mechanics.
+7.  equilibrium      ``K dx = B dw`` -- plane-stress linear elasticity, Q1 elements.  ``K`` depends
+    only on grid, ``E``, ``nu`` and the BCs, so it is assembled and factored **once**.
+8.  face fluxes      ``F_{p->q} = (1/Delta)*(v_+ ftilde_p - v_- ftilde_q)`` with the smoothed
+    upwind split, antisymmetric by construction.
+9.  mass loss        ``ftilde = f*exp(-a*I_p - b*I_p^2)`` -- the v1 multiplicative decay, driven
+    by instantaneous local fluence rather than accumulated dose, with no floor.  eq:xd_decay.
+10. mass balance     ``f_next = ftilde - sum_q F[ftilde]``.  eq:xd_mass_transport.
 
-Pure numpy + scipy over the repo's own cached ray geometry -- no Streamlit, no Pyomo, no solver,
-so this module is importable from a headless script or a test.
+Steps 11 (observation) and 12 (constraints) belong to the estimation NLP, not here.
+
+**Step 9 runs before step 10, and the order is not cosmetic.** Decaying first and transporting
+the decayed field keeps the flux sum antisymmetric, so it telescopes and contributes exactly
+nothing to the total: the whole change in mass is the decay. Transporting first and decaying
+after multiplies the two ends of each face by different factors, the sum stops telescoping, and
+the flux starts leaking mass of its own. :func:`check_invariants` asserts this rather than
+trusting it -- measured here at ~1e-16 for the correct order against ~1e-4 for the reverse.
+
+Pure numpy + scipy over the repo's own cached ray geometry -- no Streamlit, no Pyomo, no solver.
 
 Discretisation choices that differ from the manuscript's scratch reference, and why
 ------------------------------------------------------------------------------------
@@ -36,35 +45,28 @@ Discretisation choices that differ from the manuscript's scratch reference, and 
   eq:xd_local_intensity is stated over the pixels a ray crosses with chord lengths from
   ``C_v^loc``, which is exactly what :func:`dose_response.ray_geometry` returns -- so this module
   reuses it and the (angle, offset, n_beams) bundles the rest of the app is built around.
-* **Pixel units.**  ``dx = 1`` here, matching the app's geometry (``x_range = [-w/2, w/2]`` over
-  ``w`` pixels), where the reference used a ``[-1,1]`` box.  Every dimensionless diagnostic
-  (Courant number, mass drift, the collapse error) is unaffected; only the natural size of
-  ``c_q`` changes, since ``delta_p ~ 1`` here against ``~0.03`` there.
-* **The box constraints of eq:xd_budget are NOT applied in the dynamics.**  They are inequality
-  constraints of the estimation NLP, not a projection inside the forward map, and clipping here
-  would destroy both exact mass conservation and the exact collapse.  Violations are reported in
+* **Pixel units.**  ``dx = 1`` here, matching the app's geometry, where the reference used a
+  ``[-1,1]`` box.  Every dimensionless diagnostic (Courant number, mass drift, the collapse
+  error) is unaffected; only the natural size of ``c_q`` changes.  The ``1/Delta`` of
+  eq:xd_flux -- which the written spec currently omits, though the reference implementation has
+  it -- is applied here when assembling the divergence, so it is already correct.
+* **The box constraints of eq:xd_box / eq:xd_budget are NOT applied in the dynamics.**  They are
+  inequality constraints of the estimation NLP, and step 12 says explicitly that clipping inside
+  the forward map destroys both the conservation and the collapse.  Violations are reported in
   :class:`StepInfo` instead.
-* **``eps_up`` is the constant of eq:xd_mass_transport, and defaults to zero here.**  The spec
-  now carries a relative form, ``eps_up = eps_rel * ||u_k||`` over a smooth grid norm, adopted
-  after the resting-diffusion defect below was found: scaling the smoothing to the flow makes it
-  vanish wherever the flow does, which restores both invariants to zero while keeping
-  ``phi >= |v|`` and so keeping positivity.  (A split vanishing at rest by construction, such as
-  ``phi(v) = v^2/sqrt(v^2+eps^2)``, does *not* work -- any smooth ``phi`` with ``phi(0) = 0`` dips
-  below ``|v|`` near the origin, which is locally anti-diffusive and costs positivity.)  This
-  module implements the constant form and defaults it to ``0``, which is exact and is what the
-  spec endorses for a simulator doing no sensitivity extraction.  Wire the relative form in if
-  this model is ever handed to the estimation NLP; ``eps_rel = 1e-3`` was sufficient upstream.
+* **``eps_up`` is the constant of eq:xd_upwind, and defaults to zero here.**  The spec's relative
+  form ``eps_up = eps_rel*||dx_k||`` vanishes with the flow; the constant form does not, and at
+  ``v = 0`` still passes ``0.5*eps*(f_p - f_q)`` across every face.  Zero is exact and is what the
+  spec endorses for a simulator doing no sensitivity extraction.
 
 Tuning note
 -----------
-``c_cp`` has to serve two behaviours that want opposite values, and they fight.  Shrinkage wants
-it large; a beam channel that does not refill wants it small.  Measured upstream: repeated
-thin-beam exposure in the optically thin regime drills a clean through-channel floored at
-``omega_inf`` (20% of original) at ``c_cp = 0``, while at ``c_cp = 0.8`` the same channel only
-reaches 56% and grows a densified rim at ~1.07 of the original value, because the contracting
-channel pulls its neighbours inward.  Seeing the two trade off is the model behaving correctly.
-A damage-dependent modulus is the only remaining route by which stiffness could separate them,
-since a uniform ``E`` cancels out of ``K u = B dw`` entirely.
+``c_cp`` serves two behaviours that want opposite values: shrinkage wants it large, a beam channel
+that does not refill wants it small.  Measured upstream, against a channel floor of 0.20: a
+constant ``c_cp`` gives 0.57 and a modulus that follows density gives 0.56, but a **dose-dependent**
+``c_cp = c0*omega(Q)`` gives 0.35.  ``c_cp`` enters the load only, so nothing cancels it -- unlike
+``E``, which cancels out of ``K dx = B dw`` almost exactly (1 against 1000 moves the displacement
+by 9e-15).  The dose-dependent form is not part of section 3.2 and is not implemented here.
 """
 
 from dataclasses import dataclass
@@ -85,8 +87,12 @@ class V2Params:
     Q_c: float = 1.0         # characteristic dose of the response
     omega_inf: float = 0.2   # residual attenuation fraction, in [0, 1)
     c_cp: float = 0.3        # fraction of created void the matrix closes: 1 compliant, 0 rigid
-    gamma_esc: float = 0.0   # fraction of converted mass that leaves the specimen, in [0, 1]
-    eps_up: float = 1e-6     # upwind smoothing; keeps the step map C-infinity (see below)
+    # Mass loss, eq:xd_decay. Replaces the old gamma_esc sink: mass now leaves by the v1
+    # multiplicative decay, driven by instantaneous fluence. a = b = 0 is the switch that
+    # conserves mass exactly. b is kept at 0 -- see (M1) in the note on fractionation.
+    a: float = 0.05
+    b: float = 0.0
+    eps_up: float = 0.0      # upwind smoothing; 0 is exact (see the module docstring)
     E0: float = 1.0          # modulus of the undamaged matrix
     nu: float = 0.3          # Poisson ratio
     e_min_ratio: float = 1e-6  # ersatz soft background, E_min/E_0, so the free surface needs no
@@ -94,9 +100,10 @@ class V2Params:
     clamp_bottom: bool = False  # substrate (clamp one edge) vs free-floating body
     dx: float = 1.0          # pixel pitch, in the app's geometry units
 
-    def f_of_omega(self, Q):
-        """Convenience: the photometric collapse field ``omega(Q)``."""
-        return omega(Q, self.omega_inf, self.Q_c)
+    def decay_factor(self, I_p):
+        """eq:xd_decay's multiplier ``exp(-a*I - b*I^2)``.  Strictly positive, so f stays > 0."""
+        I_p = np.asarray(I_p, dtype=float)
+        return np.exp(-self.a * I_p - self.b * I_p ** 2)
 
 
 @dataclass
@@ -105,7 +112,7 @@ class StepInfo:
 
     courant: float        # max|u|/dx -- keep under ~0.5 or the upwind transport loses positivity
     mass: float           # sum_p f_p, the total attenuation M_k
-    escaped: float        # sum_p gamma_esc*dw*f, the mass that left this step
+    lost: float           # mass removed by eq:xd_decay this step; transport moves, never removes
     dw_max: float         # largest converted fraction anywhere
     q_max: float          # largest accumulated dose anywhere
     f_min: float          # most negative f, if the transport overshot
@@ -118,7 +125,12 @@ def omega(Q, omega_inf: float, Q_c: float):
 
 
 def accumulate_dose(f, r_values, angle_rad: float, I0: float, c_q: float):
-    """``c_q * I_p * delta_p`` summed over the rays of one bundle -- steps 1 and 2.
+    """Steps 1 and 2: returns ``(dQ, I_sum)`` for one bundle.
+
+    ``dQ`` is ``c_q * I_p * delta_p`` summed over the bundle's rays -- the dose increment of
+    eq:xd_dose_state. ``I_sum`` is ``I_p`` itself, likewise summed, which eq:xd_decay needs
+    separately: the decay is driven by the *instantaneous local fluence*, not by the dose, and
+    the two differ by the chord length and ``c_q``.
 
     ``I_p`` is the Beer-Lambert intensity delivered to pixel ``p`` by one ray, with the sum in
     the exponent running strictly over the *upstream* pixels, so the entry pixel sees the full
@@ -132,6 +144,7 @@ def accumulate_dose(f, r_values, angle_rad: float, I0: float, c_q: float):
     """
     f = np.asarray(f, dtype=float)
     dQ = np.zeros_like(f)
+    I_sum = np.zeros_like(f)
     for r in r_values:
         g = ray_geometry(float(r), float(angle_rad), f.shape[0], f.shape[1])
         if g is None:
@@ -148,9 +161,10 @@ def accumulate_dose(f, r_values, angle_rad: float, I0: float, c_q: float):
             seg = i if forward else i - 1            # chord within pixel i, in travel order
             if 0 <= seg < n_seg:
                 dQ[rows[i], cols[i]] += c_q * local * seg_lengths[seg]
+                I_sum[rows[i], cols[i]] += local
                 shielding += radon[seg]
             # the last pixel in travel order has no chord in the vendored convention -> no dose
-    return dQ
+    return dQ, I_sum
 
 
 def _q1_matrices(h: float, nu: float):
@@ -289,24 +303,43 @@ def upwind_flux_divergence(f, vx, vy, dx: float, eps_up: float):
     return div
 
 
-def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver):
-    """One measurement step: ``(f, Q) -> (f_next, Q_next, info)``.  Steps 1-7 in order."""
+def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver,
+         _decay_last: bool = False):
+    """One measurement step: ``(f, Q) -> (f_next, Q_next, info)``.  Steps 1-10 in order.
+
+    ``_decay_last`` swaps steps 9 and 10 -- transport the undecayed field and decay afterwards.
+    It exists only so :func:`check_invariants` can *demonstrate* that the order matters instead
+    of asserting it on faith; it is the wrong order and nothing else should use it.
+    """
     f = np.asarray(f, dtype=float)
     Q = np.asarray(Q, dtype=float)
 
-    Q_next = Q + accumulate_dose(f, r_values, angle_rad, p.I0, p.c_q)
-    # Relative converted fraction -- see the module docstring; absolute is the classic bug.
+    dQ, I_p = accumulate_dose(f, r_values, angle_rad, p.I0, p.c_q)   # 1, 2
+    Q_next = Q + dQ
+    # 5. Relative converted fraction -- see the module docstring; absolute is the classic bug.
     dw = 1.0 - omega(Q_next, p.omega_inf, p.Q_c) / omega(Q, p.omega_inf, p.Q_c)
+    dx_x, dx_y = solver.solve(dw, p.c_cp)                            # 6, 7 -> displacement
 
-    ux, uy = solver.solve(dw, p.c_cp)
-    div = upwind_flux_divergence(f, ux, uy, p.dx, p.eps_up)
-    escaped = p.gamma_esc * dw * f
-    f_next = f - div - escaped
+    if _decay_last:                                                  # deliberately wrong order
+        moved = f - upwind_flux_divergence(f, dx_x, dx_y, p.dx, p.eps_up)
+        f_next = moved * p.decay_factor(I_p)
+        # Deliberately measured the same way as the correct branch: the decay loss of the field
+        # as it stood at the START of the step. Transport telescopes in either order, so a loss
+        # measured *after* it would come out trivially consistent and hide the defect. What the
+        # wrong order actually breaks is that the decay now weights a redistributed field, so
+        # this expected loss no longer matches the real change -- and that gap is the leak.
+        lost = float(f.sum() - (f * p.decay_factor(I_p)).sum())
+    else:
+        # 9 then 10: decaying first keeps the flux sum antisymmetric, so it telescopes and
+        # moves no mass at all; the entire change in the total is the decay.
+        f_tilde = f * p.decay_factor(I_p)
+        lost = float(f.sum() - f_tilde.sum())
+        f_next = f_tilde - upwind_flux_divergence(f_tilde, dx_x, dx_y, p.dx, p.eps_up)
 
     info = StepInfo(
-        courant=float(np.sqrt(ux ** 2 + uy ** 2).max() / p.dx),
+        courant=float(np.sqrt(dx_x ** 2 + dx_y ** 2).max() / p.dx),
         mass=float(f_next.sum()),
-        escaped=float(escaped.sum()),
+        lost=lost,
         dw_max=float(dw.max()),
         q_max=float(Q_next.max()),
         f_min=float(f_next.min()),
@@ -315,7 +348,7 @@ def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver):
     return f_next, Q_next, info
 
 
-def simulate(theta, seq, p: V2Params, image_res: int):
+def simulate(theta, seq, p: V2Params, image_res: int, _decay_last: bool = False):
     """Run a measurement sequence from the undamaged field ``theta``.
 
     ``seq`` is the app's ``_table_to_seq`` output -- ``(angle_deg, offset, n_beams)`` triples.
@@ -329,7 +362,8 @@ def simulate(theta, seq, p: V2Params, image_res: int):
     infos = []
     for angle_deg, offset, n_beams in seq:
         r_values = bundle_r_values(float(offset), int(n_beams), int(image_res))
-        f, Q, info = step(f, Q, r_values, np.deg2rad(float(angle_deg)), p, solver)
+        f, Q, info = step(f, Q, r_values, np.deg2rad(float(angle_deg)), p, solver,
+                          _decay_last=_decay_last)
         infos.append(info)
     return f, Q, infos
 
@@ -394,39 +428,40 @@ def _demo_sequence(n_steps: int = 12):
 
 
 def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = True):
-    """Assert the three invariants of section 3.2.  Returns a dict of measured residuals.
+    """Assert the invariants of section 3.2.  Returns a dict of measured residuals.
 
-    (a) **Exact mass conservation.**  ``sum_p f_{k+1,p} = sum_p f_{k,p} - gamma_esc*sum_p
-        dw*f``, so at ``gamma_esc = 0`` the total attenuation is conserved to machine precision
-        for *any* ``c_cp``.  This one is robust to ``eps_up``: it follows from the face fluxes
-        being antisymmetric, nothing else.  If it fails, they are not.
+    (a) **Exact mass conservation, and the step ordering that makes it hold.**  ``a = b = 0``
+        removes eq:xd_decay, and then the total attenuation is conserved to machine precision
+        for *any* ``c_cp`` -- transport moves mass, it never removes it.  With ``a > 0`` the
+        whole change in the total must be the decay, because decaying *before* transporting
+        leaves the flux sum antisymmetric so it telescopes to nothing.  Swapping steps 9 and 10
+        multiplies the two ends of each face by different factors, the sum stops telescoping,
+        and the flux leaks mass of its own.  The wrong order is *run* here rather than reasoned
+        about, so the claim is demonstrated.
 
-    (b) **Exact collapse to the photometric model.**  At ``c_cp = 0, gamma_esc = 1`` the step map
-        must give ``f_k = theta*omega(Q_k)``, because the relative ``dw`` telescopes and
-        ``omega(0) = 1`` (bitwise, which is checked).  This is the sharpest regression test
-        available: coding ``dw`` as the absolute difference instead fails it by orders of
-        magnitude, which the check below demonstrates rather than asserts.
+    (b) **Exact collapse to the model already in use.**  At ``c_cp = 0`` the eigenstrain
+        vanishes, so ``Delta x = 0``, every flux with it, and the dynamics reduce to
+        eq:xd_decay composed over ``K`` steps -- which is eq:xd_implicit_accumulation,
+        ``f_K = f_0*exp(-a*sum_k I_k - b*sum_k I_k^2)``.
 
-        "Exact" is a statement about real arithmetic.  In floating point the step map forms the
-        telescoping product one ratio at a time while the right-hand side evaluates
-        ``omega(Q_K)`` once, so the two agree only to roundoff -- measured here at well under
-        1 ulp per step (5.6e-17 at one step rising to 4.4e-16 at twenty-four).  A field whose
-        values are exactly representable, such as the binary disc of the manuscript's own check,
-        does come out bitwise identical; a Shepp-Logan phantom does not, and that is arithmetic
-        rather than a defect.  Hence a roundoff-scaled tolerance below, not ``== 0``.
+        This replaces the old check against ``theta*omega(Q)`` (eq:xd_reference_state).  That
+        collapse is **no longer reachable**: the mass-loss channel is the fluence-driven decay
+        and is no longer a function of ``omega``, so the old test would now fail against a
+        correct implementation.  It would return only if eq:xd_decay were replaced by a sink
+        proportional to ``dw``.
 
-    (c) **``I0 = 0`` gives ``M = id``.**  No dose, so no response, no eigenstrain, no transport.
+    (c) **``I0 = 0`` gives ``M = id``.**  No fluence, so no dose, no response, no eigenstrain,
+        no decay, no transport.
 
-    (b) and (c) are exact **only at** ``eps_up = 0``.  The smoothed split of eq:xd_mass_transport
-    gives ``v_+ = v_- = eps/2`` at ``v = 0``, so a motionless field still exchanges
-    ``0.5*eps*(f_L - f_R)`` across every face: an O(eps) diffusion that has nothing to do with
-    the physics.  Both are therefore checked exactly at ``eps_up = 0`` and reported, not
-    asserted, at the default ``eps_up``.
+    (b) and (c) are exact only at ``eps_up = 0``: the constant smoothing of eq:xd_upwind gives
+    ``v_+ = v_- = eps/2`` at ``v = 0``, so a motionless field still exchanges
+    ``0.5*eps*(f_p - f_q)`` across every face.  Both are checked at 0 and reported at 1e-6.
     """
     from skimage.data import shepp_logan_phantom
     from skimage.transform import resize
 
-    theta = resize(shepp_logan_phantom(), (image_res, image_res)).astype(float)
+    theta = scale_to_optical_depth(
+        resize(shepp_logan_phantom(), (image_res, image_res)).astype(float), 1.1, image_res)
     seq = _demo_sequence(n_steps)
     out = {}
 
@@ -434,68 +469,70 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
         if verbose:
             print(msg)
 
-    # (a) mass conservation, any c_cp, robust to eps_up ----------------------------------
-    say("(a) mass conservation")
-    worst_a = 0.0
+    # (a) conservation at a = b = 0, for any c_cp --------------------------------------
+    say("(a) mass conservation and step ordering")
+    worst = 0.0
     for c_cp in (0.0, 0.3, 0.8):
-        p = V2Params(c_cp=c_cp, gamma_esc=0.0)
+        p = V2Params(a=0.0, b=0.0, c_cp=c_cp)
         f, _, infos = simulate(theta, seq, p, image_res)
         drift = abs(f.sum() - theta.sum()) / theta.sum()
-        worst_a = max(worst_a, drift)
-        say("    c_cp=%.1f gamma=0.0   relative drift %.3e   Courant max %.3f"
-            % (c_cp, drift, max(i.courant for i in infos)))
-    # and with escape on, the loss must be exactly the reported escaped mass
-    p = V2Params(c_cp=0.3, gamma_esc=0.5)
-    f, _, infos = simulate(theta, seq, p, image_res)
-    resid = abs(f.sum() - (theta.sum() - sum(i.escaped for i in infos))) / theta.sum()
-    say("    c_cp=0.3 gamma=0.5   escape-accounted residual %.3e" % resid)
-    out["mass_drift"] = worst_a
-    out["escape_residual"] = resid
-    assert worst_a < 1e-13, "mass not conserved: face fluxes are not antisymmetric"
-    assert resid < 1e-13, "escaped mass does not account for the loss"
+        worst = max(worst, drift)
+        say("    a=b=0  c_cp=%.1f   relative drift %.3e   Courant %.3f   min f %+.2e"
+            % (c_cp, drift, max(i.courant for i in infos), min(i.f_min for i in infos)))
+    out["mass_drift"] = worst
+    assert worst < 1e-13, "mass not conserved at a=b=0: the face fluxes are not antisymmetric"
 
-    # (b) collapse to the photometric model ----------------------------------------------
-    say("(b) collapse to f = theta*omega(Q)  [c_cp=0, gamma_esc=1]")
+    # ... and with decay on, the entire change must be the decay -- which is what the
+    # ordering buys. Run the wrong order too, so the difference is measured, not asserted.
+    say("    with a=0.05, the whole change in the total must be eq:xd_decay:")
+    totals = {}
+    for label, wrong in (("decay then transport (correct)", False),
+                         ("transport then decay (wrong)  ", True)):
+        p = V2Params(a=0.05, b=0.0, c_cp=0.8)
+        f, _, infos = simulate(theta, seq, p, image_res, _decay_last=wrong)
+        resid = abs(f.sum() - (theta.sum() - sum(i.lost for i in infos))) / theta.sum()
+        totals[wrong] = f.sum()
+        out["order_wrong" if wrong else "order_right"] = resid
+        say("        %s  unexplained mass %.3e" % (label, resid))
+    out["order_total_gap"] = abs(totals[True] - totals[False]) / theta.sum()
+    say("        the two orderings' totals differ by %.3e  [1e-4 to 3e-4]"
+        % out["order_total_gap"])
+    assert out["order_right"] < 1e-13, "the correct order is leaking mass through the flux"
+    assert out["order_wrong"] > 1e-6, (
+        "swapping steps 9 and 10 left the mass budget exact -- the ordering is not implemented")
+    assert out["order_total_gap"] > 1e-6, "the two orderings are indistinguishable"
+
+    # (b) collapse to the composed v1 decay at c_cp = 0 ---------------------------------
+    say("(b) collapse to f_K = f_0*exp(-a*sum I - b*sum I^2)   [c_cp = 0]")
     for eps in (0.0, 1e-6):
-        p = V2Params(c_cp=0.0, gamma_esc=1.0, eps_up=eps)
-        f, Q, _ = simulate(theta, seq, p, image_res)
-        err = float(np.abs(f - theta * omega(Q, p.omega_inf, p.Q_c)).max())
-        say("    eps_up=%-7g  max|f - theta*omega(Q)| = %.3e" % (eps, err))
+        p = V2Params(a=0.05, b=0.01, c_cp=0.0, eps_up=eps)
+        solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
+        f_ref, Q_ref = theta.copy(), np.zeros_like(theta)
+        sum_I, sum_I2 = np.zeros_like(theta), np.zeros_like(theta)
+        for angle_deg, offset, n_beams in seq:
+            rs = bundle_r_values(float(offset), int(n_beams), image_res)
+            dQ, I_p = accumulate_dose(f_ref, rs, np.deg2rad(angle_deg), p.I0, p.c_q)
+            sum_I += I_p
+            sum_I2 += I_p ** 2
+            f_ref, Q_ref, _ = step(f_ref, Q_ref, rs, np.deg2rad(angle_deg), p, solver)
+        closed = theta * np.exp(-p.a * sum_I - p.b * sum_I2)
+        err = float(np.abs(f_ref - closed).max())
+        say("    eps_up=%-7g  max|f_K - closed form| = %.3e" % (eps, err))
         if eps == 0.0:
-            out["collapse_exact"] = err
-            # ~1 ulp per step of telescoping roundoff; 1e-12 leaves nine orders of headroom
-            # over that and still fails the absolute-dw bug by ten orders (measured below).
-            tol = 1e-12
-            assert err < tol, "collapse is not exact: is dw the relative fraction?"
+            out["collapse"] = err
+            assert err < 1e-12, "c_cp = 0 does not reduce to the composed decay"
         else:
             out["collapse_eps"] = err
 
-    # ... and show the test has teeth: the absolute-difference dw is the bug it catches.
-    p = V2Params(c_cp=0.0, gamma_esc=1.0, eps_up=0.0)
-    solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
-    f_bug, Q_bug = theta.copy(), np.zeros_like(theta)
-    for angle_deg, offset, n_beams in seq:
-        rs = bundle_r_values(float(offset), int(n_beams), image_res)
-        Qn = Q_bug + accumulate_dose(f_bug, rs, np.deg2rad(angle_deg), p.I0, p.c_q)
-        dw_abs = omega(Q_bug, p.omega_inf, p.Q_c) - omega(Qn, p.omega_inf, p.Q_c)  # the bug
-        ux, uy = solver.solve(dw_abs, p.c_cp)
-        f_bug = (f_bug - upwind_flux_divergence(f_bug, ux, uy, p.dx, p.eps_up)
-                 - p.gamma_esc * dw_abs * f_bug)
-        Q_bug = Qn
-    err_bug = float(np.abs(f_bug - theta * omega(Q_bug, p.omega_inf, p.Q_c)).max())
-    say("    absolute-dw variant (the bug) gives %.3e -- the check discriminates" % err_bug)
-    out["collapse_bug"] = err_bug
-    assert err_bug > 1e-3, "the collapse check no longer discriminates against absolute dw"
-
-    # (c) I0 = 0 is the identity map -------------------------------------------------------
+    # (c) I0 = 0 is the identity ---------------------------------------------------------
     say("(c) I0 = 0 gives M = identity")
     for eps in (0.0, 1e-6):
-        p = V2Params(I0=0.0, c_cp=0.8, gamma_esc=1.0, eps_up=eps)
+        p = V2Params(I0=0.0, a=0.05, c_cp=0.8, eps_up=eps)
         f, Q, _ = simulate(theta, seq, p, image_res)
         err = float(np.abs(f - theta).max())
         say("    eps_up=%-7g  max|f - theta| = %.3e   max Q = %.3e" % (eps, err, Q.max()))
         if eps == 0.0:
-            out["identity_exact"] = err
+            out["identity"] = err
             assert err == 0.0, "I0 = 0 is not the identity"
         else:
             out["identity_eps"] = err
@@ -505,22 +542,24 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
 
 
 def check_reference_numbers(image_res: int = 64, verbose: bool = True):
-    """Reproduce the manuscript's measured numbers on its own test object.
+    """Reproduce the manuscript's re-measured numbers on its own test object.
 
-    The invariants above are structural -- they would pass for a model that was self-consistent
-    but wrong.  These are the quantitative cross-check against an independently written reference
-    (a plane-wave, bilinear-resampling script; this module is ray-based over the app's own cached
+    The invariants are structural -- they would pass for a model that was self-consistent and
+    still wrong.  These are the quantitative cross-check against an independently written
+    reference (plane-wave, bilinear resampling; this module is ray-based over the app's cached
     geometry), so agreement to a few percent is evidence the port is faithful rather than merely
-    coherent.  The residual is the discretisation difference and is expected.
+    coherent.  Run at the reference's settings: a = 0.05, b = 0, peak optical depth 1.1,
+    12 projections, nu = 0.3.
 
-    The disc is placed in the manuscript's regime first: diameter 1.1 in a ``[-1,1]`` box with
-    ``f = 1`` is a peak optical depth of 1.1, which in pixel units means rescaling ``f``.  Run at
-    the reference's own ``c_q``.
+    Note the shrinkage baseline moved.  Radius of gyration used to be flat whenever
+    ``c_cp = 0``, so it read as pure geometry; the fluence-driven decay fades the field
+    *non-uniformly*, because ``I_p`` varies, so ``c_cp = 0`` now registers a small contraction
+    with nothing having moved.  Rg mixes contraction with photometric reshaping and has to be
+    read against that baseline rather than against zero.
     """
     lin = np.linspace(-1.0, 1.0, image_res)
     X, Y = np.meshgrid(lin, lin)
-    r = np.hypot(X, Y)
-    disc = scale_to_optical_depth(np.where(r < 0.55, 1.0, 0.0), 1.1, image_res)
+    disc = scale_to_optical_depth(np.where(np.hypot(X, Y) < 0.55, 1.0, 0.0), 1.1, image_res)
     seq = _demo_sequence(12)
     out = {}
 
@@ -528,28 +567,39 @@ def check_reference_numbers(image_res: int = 64, verbose: bool = True):
         if verbose:
             print(msg)
 
-    say("reference numbers (manuscript value in brackets)")
-    for c_cp, want in ((0.0, 0.0), (0.3, -2.3), (0.8, -5.9)):
-        p = V2Params(c_q=0.0317, c_cp=c_cp, gamma_esc=0.0, eps_up=0.0)
+    def run(**kw):
+        p = V2Params(c_q=0.0317, **kw)
         f, _, infos = simulate(disc, seq, p, image_res)
         g0, g1 = radius_of_gyration(disc), radius_of_gyration(f)
-        got = 100.0 * (g1 - g0) / g0
-        out["rg_%.1f" % c_cp] = got
-        say("    c_cp=%.1f  radius of gyration %+7.3f%%  [%+.1f%%]   Courant %.2f"
-            % (c_cp, got, want, max(i.courant for i in infos)))
-        if c_cp == 0.0:
-            assert got == 0.0, "c_cp = 0 must not move anything at all"
-        else:
-            assert got < 0.0, "contraction must shrink the sample"
-            assert abs(got - want) / abs(want) < 0.15, "shrinkage is off the reference value"
+        return (100.0 * (g1 - g0) / g0, f.sum() / disc.sum(),
+                max(i.courant for i in infos), min(i.f_min for i in infos))
 
-    p = V2Params(c_q=0.0317, c_cp=0.0, eps_up=0.0)
-    _, Q, _ = simulate(disc, seq, p, image_res)
-    core, rim = (r < 0.20) & (disc > 0), (r > 0.45) & (disc > 0)
-    ratio = float(Q[rim].mean() / Q[core].mean())
-    out["rim_core"] = ratio
-    say("    rim/core accumulated dose %.3f  [1.22]" % ratio)
-    assert abs(ratio - 1.22) / 1.22 < 0.05, "rim-vs-core dose gradient is off the reference value"
+    say("reference numbers (manuscript value in brackets)")
+    base, _, _, _ = run(a=0.05, b=0.0, c_cp=0.0)
+    out["rg_baseline"] = base
+    say("    a=.05 c_cp=0.0  Rg %+7.3f%%  [-0.7%%]  <- photometric reshaping, nothing moved"
+        % base)
+    for c_cp, want in ((0.3, -3.4), (0.8, -7.6)):
+        rg, massf, cfl, fmin = run(a=0.05, b=0.0, c_cp=c_cp)
+        out["rg_%.1f" % c_cp] = rg
+        say("    a=.05 c_cp=%.1f  Rg %+7.3f%%  [%+.1f%%]   mass left %.1f%% [66%%]   Courant %.2f"
+            % (c_cp, rg, want, 100 * massf, cfl))
+        assert rg < base, "contraction must shrink the sample beyond the decay baseline"
+        assert abs(rg - want) / abs(want) < 0.25, "shrinkage is off the reference value"
+        assert fmin >= 0.0, "positivity lost"
+
+    rg, massf, cfl, fmin = run(a=0.0, b=0.0, c_cp=0.8)
+    out["rg_conserved"] = rg
+    say("    a=b=0 c_cp=0.8  Rg %+7.3f%%  [-6.5%%]   mass left %.6f [1.000000]   Courant %.2f"
+        % (rg, massf, cfl))
+    assert abs(rg - (-6.5)) / 6.5 < 0.25, "conserved-mass shrinkage is off the reference value"
+    assert abs(massf - 1.0) < 1e-13, "a=b=0 must conserve mass exactly"
+
+    rg, massf, _, _ = run(a=0.0, b=0.0, c_cp=0.0)
+    out["rg_null"] = rg
+    say("    a=b=0 c_cp=0.0  Rg %+7.3f%% and mass %.6f  [both unchanged to 5 dp]"
+        % (rg, massf))
+    assert abs(rg) < 1e-5 and abs(massf - 1.0) < 1e-5, "the null corner moved something"
 
     say("reference numbers reproduced")
     return out
