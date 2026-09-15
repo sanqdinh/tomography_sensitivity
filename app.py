@@ -460,6 +460,7 @@ st.session_state.setdefault("view_k", 0)  # number of measurements currently dis
 for _k, _v in {
     "live_angle": 45.0, "live_offset": 0.0, "live_nbeams": 30,
     "live_I0": 0.0, "live_alpha": 0.3, "live_beta": 0.01, "live_tv_weight": 0.1,
+    "live_preset_lo": 0.0, "live_preset_hi": 180.0, "live_preset_n": 9,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -493,6 +494,7 @@ for _k, _v in {
     "v2_depth": 1.1, "v2_I0": 1.0, "v2_c_q": 0.032, "v2_Q_c": 1.0,
     "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_a": 0.05, "v2_b": 0.0,
     "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
+    "v2_preset_lo": 0.0, "v2_preset_hi": 180.0, "v2_preset_n": 9,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -596,7 +598,7 @@ def _cb3d_step():
     s["beam_table_3d"] = pd.concat([s["beam_table_3d"], new_row], ignore_index=True)
 
 
-def _preset_angles_3d(lo: float, hi: float, n: int) -> list:
+def _preset_angles(lo: float, hi: float, n: int) -> list:
     """``n`` evenly spaced angles over **[lo, hi)** — the upper bound is exclusive.
 
     Exclusive because a projection at 180 deg traces the same line as one at 0 deg, so an
@@ -607,22 +609,54 @@ def _preset_angles_3d(lo: float, hi: float, n: int) -> list:
     return [float(a) for a in np.linspace(float(lo), float(hi), n, endpoint=False)]
 
 
-def _cb3d_preset(replace: bool):
-    """Fill the 3D sequence with an evenly spaced angular sweep.
+def _cb_preset(prefix: str, table_key: str, replace: bool):
+    """Fill a sequence table with an evenly spaced angular sweep.
 
-    Offset and beam count come from the current aim, so the preset sweeps *this* bundle through
-    the angles rather than inventing a geometry of its own.
+    Shared by all three tabs; ``prefix`` selects the namespace (``live``, ``live3d``, ``v2``).
+    Offset and beam count come from that tab's current aim, so the preset sweeps *this* bundle
+    through the angles rather than inventing a geometry of its own.
     """
     s = st.session_state
     rows = pd.DataFrame(
         [{"angle_deg": a,
-          "offset": float(s["live3d_offset"]),
-          "n_beams": int(s["live3d_nbeams"])}
-         for a in _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
-                                    s["live3d_preset_n"])]
+          "offset": float(s[prefix + "_offset"]),
+          "n_beams": int(s[prefix + "_nbeams"])}
+         for a in _preset_angles(s[prefix + "_preset_lo"], s[prefix + "_preset_hi"],
+                                 s[prefix + "_preset_n"])]
     )
-    s["beam_table_3d"] = (rows if replace
-                          else pd.concat([s["beam_table_3d"], rows], ignore_index=True))
+    s[table_key] = rows if replace else pd.concat([s[table_key], rows], ignore_index=True)
+
+
+def _preset_block(prefix: str, table_key: str, max_n: int = 60):
+    """The Measurement Preset controls.  One implementation, rendered in each tab.
+
+    Widget keys are namespaced by ``prefix`` because Streamlit renders every tab on every run,
+    so a key may appear only once across all of them.
+    """
+    s = st.session_state
+    st.markdown("**Measurement Preset**")
+    pc1, pc2 = st.columns(2)
+    pc1.number_input("From (deg)", step=5.0, format="%.1f", key=prefix + "_preset_lo")
+    pc2.number_input("To (deg, exclusive)", step=5.0, format="%.1f", key=prefix + "_preset_hi")
+    st.slider("Number of measurements", 1, max_n, step=1, key=prefix + "_preset_n")
+    pre = _preset_angles(s[prefix + "_preset_lo"], s[prefix + "_preset_hi"],
+                         s[prefix + "_preset_n"])
+    # Show the actual angles: the exclusive upper bound is the one thing about this that can
+    # surprise, and a preview settles it without anyone having to read a tooltip.
+    st.caption(
+        "\u2192 %s   \u00b7   at offset **%.1f**, **%s**"
+        % (", ".join("%g\u00b0" % a for a in pre[:8]) + (" \u2026" if len(pre) > 8 else ""),
+           float(s[prefix + "_offset"]),
+           "full fan" if int(s[prefix + "_nbeams"]) == 0
+           else "%d beams" % int(s[prefix + "_nbeams"]))
+    )
+    pb1, pb2 = st.columns(2)
+    pb1.button("Generate", key="btn_preset_gen_" + prefix, on_click=_cb_preset,
+               args=(prefix, table_key, True), use_container_width=True,
+               help="Replace the sequence with this sweep.")
+    pb2.button("Append", key="btn_preset_add_" + prefix, on_click=_cb_preset,
+               args=(prefix, table_key, False), use_container_width=True,
+               help="Add this sweep to the existing sequence.")
 
 
 def _cb3d_reset():
@@ -1622,27 +1656,7 @@ def _render_3d_tab():
         st.number_input("beta", min_value=0.0, step=0.005, format="%.3f", key="live3d_beta")
 
     with right3d:
-        st.markdown("**Measurement Preset**")
-        pc1, pc2 = st.columns(2)
-        pc1.number_input("From (deg)", step=5.0, format="%.1f", key="live3d_preset_lo")
-        pc2.number_input("To (deg, exclusive)", step=5.0, format="%.1f", key="live3d_preset_hi")
-        st.slider("Number of measurements", 1, 60, step=1, key="live3d_preset_n")
-        _pre = _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
-                                 s["live3d_preset_n"])
-        # Show the actual angles: the exclusive upper bound is the one thing about this that
-        # can surprise, and a preview settles it without anyone having to read a tooltip.
-        st.caption(
-            "\u2192 %s   \u00b7   at offset **%.1f**, **%s**"
-            % (", ".join("%g\u00b0" % a for a in _pre[:8]) + (" \u2026" if len(_pre) > 8 else ""),
-               float(s["live3d_offset"]),
-               "full fan" if int(s["live3d_nbeams"]) == 0
-               else "%d beams" % int(s["live3d_nbeams"]))
-        )
-        pb1, pb2 = st.columns(2)
-        pb1.button("Generate", key="btn3d_preset_gen", on_click=_cb3d_preset, args=(True,),
-                   use_container_width=True, help="Replace the sequence with this sweep.")
-        pb2.button("Append", key="btn3d_preset_add", on_click=_cb3d_preset, args=(False,),
-                   use_container_width=True, help="Add this sweep to the existing sequence.")
+        _preset_block("live3d", "beam_table_3d")
 
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
@@ -1866,6 +1880,8 @@ def _render_2d_v2_tab():
         #                           "across the sample within a step or two.")
 
     with right:
+        _preset_block("v2", "beam_table_v2")
+
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_v2"], use_container_width=True, height=200)
         if summary["courant"] > 0.5:
@@ -2006,6 +2022,8 @@ with tab_2d:
                    "the live I0/α/β; set I0=0 to reconstruct without modeling dose degradation.")
 
     with right:
+        _preset_block("live", "beam_table")
+
         st.subheader("Measurement sequence")
         st.caption(
             "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
