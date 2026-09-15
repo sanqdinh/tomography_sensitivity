@@ -1809,14 +1809,17 @@ def _render_2d_v2_tab():
         with st.expander("Beam and dose", expanded=True):
             st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v2_I0",
                       help="0 is the undamaged limit: the step map is exactly the identity.")
-            st.slider("c_q \u2014 fluence to dose", 0.0, 1.0, step=0.001, key="v2_c_q",
-                      format="%.3f")
-            st.slider("Q_c \u2014 characteristic dose", 0.05, 5.0, step=0.05, key="v2_Q_c")
-            st.slider("Peak optical depth \u03bcL", 0.1, 5.0, step=0.1, key="v2_depth",
-                      help="Rescales the phantom so its largest line integral is this. f is a "
-                           "reciprocal length, so its size is meaningless without the pixel "
-                           "pitch: left unscaled this phantom sits at 34, where the beam is "
-                           "fully absorbed in two pixels. Real tomography is of order 1.")
+            # Hidden on request -- these keep running at their seeded defaults (v2_c_q,
+            # v2_Q_c, v2_depth in the session-state block), so the model is unchanged; only
+            # the controls are gone. Uncomment to expose them again.
+            # st.slider("c_q \u2014 fluence to dose", 0.0, 1.0, step=0.001, key="v2_c_q",
+            #           format="%.3f")
+            # st.slider("Q_c \u2014 characteristic dose", 0.05, 5.0, step=0.05, key="v2_Q_c")
+            # st.slider("Peak optical depth \u03bcL", 0.1, 5.0, step=0.1, key="v2_depth",
+            #           help="Rescales the phantom so its largest line integral is this. f is a "
+            #                "reciprocal length, so its size is meaningless without the pixel "
+            #                "pitch: left unscaled this phantom sits at 34, where the beam is "
+            #                "fully absorbed in two pixels. Real tomography is of order 1.")
 
         with st.expander("Response and mass", expanded=True):
             st.slider("\u03c9\u221e \u2014 residual attenuation floor", 0.0, 0.99, step=0.01,
@@ -1839,24 +1842,28 @@ def _render_2d_v2_tab():
                            "dose fractionation theorem; at realistic I0 it contributes well "
                            "under a percent of the exponent anyway.")
 
-        with st.expander("Mechanics and numerics", expanded=False):
-            st.slider("E \u2014 modulus", 0.1, 10.0, step=0.1, key="v2_E0",
-                      help="Very nearly a no-op on its own: the eigenstrain load scales with E "
-                           "too, so a uniform modulus cancels out of K u = B dw. The ersatz "
-                           "contrast between sample and background is what bites.")
-            st.slider("\u03bd \u2014 Poisson ratio", 0.0, 0.49, step=0.01, key="v2_nu")
-            st.select_slider("\u03b5_up \u2014 upwind smoothing", options=(0.0, 1e-8, 1e-6, 1e-4),
-                             key="v2_eps_up", format_func=lambda v: "%g" % v,
-                             help="Keeps the step map differentiable for the sensitivity "
-                                  "extraction. It is not free: at v = 0 the split still passes "
-                                  "0.5*eps*(f_L - f_R) across every face, so I0 = 0 stops being "
-                                  "exactly the identity. 0 is exact and fine for this tab.")
-            st.checkbox("Clamp one edge (substrate)", key="v2_clamp",
-                        help="Off is a free-floating body with three dofs pinned only to kill "
-                             "the rigid modes.")
-            st.select_slider("Grid", options=_V2_RESOLUTIONS, key="v2_res",
-                             help="Below 64 numerical diffusion smears the moving interface "
-                                  "across the sample within a step or two.")
+        # "Mechanics and numerics" hidden on request. Every value below still comes from the
+        # session-state seeds (v2_E0, v2_nu, v2_eps_up, v2_clamp, v2_res), so the simulation is
+        # byte-identical to what it was with the box open at its defaults -- only the controls
+        # are gone. Uncomment the block to bring it back.
+        # with st.expander("Mechanics and numerics", expanded=False):
+        #     st.slider("E \u2014 modulus", 0.1, 10.0, step=0.1, key="v2_E0",
+        #               help="Very nearly a no-op on its own: the eigenstrain load scales with E "
+        #                    "too, so a uniform modulus cancels out of K dx = B dw. The ersatz "
+        #                    "contrast between sample and background is what bites.")
+        #     st.slider("\u03bd \u2014 Poisson ratio", 0.0, 0.49, step=0.01, key="v2_nu")
+        #     st.select_slider("\u03b5_up \u2014 upwind smoothing", options=(0.0, 1e-8, 1e-6, 1e-4),
+        #                      key="v2_eps_up", format_func=lambda v: "%g" % v,
+        #                      help="Keeps the step map differentiable for the sensitivity "
+        #                           "extraction. It is not free: at v = 0 the split still passes "
+        #                           "0.5*eps*(f_L - f_R) across every face, so I0 = 0 stops being "
+        #                           "exactly the identity. 0 is exact and fine for this tab.")
+        #     st.checkbox("Clamp one edge (substrate)", key="v2_clamp",
+        #                 help="Off is a free-floating body with three dofs pinned only to kill "
+        #                      "the rigid modes.")
+        #     st.select_slider("Grid", options=_V2_RESOLUTIONS, key="v2_res",
+        #                      help="Below 64 numerical diffusion smears the moving interface "
+        #                           "across the sample within a step or two.")
 
     with right:
         st.markdown("**Measurement sequence**")
