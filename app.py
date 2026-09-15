@@ -1467,36 +1467,14 @@ def _render_3d_tab():
                         st.warning("%d of %d slices failed and are left empty in the stack: z = %s"
                                    % (len(failed), len(res3["targets"]),
                                       ", ".join(str(x) for x in failed)))
-                    # Seed the mirrors from the canonical values immediately before building
-                    # the widgets -- the last moment Streamlit allows a widget key to be
-                    # written, and late enough to pick up a change made in the Volume view
-                    # earlier in this same run.
-                    s["live3d_opacity_rec"] = float(s["live3d_opacity"])
-                    s["live3d_cutaxis_rec"] = s["live3d_cutaxis"]
-                    s["live3d_cut_rec"] = float(s["live3d_cut"])
-
-                    qc1, qc2, qc3, qc4 = st.columns(4)
-                    with qc1:
-                        st.radio("Show", ("Reconstruction", "Variance"), key="live3d_recsrc",
-                                 help="'Variance' is the posterior log10 variance from k_aug "
-                                      "— where this geometry leaves the image uncertain.")
-                    with qc2:
-                        st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity_rec",
-                                  on_change=_cb3d_sync_recview,
-                                  help="Shared with the Volume view — both track one value.")
-                    with qc3:
-                        st.slider("Visible range (%)", 0, 100, step=1,
-                                  key="live3d_recband_pct",
-                                  help="Band to draw, as a percentage of the current view's own "
-                                       "range. Percent rather than absolute because the two "
-                                       "views are not in the same units: attenuation runs 0-1 "
-                                       "and log10 variance is negative throughout.")
-                    with qc4:
-                        st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis_rec",
-                                     on_change=_cb3d_sync_recview,
-                                     help="Shared with the Volume view.")
-                        st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut_rec",
-                                  on_change=_cb3d_sync_recview)
+                    # "Show" sits above the figure because it chooses what the figure IS.
+                    # Everything below the figure is *viewing* geometry and is deliberately
+                    # independent of it, so switching source back and forth to compare the
+                    # reconstruction against its variance leaves the view exactly as set.
+                    st.radio("Show", ("Reconstruction", "Variance"), key="live3d_recsrc",
+                             horizontal=True,
+                             help="'Variance' is the posterior log10 variance from k_aug — "
+                                  "where this geometry leaves the image uncertain.")
 
                     if s["live3d_recsrc"] == "Variance":
                         # -inf is a real output here: a pixel no ray constrains has exactly zero
@@ -1508,11 +1486,10 @@ def _render_3d_tab():
                         vdata = res3["recon"]
                         vcmap, vlabel = "Gray", "Stacked reconstruction"
                     _fin = vdata[np.isfinite(vdata)]
-                    if _fin.size:
-                        _lo, _hi = float(_fin.min()), float(_fin.max())
-                    else:
-                        _lo, _hi = 0.0, 1.0
+                    _lo, _hi = ((float(_fin.min()), float(_fin.max())) if _fin.size else (0.0, 1.0))
                     _span = (_hi - _lo) or 1.0
+                    # Read before the widgets are built: these hold the live values either way,
+                    # since Streamlit applies widget state before re-running the script body.
                     _p0, _p1 = s["live3d_recband_pct"]
                     _isomin = _lo + _span * float(_p0) / 100.0
                     _isomax = _lo + _span * float(_p1) / 100.0
@@ -1551,6 +1528,34 @@ def _render_3d_tab():
                             use_container_width=True, hide_index=True, height=180,
                         )
 
+                    # View controls, under the figure and spanning the full width rather than
+                    # squeezed into a quarter of it. Seeded from the canonical values
+                    # immediately before the widgets are built -- the last moment Streamlit
+                    # allows a widget key to be written, and late enough to pick up a change
+                    # made in the Volume view earlier in this same run.
+                    s["live3d_opacity_rec"] = float(s["live3d_opacity"])
+                    s["live3d_cutaxis_rec"] = s["live3d_cutaxis"]
+                    s["live3d_cut_rec"] = float(s["live3d_cut"])
+                    qc1, qc2, qc3, qc4 = st.columns(4)
+                    with qc1:
+                        st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity_rec",
+                                  on_change=_cb3d_sync_recview,
+                                  help="Shared with the Volume view — both track one value.")
+                    with qc2:
+                        st.slider("Visible range (%)", 0, 100, step=1,
+                                  key="live3d_recband_pct",
+                                  help="Band to draw, as a percentage of the current view's own "
+                                       "range. Percent rather than absolute because the two "
+                                       "views are not in the same units: attenuation runs 0-1 "
+                                       "and log10 variance is negative throughout, so one "
+                                       "setting keeps meaning the same thing across both.")
+                    with qc3:
+                        st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis_rec",
+                                     on_change=_cb3d_sync_recview,
+                                     help="Shared with the Volume view.")
+                    with qc4:
+                        st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut_rec",
+                                  on_change=_cb3d_sync_recview)
                     zsel = st.slider("Inspect slice z", 0, max(n_slices - 1, 0),
                                      key="live3d_recon_z")
                     st.pyplot(
