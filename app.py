@@ -435,15 +435,36 @@ def _cb_reset():
     st.session_state["view_k"] = 0
 
 
-def _cb_prev():
-    """Step the view back one measurement."""
-    st.session_state["view_k"] = max(0, int(st.session_state["view_k"]) - 1)
+def _cb_view_prev(view_key: str):
+    """Step a tab's view back one measurement."""
+    st.session_state[view_key] = max(0, int(st.session_state[view_key]) - 1)
 
 
-def _cb_next():
-    """Step the view forward one measurement (bounded by the sequence length)."""
-    n = len(st.session_state["beam_table"])
-    st.session_state["view_k"] = min(n, int(st.session_state["view_k"]) + 1)
+def _cb_view_next(view_key: str, n: int):
+    """Step a tab's view forward one measurement, bounded by the sequence length."""
+    st.session_state[view_key] = min(int(n), int(st.session_state[view_key]) + 1)
+
+
+def _nav_block(view_key: str, n: int) -> int:
+    """Previous / Next measurement scrubbing.  Returns the clamped view index.
+
+    **Display only.**  It changes how much of the sequence is applied to the picture, not the
+    sequence itself, and not what gets solved: the 2D tab's Reconstruct has always run the whole
+    table however far the view is scrubbed back, and the 3D Reconstruct sub-tab does the same.
+
+    Clamps on the way through, because the table may have shrunk since the index was set.
+    """
+    k = max(0, min(int(st.session_state[view_key]), n))
+    st.session_state[view_key] = k
+    nav = st.columns(2)
+    nav[0].button("\u2b05 Previous Measurement", key="btn_prev_" + view_key,
+                  on_click=_cb_view_prev, args=(view_key,),
+                  use_container_width=True, disabled=(k == 0))
+    nav[1].button("Next Measurement \u27a1", key="btn_next_" + view_key,
+                  on_click=_cb_view_next, args=(view_key, n),
+                  use_container_width=True, disabled=(k >= n))
+    st.caption("Viewing measurement **%d** of **%d**." % (k, n))
+    return k
 
 
 def _cb_toggle():
@@ -480,6 +501,7 @@ for _k, _v in {
     "live3d_tv_weight": 0.1, "live3d_recon_stride": 1, "live3d_recon_z": 0,
     # Measurement preset: evenly spaced angles over [lo, hi).
     "live3d_preset_lo": 0.0, "live3d_preset_hi": 180.0, "live3d_preset_n": 9,
+    "live3d_view_k": 0,
     "live3d_recsrc": "Reconstruction", "live3d_recband_pct": (2, 100),
 }.items():
     st.session_state.setdefault(_k, _v)
@@ -495,6 +517,7 @@ for _k, _v in {
     "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_a": 0.05, "v2_b": 0.0,
     "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
     "v2_preset_lo": 0.0, "v2_preset_hi": 180.0, "v2_preset_n": 9,
+    "v2_view_k": 0,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -596,6 +619,7 @@ def _cb3d_step():
         }]
     )
     s["beam_table_3d"] = pd.concat([s["beam_table_3d"], new_row], ignore_index=True)
+    s["live3d_view_k"] = len(s["beam_table_3d"])  # jump the view to the just-taken measurement
 
 
 def _preset_angles(lo: float, hi: float, n: int) -> list:
@@ -609,7 +633,7 @@ def _preset_angles(lo: float, hi: float, n: int) -> list:
     return [float(a) for a in np.linspace(float(lo), float(hi), n, endpoint=False)]
 
 
-def _cb_preset(prefix: str, table_key: str, replace: bool):
+def _cb_preset(prefix: str, table_key: str, view_key: str, replace: bool):
     """Fill a sequence table with an evenly spaced angular sweep.
 
     Shared by all three tabs; ``prefix`` selects the namespace (``live``, ``live3d``, ``v2``).
@@ -625,9 +649,12 @@ def _cb_preset(prefix: str, table_key: str, replace: bool):
                                  s[prefix + "_preset_n"])]
     )
     s[table_key] = rows if replace else pd.concat([s[table_key], rows], ignore_index=True)
+    # Show what was just generated. Without this the view stays wherever it was -- at 0 on a
+    # fresh tab -- and a freshly generated sweep would render as an untouched sample.
+    s[view_key] = len(s[table_key])
 
 
-def _preset_block(prefix: str, table_key: str, max_n: int = 60):
+def _preset_block(prefix: str, table_key: str, view_key: str, max_n: int = 60):
     """The Measurement Preset controls.  One implementation, rendered in each tab.
 
     Widget keys are namespaced by ``prefix`` because Streamlit renders every tab on every run,
@@ -652,10 +679,10 @@ def _preset_block(prefix: str, table_key: str, max_n: int = 60):
     )
     pb1, pb2 = st.columns(2)
     pb1.button("Generate", key="btn_preset_gen_" + prefix, on_click=_cb_preset,
-               args=(prefix, table_key, True), use_container_width=True,
+               args=(prefix, table_key, view_key, True), use_container_width=True,
                help="Replace the sequence with this sweep.")
     pb2.button("Append", key="btn_preset_add_" + prefix, on_click=_cb_preset,
-               args=(prefix, table_key, False), use_container_width=True,
+               args=(prefix, table_key, view_key, False), use_container_width=True,
                help="Add this sweep to the existing sequence.")
 
 
@@ -1124,7 +1151,11 @@ def _render_3d_tab():
     )
     left3d, mid3d, right3d = st.columns([3, 2, 2])
 
-    seq3d = _table_to_seq(s["beam_table_3d"])
+    # The full table is what Reconstruct solves; seq3d is the prefix the *pictures* show, so
+    # every display below keeps working unchanged while Previous/Next scrubs history.
+    seq_all = _table_to_seq(s["beam_table_3d"])
+    n_all = len(seq_all)
+    seq3d = seq_all[:max(0, min(int(s["live3d_view_k"]), n_all))]
     n_meas = len(seq3d)
     n_slices = int(s["live3d_nslices"])
 
@@ -1143,6 +1174,7 @@ def _render_3d_tab():
     s["live3d_z_slice"] = s["live3d_z_sino"] = k
 
     with left3d:
+        _nav_block("live3d_view_k", n_all)
         view_slice, view_vol, view_sino, view_recon = st.tabs(
             ["Slice", "Volume", "Sinogram", "Reconstruct"]
         )
@@ -1408,7 +1440,7 @@ def _render_3d_tab():
                 st.slider("TV weight", 0.0, 1.0, step=0.01, key="live3d_tv_weight",
                           help="Total-variation regularisation, the same dial the 2D tab has.")
             with rc3:
-                if not n_meas:
+                if not n_all:
                     st.caption("Take at least one measurement first.")
                 elif float(s["live3d_I0"]) > 0.0:
                     # Measured on this box: 9 measurements at IMAGE_RES=30 solve in 5.7 s at
@@ -1425,20 +1457,20 @@ def _render_3d_tab():
                     )
                 else:
                     # ~0.6 s per measurement per slice at IMAGE_RES=30, I0 = 0, measured here.
-                    est = 0.6 * n_meas * len(targets)
+                    est = 0.6 * n_all * len(targets)
                     st.caption(
                         "**%d** of %d slices · %d measurement%s · rough estimate "
                         "**%s** (cached slices are instant)."
-                        % (len(targets), n_slices, n_meas, "" if n_meas == 1 else "s",
+                        % (len(targets), n_slices, n_all, "" if n_all == 1 else "s",
                            "%.0f s" % est if est < 90 else "%.1f min" % (est / 60.0))
                     )
 
             go = st.button("Reconstruct slices", type="primary", key="btn3d_recon",
-                           disabled=(n_meas == 0), use_container_width=False)
+                           disabled=(n_all == 0), use_container_width=False)
 
             # Signature of everything the stack depends on. Stored alongside the result so a
             # stale stack (parameters moved since) is reported rather than silently shown.
-            recon_key = (seq3d, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
+            recon_key = (seq_all, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
                          float(s["live3d_I0"]), float(s["live3d_alpha"]),
                          float(s["live3d_beta"]), float(s["live3d_tv_weight"]))
 
@@ -1475,7 +1507,7 @@ def _render_3d_tab():
                                   text="Slice %d of %d (z = %d)" % (i + 1, len(targets), kz))
                     try:
                         a, c, dv, fwd, inv = _recon_slice_3d(
-                            seq3d, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
+                            seq_all, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
                             float(s["live3d_I0"]), float(s["live3d_alpha"]),
                             float(s["live3d_beta"]), float(s["live3d_tv_weight"]), kz,
                             _log_callback=_log_cb,
@@ -1656,7 +1688,7 @@ def _render_3d_tab():
         st.number_input("beta", min_value=0.0, step=0.005, format="%.3f", key="live3d_beta")
 
     with right3d:
-        _preset_block("live3d", "beam_table_3d")
+        _preset_block("live3d", "beam_table_3d", "live3d_view_k")
 
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
@@ -1692,6 +1724,7 @@ def _cb_v2_step():
         }]
     )
     s["beam_table_v2"] = pd.concat([s["beam_table_v2"], new_row], ignore_index=True)
+    s["v2_view_k"] = len(s["beam_table_v2"])  # jump the view to the just-taken measurement
 
 
 def _cb_v2_reset():
@@ -1753,7 +1786,9 @@ def _render_2d_v2_tab():
     left, mid, right = st.columns([3, 2, 2])
 
     res = int(s["v2_res"])
-    seq = _table_to_seq(s["beam_table_v2"])
+    seq_all = _table_to_seq(s["beam_table_v2"])
+    n_all = len(seq_all)
+    seq = seq_all[:max(0, min(int(s["v2_view_k"]), n_all))]
     n_meas = len(seq)
 
     theta, f, Q, summary = _simulate_v2(
@@ -1774,6 +1809,7 @@ def _render_2d_v2_tab():
         panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
 
     with left:
+        _nav_block("v2_view_k", n_all)
         # Third instance of the 2D tab's live component. It owns the Angle / Offset / # Beams
         # sliders and redraws the red preview client-side while the thumb is held; st.slider only
         # reports on release, so a Python-owned slider cannot track a drag at all.
@@ -1880,7 +1916,7 @@ def _render_2d_v2_tab():
         #                           "across the sample within a step or two.")
 
     with right:
-        _preset_block("v2", "beam_table_v2")
+        _preset_block("v2", "beam_table_v2", "v2_view_k")
 
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_v2"], use_container_width=True, height=200)
@@ -1953,9 +1989,11 @@ with tab_2d:
 
     with left:
         nav = st.columns(2)
-        nav[0].button("⬅ Previous Measurement", on_click=_cb_prev,
+        nav[0].button("⬅ Previous Measurement", key="btn_prev_view_k",
+                      on_click=_cb_view_prev, args=("view_k",),
                       use_container_width=True, disabled=(_k == 0))
-        nav[1].button("Next Measurement ➡", on_click=_cb_next,
+        nav[1].button("Next Measurement ➡", key="btn_next_view_k",
+                      on_click=_cb_view_next, args=("view_k", _n),
                       use_container_width=True, disabled=(_k >= _n))
         st.caption(f"Viewing measurement **{_k}** of **{_n}**.")
         # Interactive browser preview: the Angle/Offset/#Beams sliders live here and the red preview
@@ -2022,7 +2060,7 @@ with tab_2d:
                    "the live I0/α/β; set I0=0 to reconstruct without modeling dose degradation.")
 
     with right:
-        _preset_block("live", "beam_table")
+        _preset_block("live", "beam_table", "view_k")
 
         st.subheader("Measurement sequence")
         st.caption(
