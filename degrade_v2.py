@@ -1,6 +1,6 @@
 """v2 damage model: dose accumulation, saturating response, decay, and elastic transport.
 
-Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``f91887f`` of the
+Implements section 3.2 ("The system") of ``xray_degradation.tex`` at commit ``a2c5ee2`` of the
 manuscript repo. Where v1 (:func:`dose_response.degradation_dose_response`) is a pure *local
 sink* -- mass vanishes in place, so the sample fades but never changes shape -- v2 separates the
 dose *accumulation* from the dose *response*, and adds a mass balance so mass also **moves**.
@@ -29,12 +29,15 @@ implements are 1-10, the dynamics map ``M``:
 
 Steps 11 (observation) and 12 (constraints) belong to the estimation NLP, not here.
 
-**Step 9 runs before step 10, and the order is not cosmetic.** Decaying first and transporting
-the decayed field keeps the flux sum antisymmetric, so it telescopes and contributes exactly
-nothing to the total: the whole change in mass is the decay. Transporting first and decaying
-after multiplies the two ends of each face by different factors, the sum stops telescoping, and
-the flux starts leaking mass of its own. :func:`check_invariants` asserts this rather than
-trusting it -- measured here at ~1e-16 for the correct order against ~1e-4 for the reverse.
+**Step 9 runs before step 10, and the order is not cosmetic.** The mechanism is easy to state
+wrongly, so precisely: the *unweighted* flux sum is zero in every case, whatever the ordering --
+telescoping follows from the antisymmetry of eq:xd_flux alone and does not care when the decay
+is applied. What the wrong order changes is the *weight* each end of a face carries into the
+total. Decaying first means every face sees one common factor and the fluxes still cancel in
+pairs; transporting first and decaying after leaves the flux contributing
+``sum_faces (e_p - e_q) F_{p->q}``, which vanishes only if the decay factor ``e`` is uniform --
+and it never is, because ``I_p`` varies. :func:`check_invariants` runs both orderings rather
+than trusting either: measured at 0.0 for the correct order against ~9e-4 for the reverse.
 
 Pure numpy + scipy over the repo's own cached ray geometry -- no Streamlit, no Pyomo, no solver.
 
@@ -48,8 +51,8 @@ Discretisation choices that differ from the manuscript's scratch reference, and 
 * **Pixel units.**  ``dx = 1`` here, matching the app's geometry, where the reference used a
   ``[-1,1]`` box.  Every dimensionless diagnostic (Courant number, mass drift, the collapse
   error) is unaffected; only the natural size of ``c_q`` changes.  The ``1/Delta`` of
-  eq:xd_flux -- which the written spec currently omits, though the reference implementation has
-  it -- is applied here when assembling the divergence, so it is already correct.
+  eq:xd_flux is applied here when assembling the divergence.  (The spec omitted it until
+  ``a2c5ee2``; this module always had it, so nothing changed when it was added.)
 * **The box constraints of eq:xd_box / eq:xd_budget are NOT applied in the dynamics.**  They are
   inequality constraints of the estimation NLP, and step 12 says explicitly that clipping inside
   the forward map destroys both the conservation and the collapse.  Violations are reported in
@@ -330,8 +333,8 @@ def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver,
         # this expected loss no longer matches the real change -- and that gap is the leak.
         lost = float(f.sum() - (f * p.decay_factor(I_p)).sum())
     else:
-        # 9 then 10: decaying first keeps the flux sum antisymmetric, so it telescopes and
-        # moves no mass at all; the entire change in the total is the decay.
+        # 9 then 10: one common decay factor per face, so the fluxes still cancel in pairs and
+        # the transport moves no mass at all; the entire change in the total is the decay.
         f_tilde = f * p.decay_factor(I_p)
         lost = float(f.sum() - f_tilde.sum())
         f_next = f_tilde - upwind_flux_divergence(f_tilde, dx_x, dx_y, p.dx, p.eps_up)
@@ -433,10 +436,11 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     (a) **Exact mass conservation, and the step ordering that makes it hold.**  ``a = b = 0``
         removes eq:xd_decay, and then the total attenuation is conserved to machine precision
         for *any* ``c_cp`` -- transport moves mass, it never removes it.  With ``a > 0`` the
-        whole change in the total must be the decay, because decaying *before* transporting
-        leaves the flux sum antisymmetric so it telescopes to nothing.  Swapping steps 9 and 10
-        multiplies the two ends of each face by different factors, the sum stops telescoping,
-        and the flux leaks mass of its own.  The wrong order is *run* here rather than reasoned
+        whole change in the total must be the decay.  Not because the ordering restores
+        telescoping -- the unweighted flux sum is zero either way, that being a property of
+        eq:xd_flux alone -- but because decaying first gives both ends of every face one common
+        factor, so the pairs still cancel.  Transport-then-decay leaves the flux contributing
+        ``sum_faces (e_p - e_q) F_{p->q}``, zero only for a uniform decay.  The wrong order is *run* here rather than reasoned
         about, so the claim is demonstrated.
 
     (b) **Exact collapse to the model already in use.**  At ``c_cp = 0`` the eigenstrain
