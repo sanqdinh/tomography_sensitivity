@@ -473,6 +473,7 @@ for _k, _v in {
     "live3d_tv_weight": 0.1, "live3d_recon_stride": 1, "live3d_recon_z": 0,
     # Measurement preset: evenly spaced angles over [lo, hi).
     "live3d_preset_lo": 0.0, "live3d_preset_hi": 180.0, "live3d_preset_n": 9,
+    "live3d_recsrc": "Reconstruction", "live3d_recband_pct": (2, 100),
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -634,6 +635,22 @@ def _cb3d_sync_beam():
     s["live3d_angle"] = float(s["live3d_angle_vol"])
     s["live3d_offset"] = float(s["live3d_offset_vol"])
     s["live3d_nbeams"] = int(s["live3d_nbeams_vol"])
+
+
+def _cb3d_sync_recview():
+    """Fold the Reconstruct view's opacity / cut-away duplicates into the canonical values.
+
+    Same one-value-two-widgets pattern as :func:`_cb3d_sync_z`: Streamlit renders every tab on
+    every run, so these keys cannot be reused across two sub-tabs. Sharing the *values* rather
+    than giving the Reconstruct view its own is deliberate -- lining a cut-away up in the Volume
+    view and then switching over to see the same cut through the reconstruction is the whole
+    point of having both. The intensity band is NOT shared, because the two views are not in the
+    same units: attenuation runs 0-1 and log10 variance is negative throughout.
+    """
+    s = st.session_state
+    s["live3d_opacity"] = float(s["live3d_opacity_rec"])
+    s["live3d_cutaxis"] = s["live3d_cutaxis_rec"]
+    s["live3d_cut"] = float(s["live3d_cut_rec"])
 
 
 def _bundle_sliders_3d(suffix: str, slots=None):
@@ -911,7 +928,7 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
 
 
 def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
-                   cut_axis="none", cut_frac=0.0, beams=()):
+                   cut_axis="none", cut_frac=0.0, beams=(), cmin=0.0):
     """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
 
     ``go.Volume`` ray-marches through the data and blends between voxel centres, which smears
@@ -969,10 +986,13 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
                 k=np.stack([base + 2, base + 3], 1).ravel(),
                 intensity=np.repeat(vals, 2), intensitymode="cell",
                 colorscale=colorscale,
-                # Fixed 0 -> cmax, set by the caller and never by the mask, so no slider can
+                # Fixed cmin -> cmax, set by the caller and never by the mask, so no slider can
                 # rescale the bar. Intensity is physically non-negative, so 0 is the dark end.
-                cmin=0.0,
-                cmax=float(max(cmax, 1e-6)),
+                # cmin defaults to 0, which is right for attenuation (0 is air). The
+                # reconstruction's log10-variance view is negative throughout, and a ramp
+                # anchored at 0 would clamp every voxel to one colour, so that caller sets it.
+                cmin=float(cmin),
+                cmax=float(max(cmax, cmin + 1e-6)),
                 opacity=float(opacity), flatshading=True,
                 lighting=dict(ambient=0.62, diffuse=0.58, specular=0.12, roughness=0.7),
                 lightposition=dict(x=2 * nc, y=-2 * nr, z=2 * nz),
@@ -1441,19 +1461,70 @@ def _render_3d_tab():
                         st.warning("%d of %d slices failed and are left empty in the stack: z = %s"
                                    % (len(failed), len(res3["targets"]),
                                       ", ".join(str(x) for x in failed)))
+                    # Seed the mirrors from the canonical values immediately before building
+                    # the widgets -- the last moment Streamlit allows a widget key to be
+                    # written, and late enough to pick up a change made in the Volume view
+                    # earlier in this same run.
+                    s["live3d_opacity_rec"] = float(s["live3d_opacity"])
+                    s["live3d_cutaxis_rec"] = s["live3d_cutaxis"]
+                    s["live3d_cut_rec"] = float(s["live3d_cut"])
+
+                    qc1, qc2, qc3, qc4 = st.columns(4)
+                    with qc1:
+                        st.radio("Show", ("Reconstruction", "Variance"), key="live3d_recsrc",
+                                 help="'Variance' is the posterior log10 variance from k_aug "
+                                      "— where this geometry leaves the image uncertain.")
+                    with qc2:
+                        st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity_rec",
+                                  on_change=_cb3d_sync_recview,
+                                  help="Shared with the Volume view — both track one value.")
+                    with qc3:
+                        st.slider("Visible range (%)", 0, 100, step=1,
+                                  key="live3d_recband_pct",
+                                  help="Band to draw, as a percentage of the current view's own "
+                                       "range. Percent rather than absolute because the two "
+                                       "views are not in the same units: attenuation runs 0-1 "
+                                       "and log10 variance is negative throughout.")
+                    with qc4:
+                        st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis_rec",
+                                     on_change=_cb3d_sync_recview,
+                                     help="Shared with the Volume view.")
+                        st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut_rec",
+                                  on_change=_cb3d_sync_recview)
+
+                    if s["live3d_recsrc"] == "Variance":
+                        # -inf is a real output here: a pixel no ray constrains has exactly zero
+                        # variance. Drop those to NaN so they are simply absent rather than
+                        # dragging the colour ramp to negative infinity.
+                        vdata = np.where(np.isfinite(res3["logcov"]), res3["logcov"], np.nan)
+                        vcmap, vlabel = "Viridis", "Posterior log10 variance"
+                    else:
+                        vdata = res3["recon"]
+                        vcmap, vlabel = "Gray", "Stacked reconstruction"
+                    _fin = vdata[np.isfinite(vdata)]
+                    if _fin.size:
+                        _lo, _hi = float(_fin.min()), float(_fin.max())
+                    else:
+                        _lo, _hi = 0.0, 1.0
+                    _span = (_hi - _lo) or 1.0
+                    _p0, _p1 = s["live3d_recband_pct"]
+                    _isomin = _lo + _span * float(_p0) / 100.0
+                    _isomax = _lo + _span * float(_p1) / 100.0
+
                     rv1, rv2 = st.columns([3, 2])
                     with rv1:
                         st.plotly_chart(
                             _volume_figure(
-                                res3["recon"], float(s["live3d_opacity"]),
-                                float(s["live3d_isomin"]), float(s["live3d_isomax"]),
-                                "Stacked reconstruction — %d of %d slices"
-                                % (len(solved), n_slices),
-                                "Gray", float(vol0.max()),
+                                vdata, float(s["live3d_opacity"]), _isomin, _isomax,
+                                "%s — %d of %d slices" % (vlabel, len(solved), n_slices),
+                                vcmap, _hi,
                                 cut_axis=s["live3d_cutaxis"], cut_frac=float(s["live3d_cut"]),
+                                cmin=_lo,
                             ),
                             use_container_width=True,
                         )
+                        st.caption("Range %.4g – %.4g; drawing %.4g – %.4g."
+                                   % (_lo, _hi, _isomin, _isomax))
                     with rv2:
                         finite = [(z, res3["dopt"][z]) for z in solved
                                   if np.isfinite(res3["dopt"][z])]
