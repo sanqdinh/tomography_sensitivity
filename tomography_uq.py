@@ -125,6 +125,12 @@ class UQParams:
     linear_solver: str = "ma27"
     # User-defined projection geometry; one BeamStep per time step (n_horizon = len + 1).
     beam_steps: List[BeamStep] = field(default_factory=_default_beam_steps)
+    # Reconstruct this image instead of the built-in Shepp-Logan. ``None`` keeps the Example2
+    # default exactly, so the pipeline is byte-identical when the field is left alone. The 3D
+    # tab passes one z-slice of its volume here: 2.5D geometry fires the same (r, theta) bundle
+    # through every slice and rays never cross slices, so each slice is an independent 2D
+    # problem and reconstructing them one at a time is exact rather than an approximation.
+    phantom: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -143,6 +149,10 @@ class UQResults:
     n_free_image0: int
     n_sinogram_measurements: int  # real measurement params fed to k_aug (one per ray)
     n_user_rays: int  # rays actually placed by the user geometry (after clamping)
+    # The arrays behind fig_nlp / fig_covariance. Callers that stack or post-process results
+    # (the 3D tab's per-slice reconstruction) need the numbers, not the pictures.
+    image_reconstruct: "np.ndarray" = None
+    log_cov_diag_2D: "Optional[np.ndarray]" = None
 
 
 class _LogWriter:
@@ -274,8 +284,15 @@ def run_simple_uq(
     n_horizon = len(steps) + 1
 
     # --- geometry & phantom (Example2 lines 44-75) ------------------------------------
-    phantom = shepp_logan_phantom()
-    phantom = resize(phantom, (image_res, image_res))
+    if params.phantom is not None:
+        # load_image_to_sample resizes a mismatched array itself, but do it here so the phantom
+        # figure and the reconstruction are shown on the same grid the solve actually used.
+        phantom = np.asarray(params.phantom, dtype=float)
+        if phantom.shape != (image_res, image_res):
+            phantom = resize(phantom, (image_res, image_res))
+    else:
+        phantom = shepp_logan_phantom()
+        phantom = resize(phantom, (image_res, image_res))
 
     sample = create_sample_model(n_horizon=n_horizon, image_res=image_res)
     load_image_to_sample(sample, phantom)
@@ -566,6 +583,8 @@ def run_simple_uq(
         n_free_image0=len(image0_vars),
         n_sinogram_measurements=len(sinogram_vars),
         n_user_rays=len(measurement_set),
+        image_reconstruct=image_reconstruct,
+        log_cov_diag_2D=log_cov_diag_2D,
     )
 
 

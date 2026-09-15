@@ -475,6 +475,11 @@ for _k, _v in {
     "live3d_cutaxis": "x (col)", "live3d_cut": 0.5,
     "live3d_volsrc": "Degraded", "live3d_sinoview": "Per-slice sinogram",
     "live3d_showbeams": True,
+    # Per-slice reconstruction (Reconstruct sub-tab). tv_weight matches the 2D default.
+    "live3d_tv_weight": 0.1, "live3d_recon_stride": 1, "live3d_recon_z": 0,
+    # Measurement preset: evenly spaced angles over [lo, hi).
+    "live3d_preset_lo": 0.0, "live3d_preset_hi": 180.0, "live3d_preset_n": 9,
+    "live3d_recsrc": "Reconstruction", "live3d_recband_pct": (2, 100),
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -514,6 +519,70 @@ def _simulate_3d(seq: tuple, I0: float, alpha: float, beta: float,
     return vol0, vol1, sino
 
 
+@st.cache_data(show_spinner=False)
+def _phantom_3d(image_res: int, n_slices: int, contrast: float):
+    """The undamaged volume on its own, without running a degradation sequence."""
+    return shepp_logan_3d(image_res, n_slices, contrast=contrast)
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _recon_slice_3d(seq: tuple, image_res: int, n_slices: int, contrast: float,
+                    I0: float, alpha: float, beta: float, tv_weight: float, k: int,
+                    _log_callback=None):
+    """Reconstruct ONE z-slice exactly the way the 2D tab reconstructs its phantom.
+
+    The slice handed over is the **undamaged** ``vol0[:, :, k]``, with ``I0/alpha/beta`` passed
+    alongside, so the forward model applies the dose-response itself -- precisely what the 2D
+    tab does. Reconstructing the already-degraded volume instead would be a different
+    experiment: it would treat the damage as part of the object rather than as something the
+    measurement caused.
+
+    Cached per slice, which is what makes the stride control worth having: a coarse pass at
+    stride 4 leaves its slices in the cache, so committing to stride 1 afterwards only pays for
+    the ones that are new. ``_log_callback`` is underscore-prefixed so Streamlit leaves it out
+    of the hash -- an uncached slice still streams into the log box, a cached one never runs.
+
+    Returns plain arrays and scalars, never the ``UQResults``: it carries four matplotlib
+    figures, and 48 slices of those would be ~192 live figures held in session state.
+    """
+    vol0 = _phantom_3d(image_res, n_slices, contrast)
+    steps = [BeamStep(angle_deg=a, offset=o, n_beams=n) for (a, o, n) in seq]
+    res = run_simple_uq(
+        UQParams(image_res=image_res, I0=I0, alpha=alpha, beta=beta, tv_weight=tv_weight,
+                 beam_steps=steps, phantom=vol0[:, :, int(k)]),
+        log_callback=_log_callback,
+    )
+    return (np.asarray(res.image_reconstruct, dtype=float),
+            None if res.log_cov_diag_2D is None else np.asarray(res.log_cov_diag_2D, dtype=float),
+            float(res.d_optimality), res.forward_solver_status, res.inverse_solver_status)
+
+
+def _recon_slice_figure(original, recon, logcov, k: int, status: str):
+    """Original | reconstruction | log-covariance for one slice, drawn from the stored arrays."""
+    fig, axes = plt.subplots(1, 3, figsize=(12.0, 4.2))
+    finite = np.isfinite(recon)
+    vmax = float(original.max()) if original.size else 1.0
+    for ax, (img, ttl, cmap) in zip(axes, (
+        (original, "Original (undamaged) z=%d" % k, "gray"),
+        (recon, "Reconstruction", "gray"),
+        (logcov, "log10 variance", "viridis"),
+    )):
+        if not np.any(np.isfinite(img)):
+            ax.text(0.5, 0.5, "not solved", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+        else:
+            kw = dict(vmin=0.0, vmax=vmax) if cmap == "gray" else {}
+            im = ax.imshow(img, cmap=cmap, interpolation="nearest", **kw)
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_title(ttl, fontsize=10)
+    axes[1].set_xlabel(status, fontsize=8)
+    if np.any(finite):
+        err = float(np.nanmean(np.abs(recon - original)))
+        axes[1].set_title("Reconstruction  (mean |err| %.4g)" % err, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
 def _cb3d_step():
     """Take a 3D measurement: append the current bundle to the 3D sequence table."""
     s = st.session_state
@@ -525,6 +594,35 @@ def _cb3d_step():
         }]
     )
     s["beam_table_3d"] = pd.concat([s["beam_table_3d"], new_row], ignore_index=True)
+
+
+def _preset_angles_3d(lo: float, hi: float, n: int) -> list:
+    """``n`` evenly spaced angles over **[lo, hi)** — the upper bound is exclusive.
+
+    Exclusive because a projection at 180 deg traces the same line as one at 0 deg, so an
+    inclusive sweep would spend a measurement re-measuring the start. This is also what makes
+    the obvious case come out right: 0 to 180 in 3 gives 0, 60, 120 rather than 0, 90, 180.
+    """
+    n = max(int(n), 1)
+    return [float(a) for a in np.linspace(float(lo), float(hi), n, endpoint=False)]
+
+
+def _cb3d_preset(replace: bool):
+    """Fill the 3D sequence with an evenly spaced angular sweep.
+
+    Offset and beam count come from the current aim, so the preset sweeps *this* bundle through
+    the angles rather than inventing a geometry of its own.
+    """
+    s = st.session_state
+    rows = pd.DataFrame(
+        [{"angle_deg": a,
+          "offset": float(s["live3d_offset"]),
+          "n_beams": int(s["live3d_nbeams"])}
+         for a in _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
+                                    s["live3d_preset_n"])]
+    )
+    s["beam_table_3d"] = (rows if replace
+                          else pd.concat([s["beam_table_3d"], rows], ignore_index=True))
 
 
 def _cb3d_reset():
@@ -556,6 +654,22 @@ def _cb3d_sync_beam():
     s["live3d_angle"] = float(s["live3d_angle_vol"])
     s["live3d_offset"] = float(s["live3d_offset_vol"])
     s["live3d_nbeams"] = int(s["live3d_nbeams_vol"])
+
+
+def _cb3d_sync_recview():
+    """Fold the Reconstruct view's opacity / cut-away duplicates into the canonical values.
+
+    Same one-value-two-widgets pattern as :func:`_cb3d_sync_z`: Streamlit renders every tab on
+    every run, so these keys cannot be reused across two sub-tabs. Sharing the *values* rather
+    than giving the Reconstruct view its own is deliberate -- lining a cut-away up in the Volume
+    view and then switching over to see the same cut through the reconstruction is the whole
+    point of having both. The intensity band is NOT shared, because the two views are not in the
+    same units: attenuation runs 0-1 and log10 variance is negative throughout.
+    """
+    s = st.session_state
+    s["live3d_opacity"] = float(s["live3d_opacity_rec"])
+    s["live3d_cutaxis"] = s["live3d_cutaxis_rec"]
+    s["live3d_cut"] = float(s["live3d_cut_rec"])
 
 
 def _bundle_sliders_3d(suffix: str, slots=None):
@@ -619,11 +733,17 @@ def _sinogram_figure(panel, image_res, xlabel, xticklabels, title):
     samples only a few of the ``image_res`` detector slots, so most of the panel is genuinely
     unmeasured — those cells are drawn in a flat off-colour via ``set_bad`` so they read as
     "no data" rather than as a real low line-integral.
+
+    The ramp is greyscale, matching the slice and volume views. That forces the ``set_bad``
+    colour to be **chromatic**: greyscale already spans every lightness from black to white, so
+    no shade of grey can mean "unmeasured" -- the old dark blue-grey would now read as a genuine
+    low reading, which is the one thing this mask exists to prevent. Hue is the only channel
+    left, hence the muted blue.
     """
     r_grid = detector_grid(image_res)
     fig, ax = plt.subplots(figsize=(7.6, 6.2))
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad("#2b2b3a")  # unmeasured — deliberately not part of the viridis ramp
+    cmap = plt.get_cmap("gray").copy()
+    cmap.set_bad("#3d5a80")  # unmeasured -- chromatic, so no grey level can be mistaken for it
     finite = np.isfinite(panel)
     im = ax.imshow(
         np.ma.masked_invalid(panel), cmap=cmap, aspect="auto", interpolation="nearest",
@@ -833,7 +953,7 @@ def _beam_curtain_trace(r_values, angle_deg, nr, nc, nz, color, name=None, flat_
 
 
 def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
-                   cut_axis="none", cut_frac=0.0, beams=()):
+                   cut_axis="none", cut_frac=0.0, beams=(), cmin=0.0):
     """Discrete voxel rendering: every voxel is a solid cube, no interpolation.
 
     ``go.Volume`` ray-marches through the data and blends between voxel centres, which smears
@@ -891,10 +1011,13 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
                 k=np.stack([base + 2, base + 3], 1).ravel(),
                 intensity=np.repeat(vals, 2), intensitymode="cell",
                 colorscale=colorscale,
-                # Fixed 0 -> cmax, set by the caller and never by the mask, so no slider can
+                # Fixed cmin -> cmax, set by the caller and never by the mask, so no slider can
                 # rescale the bar. Intensity is physically non-negative, so 0 is the dark end.
-                cmin=0.0,
-                cmax=float(max(cmax, 1e-6)),
+                # cmin defaults to 0, which is right for attenuation (0 is air). The
+                # reconstruction's log10-variance view is negative throughout, and a ramp
+                # anchored at 0 would clamp every voxel to one colour, so that caller sets it.
+                cmin=float(cmin),
+                cmax=float(max(cmax, cmin + 1e-6)),
                 opacity=float(opacity), flatshading=True,
                 lighting=dict(ambient=0.62, diffuse=0.58, specular=0.12, roughness=0.7),
                 lightposition=dict(x=2 * nc, y=-2 * nr, z=2 * nz),
@@ -962,7 +1085,8 @@ def _render_3d_tab():
         "**2.5D forward simulation.** The phantom is a true 3D Shepp-Logan volume, but each "
         "measurement fires the *same* beam bundle through every slice — rays never cross "
         "slices. Dose still varies with depth because each slice attenuates the beam "
-        "differently. Reconstruction is not part of this tab."
+        "differently. **Reconstruct** solves each slice as an independent 2D problem and "
+        "stacks the results."
     )
     left3d, mid3d, right3d = st.columns([3, 2, 2])
 
@@ -985,7 +1109,9 @@ def _render_3d_tab():
     s["live3d_z_slice"] = s["live3d_z_sino"] = k
 
     with left3d:
-        view_slice, view_vol, view_sino = st.tabs(["Slice", "Volume", "Sinogram"])
+        view_slice, view_vol, view_sino, view_recon = st.tabs(
+            ["Slice", "Volume", "Sinogram", "Reconstruct"]
+        )
 
         with view_slice:
             # The 2D tab's live component, second instance. It OWNS the Angle/Offset/#Beams
@@ -1044,6 +1170,14 @@ def _render_3d_tab():
             if src == "Original":
                 data, cmap_name = vol0, "Gray"
                 title = "Phantom (no dose applied)"
+            elif src == "Reconstruction":
+                # The stack built in the Reconstruct sub-tab, viewable here so it gets the
+                # cut-away / opacity / intensity-band controls that already exist.
+                _r3 = st.session_state.get("results_3d")
+                data = vol0 * np.nan if _r3 is None else _r3["recon"]
+                cmap_name = "Gray"
+                title = ("Stacked reconstruction" if _r3 is not None
+                         else "No reconstruction yet — see the Reconstruct sub-tab")
             elif src == "Dose removed":
                 data, cmap_name = vol0 - vol, "Inferno"
                 title = "Dose removed (original − degraded) — where the beams landed"
@@ -1123,7 +1257,7 @@ def _render_3d_tab():
                 _bundle_sliders_3d("_vol", slots=st.columns(3))
             vc1, vc2, vc3, vc4 = st.columns(4)
             with vc1:
-                st.radio("Show", ("Degraded", "Original", "Dose removed"),
+                st.radio("Show", ("Degraded", "Original", "Dose removed", "Reconstruction"),
                          key="live3d_volsrc",
                          help="'Dose removed' is the clearest view of where the beams "
                               "deposited energy.")
@@ -1213,6 +1347,243 @@ def _render_3d_tab():
                     "detector panel behind the volume would record."
                 )
 
+        with view_recon:
+            # 2.5D geometry is what makes this exact rather than an approximation: one
+            # measurement fires the SAME (r, theta) bundle through every slice and rays never
+            # cross slices, so each z-slice is an independent 2D tomography problem sharing one
+            # geometry. Each is handed to run_simple_uq exactly as the 2D tab hands it its
+            # phantom -- clean slice plus I0/alpha/beta, degradation applied inside the forward
+            # model -- and the reconstructions are stacked back into a volume.
+            st.caption(
+                "Every z-slice is reconstructed **independently**, by the same "
+                "`run_simple_uq` forward + inverse + k_aug pipeline the 2D tab uses, then "
+                "stacked back into a volume. Needs IPOPT and k_aug; the rest of this tab does "
+                "not."
+            )
+            stride = int(s["live3d_recon_stride"])
+            targets = list(range(0, n_slices, stride))
+
+            rc1, rc2, rc3 = st.columns([1, 1, 2])
+            with rc1:
+                st.select_slider(
+                    "Stride", options=(1, 2, 4, 8), key="live3d_recon_stride",
+                    help="1 is every slice. A coarse pass is cheap and its slices are cached, "
+                         "so committing to stride 1 afterwards only pays for the new ones.",
+                )
+            with rc2:
+                st.slider("TV weight", 0.0, 1.0, step=0.01, key="live3d_tv_weight",
+                          help="Total-variation regularisation, the same dial the 2D tab has.")
+            with rc3:
+                if not n_meas:
+                    st.caption("Take at least one measurement first.")
+                elif float(s["live3d_I0"]) > 0.0:
+                    # Measured on this box: 9 measurements at IMAGE_RES=30 solve in 5.7 s at
+                    # I0 = 0, and had still not converged after 8.5 MINUTES at I0 = 5. The
+                    # dose-response makes the forward model nonlinear and the NLP far harder,
+                    # so no estimate is offered here -- it would be off by two orders.
+                    st.warning(
+                        "**I0 = %.3g, so degradation is modelled in the solve and each slice "
+                        "gets dramatically more expensive** — measured at 5.7 s per slice "
+                        "with I0 = 0 against over 8 minutes at I0 = 5, for the same geometry. "
+                        "%d slices at that rate is hours. Reconstruct with a large stride "
+                        "first, or set I0 = 0 to reconstruct the undamaged phantom."
+                        % (float(s["live3d_I0"]), len(targets))
+                    )
+                else:
+                    # ~0.6 s per measurement per slice at IMAGE_RES=30, I0 = 0, measured here.
+                    est = 0.6 * n_meas * len(targets)
+                    st.caption(
+                        "**%d** of %d slices · %d measurement%s · rough estimate "
+                        "**%s** (cached slices are instant)."
+                        % (len(targets), n_slices, n_meas, "" if n_meas == 1 else "s",
+                           "%.0f s" % est if est < 90 else "%.1f min" % (est / 60.0))
+                    )
+
+            go = st.button("Reconstruct slices", type="primary", key="btn3d_recon",
+                           disabled=(n_meas == 0), use_container_width=False)
+
+            # Signature of everything the stack depends on. Stored alongside the result so a
+            # stale stack (parameters moved since) is reported rather than silently shown.
+            recon_key = (seq3d, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
+                         float(s["live3d_I0"]), float(s["live3d_alpha"]),
+                         float(s["live3d_beta"]), float(s["live3d_tv_weight"]))
+
+            if go:
+                prog = st.progress(0.0, text="Starting…")
+                log_box = st.empty()
+                log_lines: list[str] = []
+                _last = [0.0]
+
+                def _render_log() -> None:
+                    body = _html.escape("".join(log_lines)[-8000:])
+                    log_box.empty()
+                    with log_box.container():
+                        components.html(_LOG_IFRAME.format(body=body), height=312,
+                                        scrolling=False)
+
+                def _log_cb(chunk: str) -> None:
+                    # Append ONLY -- never render from in here. This callback runs inside the
+                    # cached _recon_slice_3d, and a Streamlit element called from a cached
+                    # function is recorded for replay; on a cache hit the replay fails with
+                    # "a streamlit element is called", which would break exactly the slices the
+                    # stride workflow is meant to reuse. The loop flushes between slices.
+                    log_lines.append(chunk)
+
+                # NaN, not 0: an unsolved slice must be distinguishable from a genuinely dark
+                # one, the same reason the sinogram leaves unmeasured cells NaN.
+                recon = np.full((IMAGE_RES, IMAGE_RES, n_slices), np.nan)
+                logcov = np.full((IMAGE_RES, IMAGE_RES, n_slices), np.nan)
+                dopt = [float("nan")] * n_slices
+                status = ["not solved"] * n_slices
+
+                for i, kz in enumerate(targets):
+                    prog.progress(i / max(len(targets), 1),
+                                  text="Slice %d of %d (z = %d)" % (i + 1, len(targets), kz))
+                    try:
+                        a, c, dv, fwd, inv = _recon_slice_3d(
+                            seq3d, IMAGE_RES, n_slices, float(s["live3d_contrast"]),
+                            float(s["live3d_I0"]), float(s["live3d_alpha"]),
+                            float(s["live3d_beta"]), float(s["live3d_tv_weight"]), kz,
+                            _log_callback=_log_cb,
+                        )
+                        recon[:, :, kz] = a
+                        if c is not None:
+                            logcov[:, :, kz] = c
+                        dopt[kz] = dv
+                        status[kz] = "%s / %s" % (fwd, inv)
+                    except Exception as exc:
+                        # One slice must not lose the rest: k_aug's covariance here is
+                        # intentionally rank-deficient and can fail on a starved geometry.
+                        status[kz] = "failed: %s" % (str(exc).splitlines() or [""])[0][:120]
+                    # Flush the accumulated solver output between slices (see _log_cb).
+                    now = time.time()
+                    if now - _last[0] >= 0.2:
+                        _last[0] = now
+                        _render_log()
+                prog.progress(1.0, text="Done: %d slices" % len(targets))
+                _render_log()
+                st.session_state["results_3d"] = {
+                    "recon": recon, "logcov": logcov, "dopt": dopt, "status": status,
+                    "targets": targets, "stride": stride, "key": recon_key,
+                }
+
+            res3 = st.session_state.get("results_3d")
+            if res3 is None:
+                st.info("Build a measurement sequence, then press **Reconstruct slices**.")
+            else:
+                if res3["key"] != recon_key:
+                    st.warning("Parameters or the sequence changed since this stack was "
+                               "solved — press **Reconstruct slices** again to refresh it.")
+                solved = [k2 for k2 in res3["targets"]
+                          if not str(res3["status"][k2]).startswith(("failed", "not solved"))]
+                failed = [k2 for k2 in res3["targets"]
+                          if str(res3["status"][k2]).startswith("failed")]
+                if not solved:
+                    st.error("Every slice failed — nothing to stack. See the status table "
+                             "below; a geometry with too few rays starves the sensitivity step.")
+                else:
+                    if failed:
+                        st.warning("%d of %d slices failed and are left empty in the stack: z = %s"
+                                   % (len(failed), len(res3["targets"]),
+                                      ", ".join(str(x) for x in failed)))
+                    # "Show" sits above the figure because it chooses what the figure IS.
+                    # Everything below the figure is *viewing* geometry and is deliberately
+                    # independent of it, so switching source back and forth to compare the
+                    # reconstruction against its variance leaves the view exactly as set.
+                    st.radio("Show", ("Reconstruction", "Variance"), key="live3d_recsrc",
+                             horizontal=True,
+                             help="'Variance' is the posterior log10 variance from k_aug — "
+                                  "where this geometry leaves the image uncertain.")
+
+                    if s["live3d_recsrc"] == "Variance":
+                        # -inf is a real output here: a pixel no ray constrains has exactly zero
+                        # variance. Drop those to NaN so they are simply absent rather than
+                        # dragging the colour ramp to negative infinity.
+                        vdata = np.where(np.isfinite(res3["logcov"]), res3["logcov"], np.nan)
+                        vcmap, vlabel = "Viridis", "Posterior log10 variance"
+                    else:
+                        vdata = res3["recon"]
+                        vcmap, vlabel = "Gray", "Stacked reconstruction"
+                    _fin = vdata[np.isfinite(vdata)]
+                    _lo, _hi = ((float(_fin.min()), float(_fin.max())) if _fin.size else (0.0, 1.0))
+                    _span = (_hi - _lo) or 1.0
+                    # Read before the widgets are built: these hold the live values either way,
+                    # since Streamlit applies widget state before re-running the script body.
+                    _p0, _p1 = s["live3d_recband_pct"]
+                    _isomin = _lo + _span * float(_p0) / 100.0
+                    _isomax = _lo + _span * float(_p1) / 100.0
+
+                    rv1, rv2 = st.columns([3, 2])
+                    with rv1:
+                        st.plotly_chart(
+                            _volume_figure(
+                                vdata, float(s["live3d_opacity"]), _isomin, _isomax,
+                                "%s — %d of %d slices" % (vlabel, len(solved), n_slices),
+                                vcmap, _hi,
+                                cut_axis=s["live3d_cutaxis"], cut_frac=float(s["live3d_cut"]),
+                                cmin=_lo,
+                            ),
+                            use_container_width=True,
+                        )
+                        st.caption("Range %.4g – %.4g; drawing %.4g – %.4g."
+                                   % (_lo, _hi, _isomin, _isomax))
+                    with rv2:
+                        finite = [(z, res3["dopt"][z]) for z in solved
+                                  if np.isfinite(res3["dopt"][z])]
+                        if finite:
+                            st.markdown("**D-optimality by slice**")
+                            st.line_chart(
+                                pd.DataFrame({"D-optimality": [v for _, v in finite]},
+                                             index=[z for z, _ in finite]),
+                                height=200,
+                            )
+                            st.caption("How well each depth is constrained by this geometry. "
+                                       "The 2.5D bundle is identical for every slice, so the "
+                                       "spread here is the phantom's, not the geometry's.")
+                        st.dataframe(
+                            pd.DataFrame({"z": res3["targets"],
+                                          "status": [res3["status"][z] for z in res3["targets"]],
+                                          "D-opt": [res3["dopt"][z] for z in res3["targets"]]}),
+                            use_container_width=True, hide_index=True, height=180,
+                        )
+
+                    # View controls, under the figure and spanning the full width rather than
+                    # squeezed into a quarter of it. Seeded from the canonical values
+                    # immediately before the widgets are built -- the last moment Streamlit
+                    # allows a widget key to be written, and late enough to pick up a change
+                    # made in the Volume view earlier in this same run.
+                    s["live3d_opacity_rec"] = float(s["live3d_opacity"])
+                    s["live3d_cutaxis_rec"] = s["live3d_cutaxis"]
+                    s["live3d_cut_rec"] = float(s["live3d_cut"])
+                    qc1, qc2, qc3, qc4 = st.columns(4)
+                    with qc1:
+                        st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity_rec",
+                                  on_change=_cb3d_sync_recview,
+                                  help="Shared with the Volume view — both track one value.")
+                    with qc2:
+                        st.slider("Visible range (%)", 0, 100, step=1,
+                                  key="live3d_recband_pct",
+                                  help="Band to draw, as a percentage of the current view's own "
+                                       "range. Percent rather than absolute because the two "
+                                       "views are not in the same units: attenuation runs 0-1 "
+                                       "and log10 variance is negative throughout, so one "
+                                       "setting keeps meaning the same thing across both.")
+                    with qc3:
+                        st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis_rec",
+                                     on_change=_cb3d_sync_recview,
+                                     help="Shared with the Volume view.")
+                    with qc4:
+                        st.slider("Cut amount", 0.0, 0.95, step=0.05, key="live3d_cut_rec",
+                                  on_change=_cb3d_sync_recview)
+                    zsel = st.slider("Inspect slice z", 0, max(n_slices - 1, 0),
+                                     key="live3d_recon_z")
+                    st.pyplot(
+                        _recon_slice_figure(vol0[:, :, zsel], res3["recon"][:, :, zsel],
+                                            res3["logcov"][:, :, zsel], zsel,
+                                            str(res3["status"][zsel])),
+                        use_container_width=True,
+                    )
+
     with mid3d:
         st.markdown("**Next measurement**")
         # The three bundle sliders live inside the component under the Slice picture (they have
@@ -1251,6 +1622,28 @@ def _render_3d_tab():
         st.number_input("beta", min_value=0.0, step=0.005, format="%.3f", key="live3d_beta")
 
     with right3d:
+        st.markdown("**Measurement Preset**")
+        pc1, pc2 = st.columns(2)
+        pc1.number_input("From (deg)", step=5.0, format="%.1f", key="live3d_preset_lo")
+        pc2.number_input("To (deg, exclusive)", step=5.0, format="%.1f", key="live3d_preset_hi")
+        st.slider("Number of measurements", 1, 60, step=1, key="live3d_preset_n")
+        _pre = _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
+                                 s["live3d_preset_n"])
+        # Show the actual angles: the exclusive upper bound is the one thing about this that
+        # can surprise, and a preview settles it without anyone having to read a tooltip.
+        st.caption(
+            "\u2192 %s   \u00b7   at offset **%.1f**, **%s**"
+            % (", ".join("%g\u00b0" % a for a in _pre[:8]) + (" \u2026" if len(_pre) > 8 else ""),
+               float(s["live3d_offset"]),
+               "full fan" if int(s["live3d_nbeams"]) == 0
+               else "%d beams" % int(s["live3d_nbeams"]))
+        )
+        pb1, pb2 = st.columns(2)
+        pb1.button("Generate", key="btn3d_preset_gen", on_click=_cb3d_preset, args=(True,),
+                   use_container_width=True, help="Replace the sequence with this sweep.")
+        pb2.button("Append", key="btn3d_preset_add", on_click=_cb3d_preset, args=(False,),
+                   use_container_width=True, help="Add this sweep to the existing sequence.")
+
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
         total0 = float(vol0.sum())
