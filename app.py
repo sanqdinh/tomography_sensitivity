@@ -471,6 +471,8 @@ for _k, _v in {
     "live3d_showbeams": True,
     # Per-slice reconstruction (Reconstruct sub-tab). tv_weight matches the 2D default.
     "live3d_tv_weight": 0.1, "live3d_recon_stride": 1, "live3d_recon_z": 0,
+    # Measurement preset: evenly spaced angles over [lo, hi).
+    "live3d_preset_lo": 0.0, "live3d_preset_hi": 180.0, "live3d_preset_n": 9,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -572,6 +574,35 @@ def _cb3d_step():
         }]
     )
     s["beam_table_3d"] = pd.concat([s["beam_table_3d"], new_row], ignore_index=True)
+
+
+def _preset_angles_3d(lo: float, hi: float, n: int) -> list:
+    """``n`` evenly spaced angles over **[lo, hi)** — the upper bound is exclusive.
+
+    Exclusive because a projection at 180 deg traces the same line as one at 0 deg, so an
+    inclusive sweep would spend a measurement re-measuring the start. This is also what makes
+    the obvious case come out right: 0 to 180 in 3 gives 0, 60, 120 rather than 0, 90, 180.
+    """
+    n = max(int(n), 1)
+    return [float(a) for a in np.linspace(float(lo), float(hi), n, endpoint=False)]
+
+
+def _cb3d_preset(replace: bool):
+    """Fill the 3D sequence with an evenly spaced angular sweep.
+
+    Offset and beam count come from the current aim, so the preset sweeps *this* bundle through
+    the angles rather than inventing a geometry of its own.
+    """
+    s = st.session_state
+    rows = pd.DataFrame(
+        [{"angle_deg": a,
+          "offset": float(s["live3d_offset"]),
+          "n_beams": int(s["live3d_nbeams"])}
+         for a in _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
+                                    s["live3d_preset_n"])]
+    )
+    s["beam_table_3d"] = (rows if replace
+                          else pd.concat([s["beam_table_3d"], rows], ignore_index=True))
 
 
 def _cb3d_reset():
@@ -1490,6 +1521,28 @@ def _render_3d_tab():
         st.number_input("beta", min_value=0.0, step=0.005, format="%.3f", key="live3d_beta")
 
     with right3d:
+        st.markdown("**Measurement Preset**")
+        pc1, pc2 = st.columns(2)
+        pc1.number_input("From (deg)", step=5.0, format="%.1f", key="live3d_preset_lo")
+        pc2.number_input("To (deg, exclusive)", step=5.0, format="%.1f", key="live3d_preset_hi")
+        st.slider("Number of measurements", 1, 60, step=1, key="live3d_preset_n")
+        _pre = _preset_angles_3d(s["live3d_preset_lo"], s["live3d_preset_hi"],
+                                 s["live3d_preset_n"])
+        # Show the actual angles: the exclusive upper bound is the one thing about this that
+        # can surprise, and a preview settles it without anyone having to read a tooltip.
+        st.caption(
+            "\u2192 %s   \u00b7   at offset **%.1f**, **%s**"
+            % (", ".join("%g\u00b0" % a for a in _pre[:8]) + (" \u2026" if len(_pre) > 8 else ""),
+               float(s["live3d_offset"]),
+               "full fan" if int(s["live3d_nbeams"]) == 0
+               else "%d beams" % int(s["live3d_nbeams"]))
+        )
+        pb1, pb2 = st.columns(2)
+        pb1.button("Generate", key="btn3d_preset_gen", on_click=_cb3d_preset, args=(True,),
+                   use_container_width=True, help="Replace the sequence with this sweep.")
+        pb2.button("Append", key="btn3d_preset_add", on_click=_cb3d_preset, args=(False,),
+                   use_container_width=True, help="Add this sweep to the existing sequence.")
+
         st.markdown("**Measurement sequence**")
         st.dataframe(s["beam_table_3d"], use_container_width=True, hide_index=False)
         total0 = float(vol0.sum())
