@@ -711,6 +711,8 @@ class V2UQResults:
     n_cons: int = 0
     uq_error: Optional[str] = None
     uq_conditioning: float = float("nan")   # cond(J J^T); large is expected, see CLAUDE.md
+    courant: float = float("nan")           # max|dx|/dx over the run -- how much moved at all
+    rg_pct: float = float("nan")            # contraction of the true field, % change in Rg
     mass_true: float = float("nan")
     mass_hat: float = float("nan")
 
@@ -763,6 +765,19 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     m.tv_expression = _tv_expression(m, theta_scale) / (n_pix * max(theta_scale, 1e-30))
     m.obj = pyo.Objective(expr=m.fit_expression + tv_weight * m.tv_expression)
     return m
+
+
+def _rg_pct(theta, f_final) -> float:
+    """Percent change in radius of gyration -- the contraction the transport actually produced.
+
+    Reported because it qualifies everything else: if the mechanics barely moved the field, a
+    comparison of exact against frozen transport is a comparison in a regime where there was
+    nothing much to freeze.  Read against the c_cp = 0 baseline, not against zero (the decay
+    fades the field non-uniformly, so c_cp = 0 already registers a contraction).
+    """
+    from degrade_v2 import radius_of_gyration
+    r0 = radius_of_gyration(theta)
+    return float(100.0 * (radius_of_gyration(f_final) - r0) / r0) if r0 else float("nan")
 
 
 def _phantom(image_res: int, override=None):
@@ -880,6 +895,8 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
         theta_true=theta, theta_hat=theta_hat, f_final_true=f_true, f_final_hat=f_hat,
         Q_final_hat=Q_hat, inverse_status=status, inverse_linear_solver=ls1,
         continuation_status=cont_status,
+        courant=float(max(i.courant for i in infos)),
+        rg_pct=_rg_pct(theta, f_true),
         obs_rms=float(np.sqrt(np.mean(np.square(resid)))),
         theta_rms=float(np.sqrt(np.mean((theta_hat - theta) ** 2))),
         forward_residual=fwd_resid, n_measurements=len(seq), n_rays=n_rays,

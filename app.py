@@ -2103,6 +2103,18 @@ def _render_2d_v2_tab():
                100.0 * out.theta_rms / max(float(out.theta_true.max()), 1e-30),
                "%.6g" % out.d_optimality if out.d_optimality == out.d_optimality else "n/a",
                "{:,}".format(out.n_vars), "{:,}".format(out.n_cons), out.forward_residual))
+        # How much the mechanics actually did. Without this the exact/frozen choice looks like a
+        # free lunch: they agree to four figures whenever the transport barely moved anything,
+        # which is most of the default parameter range.
+        st.caption(
+            "Transport this run: Courant **%.3f**, radius of gyration **%+.2f%%**, mass left "
+            "**%.3f** (simulated) vs **%.3f** (reconstructed). If the first two are near zero "
+            "the mechanics did almost nothing, and **Frozen mechanics** will agree with the "
+            "exact coupling because there was little to freeze \u2014 not because freezing is "
+            "free in general."
+            % (out.courant, out.rg_pct,
+               out.mass_true / max(float(out.theta_true.sum()), 1e-30),
+               out.mass_hat / max(float(out.theta_true.sum()), 1e-30)))
         if out.uq_error:
             st.warning("Sensitivity step failed, reconstruction kept: %s" % out.uq_error)
         st.pyplot(_v2_recon_figure(out), use_container_width=True)
