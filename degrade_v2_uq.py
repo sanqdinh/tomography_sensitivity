@@ -357,6 +357,84 @@ def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
     return m
 
 
+# --- a check against the SPEC, not against a sibling implementation --------------------------
+
+def reference_local_intensity(f, r, angle_rad, I0, c_q):
+    """eq:xd_local_intensity and eq:xd_dose_state, written from the spec alone.
+
+    The spec says the ray "crosses pixels p_1, p_2, ... IN TRAVERSAL ORDER with chord lengths
+    delta_{p_i}" and sums over ``m < i``: upstream material shields downstream material, and a
+    pixel never shields itself.  So: walk the SEGMENTS in travel order; the pixel owning chord
+    ``s`` is ``rows[s]``; deposit there; then let it shield everything after it.
+
+    This exists because agreeing with :mod:`degrade_v2` to 1e-16 proves only that two
+    implementations share a convention -- including a wrong one.  The manuscript records exactly
+    that failure mode for its own ordering test ("easy to write so that it passes vacuously").
+    None of the three structural invariants in ``degrade_v2.check_invariants`` can catch a
+    misplaced deposit, because all three are self-consistency properties of the composition and
+    none of them asks which pixel the dose landed in.  This one does.
+    """
+    f = np.asarray(f, dtype=float)
+    res = f.shape[0]
+    dQ = np.zeros_like(f)
+    I_sum = np.zeros_like(f)
+    g = ray_geometry(float(r), float(angle_rad), res, res)
+    if g is None:
+        return dQ, I_sum
+    rows, cols, seg, forward = g
+    n_seg = len(seg)
+    shield = 0.0
+    for s in (range(n_seg) if forward else range(n_seg - 1, -1, -1)):
+        local = I0 * np.exp(-shield)
+        pix = (int(rows[s]), int(cols[s]))
+        dQ[pix] += c_q * local * seg[s]
+        I_sum[pix] += local
+        shield += seg[s] * f[pix]
+    return dQ, I_sum
+
+
+def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool = False):
+    """Compare ``degrade_v2.accumulate_dose`` against :func:`reference_local_intensity`.
+
+    Reports forward-ordered and antiparallel rays separately, because that is where they differ.
+    ``strict=True`` asserts both agree; it is off by default while the discrepancy below is an
+    open decision rather than a settled bug (see the module docstring).
+    """
+    from degrade_v2 import accumulate_dose
+
+    rng = np.random.default_rng(7)
+    res = int(image_res)
+    f = rng.random((res, res)) * 0.4          # non-uniform: a symmetric object hides the defect
+    worst = {"forward": 0.0, "antiparallel": 0.0}
+    count = {"forward": 0, "antiparallel": 0}
+    for ang_deg in np.arange(0.0, 360.0, 15.0):
+        ang = float(np.deg2rad(ang_deg))
+        for r in bundle_r_values(0.0, 0, res):
+            g = ray_geometry(float(r), ang, res, res)
+            if g is None:
+                continue
+            key = "forward" if g[3] else "antiparallel"
+            _dq_r, I_ref = reference_local_intensity(f, r, ang, 1.0, 1.0)
+            _dq_c, I_code = accumulate_dose(f, [r], ang, 1.0, 1.0)
+            worst[key] = max(worst[key], float(np.abs(I_ref - I_code).max()))
+            count[key] += 1
+    if verbose:
+        print("eq:xd_local_intensity -- accumulate_dose against a reference from the spec alone")
+        for k in ("forward", "antiparallel"):
+            print("    %-13s rays: max |I_p(code) - I_p(spec)| = %.3e   over %d rays"
+                  % (k, worst[k], count[k]))
+        if worst["antiparallel"] > 1e-12:
+            print("    ^ antiparallel rays disagree. On those the deposit lands on rows[i] while")
+            print("      the chord just added to the shielding belongs to rows[i-1], so each pixel")
+            print("      is shielded by its own chord. dose_response.degradation_dose_response has")
+            print("      the same split, so the 2D live picture and the 3D simulator share it.")
+    assert worst["forward"] < 1e-12, "forward rays disagree with the spec -- that is a new bug"
+    if strict:
+        assert worst["antiparallel"] < 1e-12, (
+            "antiparallel rays disagree with eq:xd_local_intensity by %.3e" % worst["antiparallel"])
+    return worst
+
+
 # --- pinning the model to a numpy trajectory -------------------------------------------------
 
 def numpy_trajectory(theta, seq, p: V2Params, image_res: int, solver=None):
