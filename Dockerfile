@@ -58,7 +58,7 @@ COPY senDOE/ ./senDOE/
 COPY .streamlit/ ./.streamlit/
 COPY live_sim_component/ ./live_sim_component/
 COPY volume_sim_component/ ./volume_sim_component/
-COPY tomography_uq.py tomography_3d.py dose_response.py degrade_v2.py app.py ./
+COPY tomography_uq.py tomography_3d.py dose_response.py degrade_v2.py degrade_v2_uq.py app.py ./
 
 # 6b) Materialize plotly.min.js for the 3D Volume component from THIS image's plotly, so the
 #     browser-side bundle always matches the figure JSON the app emits. app.py does the same copy
@@ -81,6 +81,10 @@ assert v.shape==(16,16,4) and d.sum()<v.sum(); print('3D degradation sim OK')" \
     && python3 -c "import degrade_v2; \
 degrade_v2.check_invariants(image_res=48, n_steps=4, verbose=False); \
 print('v2 damage-model invariants OK')" \
+    && python3 -c "import degrade_v2_uq; \
+r=degrade_v2_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
+print('v2 Pyomo model == numpy model: residual %.1e, forward %.1e rel' \
+      % (r['residual'], r['f_err_rel']))" \
     && python3 -c "import pyomo.environ as pyo; \
 m=pyo.ConcreteModel(); m.x=pyo.Var(initialize=1.0); \
 m.c=pyo.Constraint(expr=m.x>=2.0); m.o=pyo.Objective(expr=(m.x-3.0)**2); \

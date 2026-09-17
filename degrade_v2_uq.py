@@ -119,9 +119,13 @@ def measurement_rays(seq, image_res: int):
 
 # --- model ---------------------------------------------------------------------------------
 
+class NonDifferentiableModel(ValueError):
+    """Raised when the requested settings would hand IPOPT a derivative that does not exist."""
+
+
 def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
                    reference_density=None, f_bounds=None, freeze_mechanics=False,
-                   frozen_velocity=None):
+                   frozen_velocity=None, allow_nondifferentiable=False):
     """Steps 1-11 of section 3.2 as a Pyomo model.  ``theta_ref`` seeds every variable.
 
     ``reference_density`` is what ``K``/``B`` are assembled from (see the module docstring);
@@ -145,10 +149,23 @@ def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
     solver = ElasticSolver(dens, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
     transport = (p.c_cp != 0.0)          # spec off switch: c_cp = 0 => dx = 0 => no flux
 
+    # eq:xd_upwind with no smoothing is sqrt(v^2) = |v|, and IPOPT says so in as many words
+    # ("Error evaluating constraint N: can't evaluate sqrt'(0)") the moment any face is at rest.
+    # The numpy simulator is fine with it -- it never differentiates -- which is exactly why the
+    # tab defaults to 0 and the NLP cannot.  Caught here rather than in the solver log.
+    differentiable = (not transport) or p.eps_rel > 0.0 or p.eps_up > 0.0
+    if not differentiable and not allow_nondifferentiable:
+        raise NonDifferentiableModel(
+            "eps_up = eps_rel = 0 with c_cp = %g: eq:xd_upwind reduces to |v|, which has no "
+            "derivative at v = 0, so this model cannot be solved. Set eps_rel > 0 (1e-3 is the "
+            "spec's value, and leaves the collapse and the I0 = 0 identity exact -- see "
+            "degrade_v2.check_invariants), or set c_cp = 0 to switch transport off." % p.c_cp)
+
     m = pyo.ConcreteModel(name="degrade_v2")
     m.res, m.n_steps, m.meas = res, K, meas
     m.p, m.elastic = p, solver
     m.transport, m.frozen = transport, bool(freeze_mechanics)
+    m.differentiable = differentiable
 
     # --- state ------------------------------------------------------------------------
     m.PIX = pyo.RangeSet(0, npix - 1)
@@ -323,23 +340,42 @@ def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
 
 # --- pinning the model to a numpy trajectory -------------------------------------------------
 
-def numpy_trajectory(theta, seq, p: V2Params, image_res: int):
+def numpy_trajectory(theta, seq, p: V2Params, image_res: int, solver=None):
     """Everything the Pyomo model has a variable for, computed by :mod:`degrade_v2`.
 
     Returns a dict of arrays keyed like the model's variables.  Used to pin the model for the
     residual check, to initialise it for a solve, and as the answer the forward solve is
     compared against.
+
+    With ``solver`` left ``None`` this runs :func:`degrade_v2.simulate` unmodified -- which is
+    the point, since the whole value of the cross-check is that the two implementations are
+    independent.  Passing an :class:`ElasticSolver` instead steps the model by hand with *that*
+    stiffness: needed only to initialise an inverse solve, where ``K`` is assembled from the
+    reference density and not from the current guess, so a trajectory built the other way would
+    start infeasible in the elasticity rows.
     """
-    from degrade_v2 import accumulate_dose, omega as _omega
+    from degrade_v2 import accumulate_dose, omega as _omega, step as _step
 
     theta = np.asarray(theta, dtype=float)
     res = int(image_res)
     meas = measurement_rays(seq, res)
     K = len(meas)
-    solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
-
-    _f, _Q, infos, obs, (f_hist, Q_hist) = simulate(
-        theta, seq, p, res, record_observations=True, record_trajectory=True)
+    if solver is None:
+        solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
+        _f, _Q, infos, obs, (f_hist, Q_hist) = simulate(
+            theta, seq, p, res, record_observations=True, record_trajectory=True)
+    else:
+        fk, Qk = theta.copy(), np.zeros_like(theta)
+        f_hist, Q_hist, obs, infos = [fk.copy()], [Qk.copy()], [], []
+        for (angle_deg, offset, n_beams) in seq:
+            ang = float(np.deg2rad(float(angle_deg)))
+            rs = bundle_r_values(float(offset), int(n_beams), res)
+            from dose_response import ray_line_integral as _rli
+            obs.append(np.array([_rli(fk, r, ang) for r in rs]))
+            fk, Qk, info = _step(fk, Qk, rs, ang, p, solver)
+            f_hist.append(fk.copy())
+            Q_hist.append(Qk.copy())
+            infos.append(info)
 
     S, Ipix, dW, U, EPS = {}, np.zeros((res * res, K)), np.zeros((res * res, K)), [], []
     for k, (ang, rays) in enumerate(meas):
@@ -449,11 +485,33 @@ def solve_with_fallback(model, *, linear_solver="ma27", max_iter=3000, tol=1e-8,
             res = _solve_streaming(_make_solver(name, max_iter, tol, options), model, tee,
                                    log_callback)
             return res, name
-        except Exception as exc:                       # solver missing / failed to launch
+        except Exception as exc:
+            text = str(exc)
+            if _is_model_error(text):
+                # IPOPT launched and rejected the *problem*.  Retrying it on ma57 and mumps
+                # would fail identically and report "no usable linear solver", which sends the
+                # reader hunting for a missing binary that is sitting right there.
+                raise RuntimeError(_curate(text)) from exc
             last = exc
             if log_callback:
-                log_callback("\n[linear solver %r unavailable: %s]\n" % (name, exc))
+                log_callback("\n[linear solver %r unavailable: %s]\n" % (name, text[:200]))
     raise RuntimeError("no usable IPOPT linear solver (tried %s): %s" % (order, last))
+
+
+def _is_model_error(text: str) -> bool:
+    """Did IPOPT start and object to the model, rather than fail to start?"""
+    return ("can't evaluate" in text or "Error evaluating" in text
+            or "Invalid number" in text)
+
+
+def _curate(text: str) -> str:
+    if "sqrt'(0)" in text:
+        return ("IPOPT could not differentiate eq:xd_upwind: \"can't evaluate sqrt'(0)\". "
+                "The upwind split is |v| when the smoothing is zero, and some face is at rest. "
+                "Set eps_rel > 0 (the spec's relative form, 1e-3), or c_cp = 0 to switch "
+                "transport off.")
+    first = [ln for ln in text.splitlines() if "valuat" in ln]
+    return "IPOPT rejected the model: %s" % (first[0].strip() if first else text[:300])
 
 
 def _solve_streaming(solver, model, tee, log_callback):
@@ -515,7 +573,7 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
         % (res, res, n_steps, c_cp, eps_rel, ", clamped" if clamp_bottom else ""))
 
     traj = numpy_trajectory(theta, seq, p, res)
-    m = build_v2_model(theta, seq, p, res)
+    m = build_v2_model(theta, seq, p, res, allow_nondifferentiable=True)
     n_v = sum(1 for _ in m.component_data_objects(pyo.Var))
     n_c = sum(1 for _ in m.component_data_objects(pyo.Constraint, active=True))
     say("    %d variables, %d constraints" % (n_v, n_c))
@@ -530,6 +588,12 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
     assert worst < 1e-10, "the Pyomo model does not reproduce the numpy trajectory: %s" % where
 
     if not solve:
+        return out
+    if not m.differentiable:
+        # Not a failure of the transcription: the residual above is exact.  This setting simply
+        # cannot be handed to a solver, which is the whole reason eps_rel exists.
+        out["forward_status"] = "skipped (not differentiable)"
+        say("    forward solve  SKIPPED: eps_up = eps_rel = 0 gives |v|, no derivative at rest")
         return out
 
     # --- forward solve --------------------------------------------------------------
@@ -680,12 +744,19 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
         m.y_data[k, j].set_value(float(y_data[k][j]))
         m.y_data[k, j].fix()
 
-    # Residual scale: the fit term and the TV term must be comparable or one of them is decor.
-    w = 1.0 / max(theta_scale, 1e-30) ** 2
+    # Both terms are normalised to O(1) before they are weighed against each other.  v1 gets
+    # away without this because its image runs 0..1.1 and its ray integrals are O(10), so the
+    # two land within an order of magnitude by luck.  Here theta peaks near 0.03 while the ray
+    # integrals are still O(1) -- optical depth is the product of the two -- so raw sums put the
+    # fit ~1e3 above TV and tv_weight would be decoration.  Normalising also makes tv_weight
+    # mean roughly the same thing as it does on the other two tabs.
+    y_scale = max(float(np.max([np.max(np.abs(y)) for y in y_data])), 1e-30)
+    n_obs = len(m.obs_index)
+    n_pix = m.res * m.res
     m.fit_expression = sum(
-        (m.S[k, j, n] - m.y_data[k, j]) ** 2 for (k, j, n) in m.obs_index)
-    m.tv_expression = _tv_expression(m, theta_scale)
-    m.obj = pyo.Objective(expr=w * m.fit_expression + tv_weight * w * m.tv_expression)
+        (m.S[k, j, n] - m.y_data[k, j]) ** 2 for (k, j, n) in m.obs_index) / (n_obs * y_scale ** 2)
+    m.tv_expression = _tv_expression(m, theta_scale) / (n_pix * max(theta_scale, 1e-30))
+    m.obj = pyo.Objective(expr=m.fit_expression + tv_weight * m.tv_expression)
     return m
 
 
@@ -766,11 +837,13 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
 
     # --- the full inverse solve ----------------------------------------------------------
     say("Building the v2 estimation NLP...\n")
+    # K comes from the reference density (see the module docstring), so both the initialisation
+    # trajectory and any frozen velocities must be stepped with that same stiffness.
+    solver_ref = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
+    t0 = numpy_trajectory(theta0, seq, p, res, solver=solver_ref)
     frozen = None
     if params.freeze_mechanics:
-        t0 = numpy_trajectory(theta0, seq, p, res)
-        solver0 = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
-        frozen = [solver0.solve(t0["dw"][:, k].reshape(res, res), p.c_cp)
+        frozen = [solver_ref.solve(t0["dw"][:, k].reshape(res, res), p.c_cp)
                   for k in range(len(seq))]
 
     m = build_v2_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale),
@@ -778,7 +851,7 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
     # Start on a trajectory that actually satisfies the dynamics, so IPOPT begins feasible in
     # every constraint and only the fit is wrong.  v1 starts every pixel at 0.01, which violates
     # its own dynamic constraints from iteration zero.
-    pin_model(m, numpy_trajectory(theta0, seq, p, res), fix=False)
+    pin_model(m, t0, fix=False)
     for q in m.PIX:
         m.Q[q, 0].fix(0.0)
     add_estimation_objective(m, y_true, params.tv_weight, scale)
