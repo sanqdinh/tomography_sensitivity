@@ -83,8 +83,8 @@ degrade_v2.check_invariants(image_res=48, n_steps=4, verbose=False); \
 print('v2 damage-model invariants OK')" \
     && python3 -c "import degrade_v2_uq; \
 r=degrade_v2_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
-print('v2 Pyomo model == numpy model: residual %.1e, forward %.1e rel' \
-      % (r['residual'], r['f_err_rel']))" \
+print('v2 Pyomo model == numpy model: residual %.1e, forward %.1e rel, photon balance %.1e' \
+      % (r['residual'], r['f_err_rel'], r['photon_balance']))" \
     && python3 -c "import pyomo.environ as pyo; \
 m=pyo.ConcreteModel(); m.x=pyo.Var(initialize=1.0); \
 m.c=pyo.Constraint(expr=m.x>=2.0); m.o=pyo.Objective(expr=(m.x-3.0)**2); \

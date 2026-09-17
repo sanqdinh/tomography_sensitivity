@@ -191,10 +191,18 @@ def accumulate_dose(f, r_values, angle_rad: float, I0: float, c_q: float):
         shielding = 0.0
         for i in indices:
             local = I0 * np.exp(-shielding)          # I_p, before this pixel attenuates anything
-            seg = i if forward else i - 1            # chord within pixel i, in travel order
+            seg = i if forward else i - 1            # chord traversed on leaving crossing i
             if 0 <= seg < n_seg:
-                dQ[rows[i], cols[i]] += c_q * local * seg_lengths[seg]
-                I_sum[rows[i], cols[i]] += local
+                # Deposit into the pixel that OWNS this chord, which is rows[seg] -- not rows[i].
+                # eq:xd_dose_state is Q_{k+1,p} = Q_{k,p} + c_q I_p delta_p: the deposit pixel and
+                # the chord's owner are the same symbol p, in one line. They coincide on forward
+                # rays (seg == i) and differ by one when travel runs against the vendored
+                # ascending-(x, y) crossing order, where depositing into rows[i] made every pixel
+                # shield ITSELF -- the chord added below belonged to the pixel written next.
+                # Forward rays are bit-identical to before; only antiparallel rays move.
+                dst = i if forward else seg
+                dQ[rows[dst], cols[dst]] += c_q * local * seg_lengths[seg]
+                I_sum[rows[dst], cols[dst]] += local
                 shielding += radon[seg]
             # the last pixel in travel order has no chord in the vendored convention -> no dose
     return dQ, I_sum

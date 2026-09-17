@@ -115,10 +115,24 @@ def degradation_dose_response(image, r, theta, I0, alpha, beta):
     indices = range(n) if forward else range(n - 1, -1, -1)
     dose = 0.0
     for i in indices:
-        local = I0 * np.exp(-dose)
-        out[rows[i], cols[i]] = values[i] * np.exp(-alpha * local - beta * local**2)
         seg = i if forward else i - 1  # segment crossed to reach the next pixel in travel order
-        if 0 <= seg < len(radon):
+        valid = 0 <= seg < len(radon)
+        # Degrade the pixel that OWNS the chord about to be traversed. On forward rays seg == i,
+        # so this is unchanged (including the tail at i = n-1, which owns no chord and is still
+        # degraded, preserving this function's long-standing convention). On antiparallel rays
+        # the owner is rows[seg] = rows[i-1], and writing rows[i] instead made every pixel shield
+        # itself -- the chord added below belonged to the pixel written on the NEXT iteration.
+        # The i = 0 tail is skipped there because rows[0] has already been written as the owner
+        # of segment 0, and rewriting it with its own chord included is exactly the defect.
+        if forward:
+            dst = i
+        elif valid:
+            dst = seg
+        else:
+            continue
+        local = I0 * np.exp(-dose)
+        out[rows[dst], cols[dst]] = values[dst] * np.exp(-alpha * local - beta * local**2)
+        if valid:
             dose += radon[seg]
     return out
 

@@ -114,9 +114,13 @@ def ray_walk(r: float, angle_rad: float, res: int):
     n, n_seg = len(rows), len(seg)
     walk = []
     for i in (range(n) if forward else range(n - 1, -1, -1)):
-        s = i if forward else i - 1          # chord within pixel i, in travel order
+        s = i if forward else i - 1          # chord traversed on leaving crossing i
         if 0 <= s < n_seg:
-            walk.append((int(rows[i]) * res + int(cols[i]),        # receives the dose
+            # Deposit pixel and shielding pixel are BOTH the chord's owner, rows[s]: that is
+            # eq:xd_dose_state, where they are the same symbol p. They are kept as separate
+            # fields only because the constraint builder reads them separately.
+            dst = i if forward else s
+            walk.append((int(rows[dst]) * res + int(cols[dst]),    # receives the dose
                          float(seg[s]),                            # chord for that dose
                          int(rows[s]) * res + int(cols[s])))       # shields the rest of the ray
     return walk or None
@@ -420,12 +424,14 @@ def reference_local_intensity(f, r, angle_rad, I0, c_q):
     return dQ, I_sum
 
 
-def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool = False):
+def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool = True):
     """Compare ``degrade_v2.accumulate_dose`` against :func:`reference_local_intensity`.
 
     Reports forward-ordered and antiparallel rays separately, because that is where they differ.
-    ``strict=True`` asserts both agree; it is off by default while the discrepancy below is an
-    open decision rather than a settled bug (see the module docstring).
+    Both families are asserted.  They did not always agree: antiparallel rays were out by a
+    full ``I0`` until the deposit index was fixed, because each pixel was shielded by its own
+    chord.  This is the check that found it, and the only kind that could -- see the note in the
+    module docstring on why agreeing with a sibling implementation cannot.
     """
     from degrade_v2 import accumulate_dose
 
@@ -458,7 +464,9 @@ def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool
     assert worst["forward"] < 1e-12, "forward rays disagree with the spec -- that is a new bug"
     if strict:
         assert worst["antiparallel"] < 1e-12, (
-            "antiparallel rays disagree with eq:xd_local_intensity by %.3e" % worst["antiparallel"])
+            "antiparallel rays disagree with eq:xd_local_intensity by %.3e -- the deposit index "
+            "regressed: eq:xd_dose_state puts the deposit pixel and the chord owner at the same "
+            "symbol p, so deposit into rows[s], not rows[i]" % worst["antiparallel"])
     return worst
 
 
@@ -716,6 +724,11 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
 
     say("v2 Pyomo model vs degrade_v2.simulate   [%dx%d, %d steps, c_cp=%.2f, eps_rel=%g%s]"
         % (res, res, n_steps, c_cp, eps_rel, ", clamped" if clamp_bottom else ""))
+
+    pb = check_photon_balance(image_res=min(res, 16), verbose=False)
+    out["photon_balance"] = max(pb.values())
+    say("    eq:xd_local_intensity vs a reference from the spec: %.3e (both ray families)"
+        % out["photon_balance"])
 
     traj = numpy_trajectory(theta, seq, p, res)
     m = build_v2_model(theta, seq, p, res, allow_nondifferentiable=True)
