@@ -148,7 +148,21 @@ def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
 
     dens = theta_ref if reference_density is None else np.asarray(reference_density, float)
     solver = ElasticSolver(dens, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
-    transport = (p.c_cp != 0.0)          # spec off switch: c_cp = 0 => dx = 0 => no flux
+
+    # The transport block is dropped whenever the flow is identically zero, which is BOTH of the
+    # spec's nested off switches, not just one of them:
+    #   c_cp = 0  -- "the eigenstrain vanishes, so Delta x = 0 and every flux with it"
+    #   I0   = 0  -- "M = id": no fluence, so no dose, no dw, no eigenstrain, no displacement
+    # Dropping it is faithful (the fluxes really are zero), and it is also the only way to keep
+    # the model differentiable there.  The relative smoothing of eq:xd_upwind is
+    # eps_up^2 = eps_rel^2 * mean|Delta x|^2, so it vanishes WITH the flow -- which is the
+    # property that restores the exact collapse, and the price is that sqrt(v^2 + eps_up^2)
+    # becomes a norm of Delta x and has no derivative at Delta x = 0.  A constant eps_up did not
+    # have that failure mode (it paid in resting diffusion instead), so this is a genuine
+    # trade-off the spec presents as a clean win and is not one.  Measured: with I0 = 0 and
+    # c_cp = 0.3 left in the transport block, IPOPT dies with
+    # "Error evaluating ... can't evaluate sqrt'(0)".
+    transport = (p.c_cp != 0.0) and (p.I0 != 0.0)
 
     # eq:xd_upwind with no smoothing is sqrt(v^2) = |v|, and IPOPT says so in as many words
     # ("Error evaluating constraint N: can't evaluate sqrt'(0)") the moment any face is at rest.
@@ -504,41 +518,62 @@ def solve_with_fallback(model, *, linear_solver="ma27", max_iter=3000, tol=1e-8,
 
 
 def _is_model_error(text: str) -> bool:
-    """Did IPOPT start and object to the model, rather than fail to start?"""
+    """Did IPOPT start and object to the model, rather than fail to start?
+
+    Any of these means the binary ran: retrying on another linear solver fails identically and
+    reports a missing binary that is sitting right there.
+    """
     return ("can't evaluate" in text or "Error evaluating" in text
-            or "Invalid number" in text)
+            or "Invalid number" in text or "Ipopt " in text
+            or "too few degrees of freedom" in text)
 
 
 def _curate(text: str) -> str:
     if "sqrt'(0)" in text:
         return ("IPOPT could not differentiate eq:xd_upwind: \"can't evaluate sqrt'(0)\". "
-                "The upwind split is |v| when the smoothing is zero, and some face is at rest. "
-                "Set eps_rel > 0 (the spec's relative form, 1e-3), or c_cp = 0 to switch "
-                "transport off.")
+                "Some face is at rest and the smoothing there is zero, so the upwind split is "
+                "|v|. The relative smoothing eps_up^2 = eps_rel^2*mean|dx|^2 vanishes with the "
+                "flow by design, so raising eps_rel does NOT fix a field that is identically "
+                "motionless -- set eps_up > 0 (a constant, which does not vanish) or switch "
+                "transport off with c_cp = 0.")
     first = [ln for ln in text.splitlines() if "valuat" in ln]
     return "IPOPT rejected the model: %s" % (first[0].strip() if first else text[:300])
 
 
 def _solve_streaming(solver, model, tee, log_callback):
-    """``solver.solve(tee=True)`` with the subprocess log forwarded to ``log_callback``."""
-    if log_callback is None:
-        return solver.solve(model, tee=tee)
+    """``solver.solve(tee=True)`` with the subprocess log forwarded to ``log_callback``.
+
+    The log is ALWAYS captured, even with no ``log_callback``.  Pyomo's ``tee=False`` buries the
+    solver's stdout in a temp file it then deletes, and raises only "Solver (ipopt) did not exit
+    normally" -- so a model IPOPT explicitly rejected ("can't evaluate sqrt'(0)") became
+    indistinguishable from a missing binary, and :func:`solve_with_fallback` walked the whole
+    linear-solver chain and blamed the linear solver.  Capturing it means the reason survives
+    into the exception.
+    """
     try:
         from pyomo.common.tee import capture_output
     except Exception:
         return solver.solve(model, tee=tee)
 
+    buf = []
+
     class _W:
         def write(self, chunk):
             if chunk:
-                log_callback(chunk)
+                buf.append(chunk)
+                if log_callback is not None:
+                    log_callback(chunk)
             return len(chunk)
 
         def flush(self):
             pass
 
-    with capture_output(_W()):
-        return solver.solve(model, tee=True)
+    try:
+        with capture_output(_W()):
+            return solver.solve(model, tee=True)
+    except Exception as exc:
+        tail = "".join(buf)[-4000:]
+        raise RuntimeError("%s\n--- solver log ---\n%s" % (exc, tail)) from exc
 
 
 # --- the gate: does the Pyomo model reproduce the numpy forward model? -----------------------
