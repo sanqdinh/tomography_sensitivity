@@ -27,7 +27,13 @@ implements are 1-10, the dynamics map ``M``:
     by instantaneous local fluence rather than accumulated dose, with no floor.  eq:xd_decay.
 10. mass balance     ``f_next = ftilde - sum_q F[ftilde]``.  eq:xd_mass_transport.
 
-Steps 11 (observation) and 12 (constraints) belong to the estimation NLP, not here.
+11. observation      ``y_k = C_v^loc f_k`` -- the ray integrals of the field as it stood at the
+    *start* of step k, with ``H = I`` (the cheap variant of eq:xd_obs_damage, which inflates the
+    noise covariance instead of smoothing the detector).  Off by default: pass
+    ``record_observations=True`` to :func:`simulate`.  This is what :mod:`degrade_v2_uq`
+    reconstructs from.
+
+Step 12 (the box and budget constraints) belongs to the estimation NLP, not here.
 
 **Step 9 runs before step 10, and the order is not cosmetic.** The mechanism is easy to state
 wrongly, so precisely: the *unweighted* flux sum is zero in every case, whatever the ordering --
@@ -57,10 +63,17 @@ Discretisation choices that differ from the manuscript's scratch reference, and 
   inequality constraints of the estimation NLP, and step 12 says explicitly that clipping inside
   the forward map destroys both the conservation and the collapse.  Violations are reported in
   :class:`StepInfo` instead.
-* **``eps_up`` is the constant of eq:xd_upwind, and defaults to zero here.**  The spec's relative
-  form ``eps_up = eps_rel*||dx_k||`` vanishes with the flow; the constant form does not, and at
-  ``v = 0`` still passes ``0.5*eps*(f_p - f_q)`` across every face.  Zero is exact and is what the
-  spec endorses for a simulator doing no sensitivity extraction.
+* **``eps_up`` is the constant of eq:xd_upwind and defaults to zero; ``eps_rel`` is the spec's
+  relative form and is what the NLP needs.**  A constant ``eps_up`` does not vanish with the
+  flow: at ``v = 0`` it still passes ``0.5*eps*(f_p - f_q)`` across every face, which breaks both
+  the collapse and the ``I0 = 0`` identity.  Zero is exact, and is what the spec endorses for a
+  simulator doing no sensitivity extraction -- but ``sqrt(v^2)`` is not differentiable at ``v =
+  0``, so an NLP cannot use it.  ``eps_rel > 0`` selects ``eps_up^2 = eps_rel^2 * mean(|dx_k|^2)``
+  instead, which is smooth, vanishes exactly where the flow does, and is grid independent (the
+  RMS, so ``eps_rel`` is relative to a *typical* displacement rather than growing with the pixel
+  count).  It is carried as ``eps_up^2`` throughout and never square-rooted, because
+  eq:xd_upwind only ever needs the square -- and the square is a polynomial in ``dx_k``, where
+  the root would reintroduce a kink at rest.
 
 Tuning note
 -----------
@@ -95,7 +108,11 @@ class V2Params:
     # conserves mass exactly. b is kept at 0 -- see (M1) in the note on fractionation.
     a: float = 0.05
     b: float = 0.0
-    eps_up: float = 0.0      # upwind smoothing; 0 is exact (see the module docstring)
+    eps_up: float = 0.0      # absolute upwind smoothing; 0 is exact (see the module docstring)
+    eps_rel: float = 0.0     # relative smoothing, eq:xd_upwind's flow-scaled form. > 0 REPLACES
+                             # eps_up with eps_rel*||dx_k||_rms, which vanishes with the flow.
+                             # Needed only by the estimation NLP, which cannot differentiate
+                             # sqrt(v^2) at v = 0; leave at 0 for forward simulation.
     E0: float = 1.0          # modulus of the undamaged matrix
     nu: float = 0.3          # Poisson ratio
     e_min_ratio: float = 1e-6  # ersatz soft background, E_min/E_0, so the free surface needs no
@@ -120,6 +137,7 @@ class StepInfo:
     q_max: float          # largest accumulated dose anywhere
     f_min: float          # most negative f, if the transport overshot
     energy_max: float     # max of the algebraic energy density E = f*Q
+    eps_sq: float = 0.0   # the eq:xd_upwind smoothing actually used this step, squared
 
 
 def omega(Q, omega_inf: float, Q_c: float):
@@ -270,7 +288,7 @@ class ElasticSolver:
         return cx, cy
 
 
-def upwind_flux_divergence(f, vx, vy, dx: float, eps_up: float):
+def upwind_flux_divergence(f, vx, vy, dx: float, eps_up: float, eps_sq=None):
     """``sum_q F_{p->q}`` with antisymmetric face fluxes and a smoothed upwind split.
 
     The split ``v_pm = 0.5*(sqrt(v^2 + eps^2) +- v)`` is smooth in ``v``, where the plain
@@ -282,11 +300,17 @@ def upwind_flux_divergence(f, vx, vy, dx: float, eps_up: float):
     than ``0``, so a stationary field still sees a flux ``0.5*eps*(f_L - f_R)``.  That is an
     ``O(eps)`` numerical diffusion across any gradient, and it is why the exact collapse holds
     only at ``eps_up = 0``; see :func:`check_invariants`.
+
+    ``eps_sq`` overrides ``eps_up ** 2`` when given.  The relative form of eq:xd_upwind is
+    naturally a *square* (``eps_rel^2 * mean|dx|^2``), and passing it as one avoids a
+    square-root-then-square round trip -- which matters because the root has a kink at rest and
+    the square does not.
     """
     f = np.asarray(f, dtype=float)
+    e2 = eps_up ** 2 if eps_sq is None else float(eps_sq)
 
     def split(v):
-        s = np.sqrt(v ** 2 + eps_up ** 2)
+        s = np.sqrt(v ** 2 + e2)
         return 0.5 * (s + v), 0.5 * (s - v)
 
     # faces normal to x, between column j and j+1
@@ -323,8 +347,16 @@ def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver,
     dw = 1.0 - omega(Q_next, p.omega_inf, p.Q_c) / omega(Q, p.omega_inf, p.Q_c)
     dx_x, dx_y = solver.solve(dw, p.c_cp)                            # 6, 7 -> displacement
 
+    # eq:xd_upwind's smoothing, carried squared.  The relative form is scaled to the flow, so it
+    # is exactly 0 wherever dx_k is -- which is what restores the collapse and the I0 = 0
+    # identity that a constant eps_up leaks (see check_invariants).
+    if p.eps_rel > 0.0:
+        eps_sq = p.eps_rel ** 2 * float(np.mean(dx_x ** 2 + dx_y ** 2))
+    else:
+        eps_sq = p.eps_up ** 2
+
     if _decay_last:                                                  # deliberately wrong order
-        moved = f - upwind_flux_divergence(f, dx_x, dx_y, p.dx, p.eps_up)
+        moved = f - upwind_flux_divergence(f, dx_x, dx_y, p.dx, p.eps_up, eps_sq)
         f_next = moved * p.decay_factor(I_p)
         # Deliberately measured the same way as the correct branch: the decay loss of the field
         # as it stood at the START of the step. Transport telescopes in either order, so a loss
@@ -337,7 +369,7 @@ def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver,
         # the transport moves no mass at all; the entire change in the total is the decay.
         f_tilde = f * p.decay_factor(I_p)
         lost = float(f.sum() - f_tilde.sum())
-        f_next = f_tilde - upwind_flux_divergence(f_tilde, dx_x, dx_y, p.dx, p.eps_up)
+        f_next = f_tilde - upwind_flux_divergence(f_tilde, dx_x, dx_y, p.dx, p.eps_up, eps_sq)
 
     info = StepInfo(
         courant=float(np.sqrt(dx_x ** 2 + dx_y ** 2).max() / p.dx),
@@ -347,28 +379,53 @@ def step(f, Q, r_values, angle_rad: float, p: V2Params, solver: ElasticSolver,
         q_max=float(Q_next.max()),
         f_min=float(f_next.min()),
         energy_max=float((f_next * Q_next).max()),
+        eps_sq=float(eps_sq),
     )
     return f_next, Q_next, info
 
 
-def simulate(theta, seq, p: V2Params, image_res: int, _decay_last: bool = False):
+def simulate(theta, seq, p: V2Params, image_res: int, _decay_last: bool = False,
+             record_observations: bool = False, record_trajectory: bool = False):
     """Run a measurement sequence from the undamaged field ``theta``.
 
     ``seq`` is the app's ``_table_to_seq`` output -- ``(angle_deg, offset, n_beams)`` triples.
     Returns ``(f, Q, infos)``: the final attenuation field, the accumulated dose, and one
     :class:`StepInfo` per step.  The stiffness is factored once, from ``theta``.
+
+    ``record_observations`` appends a fourth return value: step 11, one 1-D array of ray
+    integrals per measurement, aligned with that step's ``bundle_r_values``.  Each is read off
+    the field as it stood at the **start** of the step, which is the same ``f_k`` the photon
+    balance of step 1 integrates -- so the observation and the shielding can never disagree.
+    It is ragged across steps, since a bundle near the edge loses rays to the ``|r|`` clamp.
+
+    ``record_trajectory`` appends the whole ``(f_k, Q_k)`` history, ``k = 0..K``, as two lists.
+    Nothing in the app needs it; :mod:`degrade_v2_uq` does, to check its Pyomo transcription of
+    these same equations against this one.
     """
     theta = np.asarray(theta, dtype=float)
     f = theta.copy()
     Q = np.zeros_like(f)
     solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
     infos = []
+    obs = []
+    f_hist, Q_hist = [f.copy()], [Q.copy()]
     for angle_deg, offset, n_beams in seq:
+        angle_rad = np.deg2rad(float(angle_deg))
         r_values = bundle_r_values(float(offset), int(n_beams), int(image_res))
-        f, Q, info = step(f, Q, r_values, np.deg2rad(float(angle_deg)), p, solver,
-                          _decay_last=_decay_last)
+        if record_observations:
+            # Step 11, taken BEFORE the step updates the field: y_k = C_v^loc f_k.
+            obs.append(np.array([ray_line_integral(f, r, angle_rad) for r in r_values]))
+        f, Q, info = step(f, Q, r_values, angle_rad, p, solver, _decay_last=_decay_last)
         infos.append(info)
-    return f, Q, infos
+        if record_trajectory:
+            f_hist.append(f.copy())
+            Q_hist.append(Q.copy())
+    out = [f, Q, infos]
+    if record_observations:
+        out.append(obs)
+    if record_trajectory:
+        out.append((f_hist, Q_hist))
+    return tuple(out)
 
 
 def peak_optical_depth(theta, image_res: int, n_angles: int = 12) -> float:
@@ -425,6 +482,20 @@ def radius_of_gyration(f) -> float:
 # Three properties the model must have.  There is no test suite in this repo (see CLAUDE.md),
 # so this is the verification path, in the same "run the module" style as tomography_3d.py.
 
+# The three settings of eq:xd_upwind's smoothing, and which of them (b) and (c) hold exactly
+# for.  The constant form is the odd one out: it does not vanish with the flow, so it leaks a
+# resting diffusion into corners where nothing should be moving at all.
+_SMOOTHINGS = (
+    ("eps_up = 0 (exact)", dict(eps_up=0.0)),
+    ("eps_up = 1e-6 (const)", dict(eps_up=1e-6)),
+    ("eps_rel = 1e-3 (flow)", dict(eps_rel=1e-3)),
+)
+_SUFFIX = {"eps_up = 0 (exact)": "", "eps_up = 1e-6 (const)": "_eps",
+           "eps_rel = 1e-3 (flow)": "_rel"}
+_EXACT = {"eps_up = 0 (exact)": True, "eps_up = 1e-6 (const)": False,
+          "eps_rel = 1e-3 (flow)": True}
+
+
 def _demo_sequence(n_steps: int = 12):
     """Evenly spaced full-fan projections -- the sequence the manuscript's checks use."""
     return tuple((180.0 * i / n_steps, 0.0, 0) for i in range(n_steps))
@@ -457,9 +528,13 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     (c) **``I0 = 0`` gives ``M = id``.**  No fluence, so no dose, no response, no eigenstrain,
         no decay, no transport.
 
-    (b) and (c) are exact only at ``eps_up = 0``: the constant smoothing of eq:xd_upwind gives
-    ``v_+ = v_- = eps/2`` at ``v = 0``, so a motionless field still exchanges
-    ``0.5*eps*(f_p - f_q)`` across every face.  Both are checked at 0 and reported at 1e-6.
+    (b) and (c) are exact at ``eps_up = 0`` and, as the spec predicts, at any ``eps_rel`` --
+    but *not* at a constant ``eps_up``, which gives ``v_+ = v_- = eps/2`` at ``v = 0``, so a
+    motionless field still exchanges ``0.5*eps*(f_p - f_q)`` across every face.  All three are
+    run: the constant form is reported (it leaks ~3e-7) and the other two are asserted exact.
+    That matters because the estimation NLP cannot use ``eps_up = 0`` -- ``sqrt(v^2)`` has no
+    derivative at ``v = 0`` -- so ``eps_rel`` is the only setting that is both differentiable
+    and faithful, and this is what establishes it.
     """
     from skimage.data import shepp_logan_phantom
     from skimage.transform import resize
@@ -508,8 +583,8 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
 
     # (b) collapse to the composed v1 decay at c_cp = 0 ---------------------------------
     say("(b) collapse to f_K = f_0*exp(-a*sum I - b*sum I^2)   [c_cp = 0]")
-    for eps in (0.0, 1e-6):
-        p = V2Params(a=0.05, b=0.01, c_cp=0.0, eps_up=eps)
+    for tag, smooth in _SMOOTHINGS:
+        p = V2Params(a=0.05, b=0.01, c_cp=0.0, **smooth)
         solver = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
         f_ref, Q_ref = theta.copy(), np.zeros_like(theta)
         sum_I, sum_I2 = np.zeros_like(theta), np.zeros_like(theta)
@@ -521,25 +596,22 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
             f_ref, Q_ref, _ = step(f_ref, Q_ref, rs, np.deg2rad(angle_deg), p, solver)
         closed = theta * np.exp(-p.a * sum_I - p.b * sum_I2)
         err = float(np.abs(f_ref - closed).max())
-        say("    eps_up=%-7g  max|f_K - closed form| = %.3e" % (eps, err))
-        if eps == 0.0:
-            out["collapse"] = err
-            assert err < 1e-12, "c_cp = 0 does not reduce to the composed decay"
-        else:
-            out["collapse_eps"] = err
+        say("    %-22s max|f_K - closed form| = %.3e" % (tag, err))
+        out["collapse" + _SUFFIX[tag]] = err
+        if _EXACT[tag]:
+            assert err < 1e-12, (
+                "c_cp = 0 does not reduce to the composed decay at %s" % tag)
 
     # (c) I0 = 0 is the identity ---------------------------------------------------------
     say("(c) I0 = 0 gives M = identity")
-    for eps in (0.0, 1e-6):
-        p = V2Params(I0=0.0, a=0.05, c_cp=0.8, eps_up=eps)
+    for tag, smooth in _SMOOTHINGS:
+        p = V2Params(I0=0.0, a=0.05, c_cp=0.8, **smooth)
         f, Q, _ = simulate(theta, seq, p, image_res)
         err = float(np.abs(f - theta).max())
-        say("    eps_up=%-7g  max|f - theta| = %.3e   max Q = %.3e" % (eps, err, Q.max()))
-        if eps == 0.0:
-            out["identity"] = err
-            assert err == 0.0, "I0 = 0 is not the identity"
-        else:
-            out["identity_eps"] = err
+        say("    %-22s max|f - theta| = %.3e   max Q = %.3e" % (tag, err, Q.max()))
+        out["identity" + _SUFFIX[tag]] = err
+        if _EXACT[tag]:
+            assert err == 0.0, "I0 = 0 is not the identity at %s" % tag
 
     say("all invariants hold")
     return out
