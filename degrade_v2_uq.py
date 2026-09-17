@@ -430,8 +430,16 @@ def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool
     Reports forward-ordered and antiparallel rays separately, because that is where they differ.
     Both families are asserted.  They did not always agree: antiparallel rays were out by a
     full ``I0`` until the deposit index was fixed, because each pixel was shielded by its own
-    chord.  This is the check that found it, and the only kind that could -- see the note in the
-    module docstring on why agreeing with a sibling implementation cannot.
+    chord.  This is the check that found it.
+
+    **What it does NOT certify, and this is the honest limit of it.**  The reference calls
+    :func:`dose_response.ray_geometry` for its crossing list, so it is independent of
+    ``accumulate_dose`` only in the *walk* -- the travel order and the deposit index.  It shares
+    the underlying chord/pixel attribution and is therefore blind to any error in it.  There is
+    one: see :func:`check_chord_attribution`.  The lesson in the module docstring applies to this
+    function too, one level down, which is worth saying plainly rather than leaving for someone
+    to discover: a reference is only independent along the axes on which it does not reuse the
+    thing it checks.
     """
     from degrade_v2 import accumulate_dose
 
@@ -468,6 +476,67 @@ def check_photon_balance(image_res: int = 12, verbose: bool = True, strict: bool
             "regressed: eq:xd_dose_state puts the deposit pixel and the chord owner at the same "
             "symbol p, so deposit into rows[s], not rows[i]" % worst["antiparallel"])
     return worst
+
+
+def check_chord_attribution(image_res: int = 32, verbose: bool = True, strict: bool = False):
+    """Is each chord attributed to the pixel that actually CONTAINS it?
+
+    Independent of the crossing-point convention, because the ground truth is the pixel holding
+    the segment's own MIDPOINT -- a segment lies in exactly one pixel, and its midpoint is
+    interior, so there is no boundary ambiguity to resolve.
+
+    The vendored ``line_grid_intersections`` instead labels each segment with the pixel at its
+    *starting crossing*, via ``col = int(x + w/2)``, ``row = int(h/2 - y)``.  Sorted ascending in
+    ``(x, y)``, that names the correct pixel only when the line has negative slope.  For positive
+    slope -- ``theta`` roughly in ``(90, 180)`` degrees, plus the axis-aligned cases -- the row is
+    off by one, so the chord is charged to a neighbour.
+
+    Measured: 0% mis-attributed on negative-slope rays, 20-100% on positive-slope ones, rising as
+    the ray approaches axis-aligned.  The *line integral* barely notices (0.31% against 0.46%
+    mean error on an analytic disc, both discretisation-level), so sinograms are essentially
+    unaffected; what moves is WHERE the dose lands.  At 135 degrees the per-pixel intensity field
+    differs from the corrected one by 52% of its own peak, while the full 12-projection Rg moves
+    by 0.01 percentage points -- the same signature as the deposit-index defect, a large per-ray
+    error that averages out over a scan.
+
+    ``strict`` is off: the fix belongs in :func:`dose_response.ray_geometry` (the vendored file
+    must not be edited), and it would move the 2D picture, the 3D simulator and
+    ``check_reference_numbers``, while NOT moving v1's Pyomo path, which calls
+    ``line_grid_intersections`` directly.  That is a decision, not a cleanup.
+    """
+    from senDOE.helpers.geometry import get_line_abc_from_r_theta, line_grid_intersections
+
+    n = int(image_res)
+    by_slope = {"negative": [0, 0], "positive": [0, 0]}
+    for ang_deg in np.arange(0.0, 360.0, 7.5):
+        th = float(np.deg2rad(ang_deg))
+        a, b, c = get_line_abc_from_r_theta(0.5, th)
+        try:
+            cross, pix, _r, seg = line_grid_intersections(
+                a, b, c, np.zeros((n, n)), x_range=[-n / 2, n / 2], y_range=[-n / 2, n / 2])
+        except IndexError:
+            continue
+        st, ct = np.sin(th), np.cos(th)
+        key = "positive" if (abs(st) < 1e-9 or abs(ct) < 1e-9 or (-ct / st) > 0) else "negative"
+        for sgi in range(len(seg)):
+            (x0, y0), (x1, y1) = cross[sgi], cross[sgi + 1]
+            mx, my = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+            ct_ = min(max(int(mx + n / 2), 0), n - 1)
+            rt_ = min(max(int(n / 2 - my), 0), n - 1)
+            by_slope[key][1] += 1
+            if (int(pix[sgi, 0]), int(pix[sgi, 1])) != (rt_, ct_):
+                by_slope[key][0] += 1
+    out = {k: (v[0] / v[1] if v[1] else 0.0) for k, v in by_slope.items()}
+    if verbose:
+        print("chord attribution -- is each chord charged to the pixel containing it?")
+        for k in ("negative", "positive"):
+            print("    %-9s-slope rays: %d of %d mis-attributed (%.1f%%)"
+                  % (k, by_slope[k][0], by_slope[k][1], 100 * out[k]))
+    assert out["negative"] < 1e-12, "negative-slope rays regressed -- that is a new bug"
+    if strict:
+        assert out["positive"] < 1e-12, (
+            "positive-slope rays mis-attribute %.1f%% of chords" % (100 * out["positive"]))
+    return out
 
 
 # --- pinning the model to a numpy trajectory -------------------------------------------------
