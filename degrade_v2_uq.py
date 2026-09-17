@@ -162,8 +162,12 @@ def build_v2_model(theta_ref, seq, p: V2Params, image_res: int, *,
             "degrade_v2.check_invariants), or set c_cp = 0 to switch transport off." % p.c_cp)
 
     m = pyo.ConcreteModel(name="degrade_v2")
+    # Plain attributes only.  k_aug clones the model, and an ElasticSolver carries a SuperLU
+    # factorisation that cannot be deep-copied -- stashing it here made every sensitivity
+    # extraction print "Unable to clone Pyomo component attribute", which looks like a failure
+    # and is not one.  Nothing downstream needs the solver object anyway.
     m.res, m.n_steps, m.meas = res, K, meas
-    m.p, m.elastic = p, solver
+    m.p = p
     m.transport, m.frozen = transport, bool(freeze_mechanics)
     m.differentiable = differentiable
 
@@ -706,6 +710,7 @@ class V2UQResults:
     n_vars: int = 0
     n_cons: int = 0
     uq_error: Optional[str] = None
+    uq_conditioning: float = float("nan")   # cond(J J^T); large is expected, see CLAUDE.md
     mass_true: float = float("nan")
     mass_hat: float = float("nan")
 
@@ -895,6 +900,12 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
             J = np.asarray(J, dtype=float)
             if not np.all(np.isfinite(J)):
                 raise ValueError("k_aug returned a non-finite sensitivity matrix")
+            # k_aug prints "Could not fix the accuracy of the problem ... results might be
+            # incorrect" when it cannot drive the KKT residual ratio below 1e-10, which this
+            # model routinely trips.  That is a caveat on the covariance, not a failure -- the
+            # covariance here is rank deficient on purpose -- but it must not scroll past
+            # unremarked, so it is carried on the result.
+            out.uq_conditioning = float(np.linalg.cond(J @ J.T)) if J.shape[0] <= 2048 else float("nan")
             cov = params.noise_cov_scale * (J @ J.T)
             with np.errstate(divide="ignore", invalid="ignore"):
                 out.log_cov_diag_2D = np.log10(np.diag(cov)).reshape(res, res)
