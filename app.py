@@ -2039,14 +2039,23 @@ def _render_2d_v2_tab():
                 % (n_all, "" if n_all == 1 else "s", _nrays, res, res,
                    "frozen-mechanics" if s["v2_freeze"] else "exact"))
             if not s["v2_freeze"]:
+                # Measured on the dev box at 4 measurements: 42.7 s at grid 12, 124.7 s at 16,
+                # 529.1 s at 20. The exponent in pixel count ACCELERATES (1.86 then 3.25), so
+                # this is not a mild extrapolation -- grid 64 is hours to days, and ~239k
+                # variables is also an OOM risk on the 2 GB deploy VM. Frozen mechanics was
+                # 36x cheaper at grid 20 and returned the identical theta.
                 st.warning(
-                    "\u26a0\ufe0f The exact coupling puts the elasticity solve and every "
-                    "smoothed-upwind face flux inside the NLP \u2014 roughly %s variables at "
-                    "this grid and horizon. Expect a long solve. **Frozen mechanics** is the "
-                    "cheap route, and a coarser grid is not offered because below ~64 numerical "
-                    "diffusion eats the moving interface (assumption S4)."
+                    "\u26a0\ufe0f **The exact coupling is slow, and superlinearly so.** It puts "
+                    "the elasticity solve and every smoothed-upwind face flux inside the NLP "
+                    "\u2014 about **%s variables** here. Measured at 4 measurements: 43 s at "
+                    "grid 12, 125 s at 16, **529 s at 20**, with the exponent rising, so grid "
+                    "64 is hours to days and may exhaust memory. **Frozen mechanics** was 36x "
+                    "cheaper at grid 20 and returned the identical theta (it changes the "
+                    "D-optimality, not the estimate). For a long run use the CLI instead of a "
+                    "browser tab: `python3 degrade_v2_uq.py --reconstruct --image-res %d "
+                    "--n-steps %d -o out.npz`."
                     % ("{:,}".format(2 * res * res * (n_all + 1)
-                                     + 2 * (res + 1) ** 2 * n_all)))
+                                     + 2 * (res + 1) ** 2 * n_all), res, n_all))
 
     go_v2 = st.button("Reconstruct", type="primary", key="btn_v2_recon",
                       disabled=(n_all == 0), use_container_width=False)
