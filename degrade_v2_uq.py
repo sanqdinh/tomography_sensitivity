@@ -591,6 +591,19 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
     say("    residual   max |constraint| = %.3e   (%s)" % (worst, where))
     assert worst < 1e-10, "the Pyomo model does not reproduce the numpy trajectory: %s" % where
 
+    # ... and the same for the frozen-mechanics build, which swaps the elasticity block for
+    # precomputed velocities and so is a genuinely different set of constraints.
+    solver_f = ElasticSolver(theta, p.nu, p.E0, p.e_min_ratio, p.dx, p.clamp_bottom)
+    vel = [solver_f.solve(traj["dw"][:, k].reshape(res, res), p.c_cp) for k in range(n_steps)]
+    m_f = build_v2_model(theta, seq, p, res, freeze_mechanics=True, frozen_velocity=vel,
+                         allow_nondifferentiable=True)
+    pin_model(m_f, traj)
+    wf, wheref = max_residual(m_f)
+    out["residual_frozen"] = wf
+    say("    residual   max |constraint| = %.3e   (%s)   [frozen mechanics]" % (wf, wheref))
+    assert wf < 1e-10, "the frozen-mechanics model does not reproduce the trajectory: %s" % wheref
+    del m_f
+
     if not solve:
         return out
     if not m.differentiable:
