@@ -240,6 +240,7 @@ class ElasticSolver:
         self.ndof_total = 2 * nn * nn
 
         Ke, Le = _q1_matrices(dx, nu)
+        self._Ke = Ke
         self._Le = Le
 
         # element (i, j) == pixel (i, j); node (i, j) -> dofs 2*(i*nn+j), +1
@@ -260,6 +261,10 @@ class ElasticSolver:
         vals = (self._Ee[:, None] * Ke.ravel()[None, :]).ravel()
         K = sp.csc_matrix((vals, (rows, cols)),
                           shape=(self.ndof_total, self.ndof_total))
+        # Kept so :mod:`degrade_v2_uq` can write eq:xd_elastic_discrete as Pyomo rows off the
+        # *same* matrix this factorisation uses, rather than assembling a second copy that
+        # could drift from it.
+        self.K = K
 
         fixed = []
         if clamp_bottom:                                   # substrate: one edge pinned
@@ -272,13 +277,22 @@ class ElasticSolver:
         self._free = np.setdiff1d(np.arange(self.ndof_total), np.array(fixed, dtype=int))
         self._lu = spla.splu(K[self._free][:, self._free].tocsc())
 
-    def solve(self, dw, c_cp: float):
-        """Per-pixel displacement ``(ux, uy)`` driven by the damage eigenstrain."""
+    def solve_nodal(self, dw, c_cp: float):
+        """The raw nodal solution of ``K u = B dw``, length ``ndof_total``.
+
+        Split out of :meth:`solve` so :mod:`degrade_v2_uq` can pin its Pyomo ``u`` variables to
+        exactly what this solves, rather than to a second implementation of the same assembly.
+        """
         s = -0.5 * c_cp * np.asarray(dw, dtype=float).ravel()   # eigenstrain amplitude
         be = (self._Ee * s)[:, None] * self._Le[None, :]
         b = np.bincount(self._edof.ravel(), weights=be.ravel(), minlength=self.ndof_total)
         u = np.zeros(self.ndof_total)
         u[self._free] = self._lu.solve(b[self._free])
+        return u
+
+    def solve(self, dw, c_cp: float):
+        """Per-pixel displacement ``(ux, uy)`` driven by the damage eigenstrain."""
+        u = self.solve_nodal(dw, c_cp)
         nn = self.nn
         ux = u[0::2].reshape(nn, nn)
         uy = u[1::2].reshape(nn, nn)

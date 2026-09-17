@@ -68,6 +68,7 @@ from degrade_v2 import (
     scale_to_optical_depth,
     simulate as simulate_v2_seq,
 )
+from degrade_v2_uq import V2UQParams, run_v2_reconstruction
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -518,6 +519,11 @@ for _k, _v in {
     "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
     "v2_preset_lo": 0.0, "v2_preset_hi": 180.0, "v2_preset_n": 9,
     "v2_view_k": 0,
+    # Reconstruct. eps_rel is NOT a forward-simulation knob: the tab simulates at eps_up = 0,
+    # which is exact, but sqrt(v^2) has no derivative at v = 0 so the NLP cannot use it. See
+    # degrade_v2.check_invariants -- the relative form is the one that is both differentiable
+    # and leaves the collapse and the I0 = 0 identity exact.
+    "v2_tv_weight": 0.05, "v2_eps_rel": 1e-3, "v2_freeze": False, "v2_uq": True,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -604,6 +610,38 @@ def _recon_slice_figure(original, recon, logcov, k: int, status: str):
     if np.any(finite):
         err = float(np.nanmean(np.abs(recon - original)))
         axes[1].set_title("Reconstruction  (mean |err| %.4g)" % err, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def _v2_recon_figure(res):
+    """theta | reconstruction | error | log-variance, drawn from the stored arrays.
+
+    Four panels rather than the 2D tab's four *figures*: the v2 backend returns arrays, not
+    matplotlib Figures (the same choice _recon_slice_3d makes), so the layout is built here.
+    """
+    theta, hat = res.theta_true, res.theta_hat
+    err = hat - theta
+    span = max(float(np.abs(err).max()), 1e-12)
+    vmax = max(float(theta.max()), 1e-12)
+    panels = [
+        (theta, "theta (truth)", "gray", dict(vmin=0.0, vmax=vmax)),
+        (hat, "theta reconstructed", "gray", dict(vmin=0.0, vmax=vmax)),
+        (err, "error (hat - truth)", "coolwarm", dict(vmin=-span, vmax=span)),
+    ]
+    if res.log_cov_diag_2D is not None:
+        lc = np.where(np.isfinite(res.log_cov_diag_2D), res.log_cov_diag_2D, np.nan)
+        panels.append((lc, "log10 posterior variance", "viridis", {}))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
+    axes = np.atleast_1d(axes)
+    for ax, (img, ttl, cmap, kw) in zip(axes, panels):
+        if not np.any(np.isfinite(img)):
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center", transform=ax.transAxes)
+        else:
+            im = ax.imshow(img, cmap=cmap, interpolation="nearest", **kw)
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_title(ttl, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout()
     return fig
 
@@ -1946,6 +1984,133 @@ def _render_2d_v2_tab():
         )
         if float(s["v2_I0"]) == 0.0:
             st.info("I0 = 0: the step map is the identity, so the sample stays undamaged.")
+
+    # --- Reconstruct ------------------------------------------------------------------
+    # Appended below the live layout rather than given a sub-tab, mirroring the 2D tab. The
+    # solve runs the WHOLE table however far the view is scrubbed back -- same invariant as the
+    # other two Reconstruct surfaces (see _nav_block).
+    st.divider()
+    st.subheader("Reconstruct")
+    st.caption(
+        "Estimate the undamaged reference field **theta = f_0** from the projections, by "
+        "solving the v2 dynamics backwards. The measurements come from the numpy simulator "
+        "above; the NLP is an independent Pyomo transcription of the same ten steps, and it is "
+        "re-checked against the simulator on your geometry before every solve."
+    )
+
+    rc = st.columns([1, 1, 2])
+    with rc[0]:
+        st.slider("TV weight", 0.0, 1.0, step=0.01, key="v2_tv_weight",
+                  help="Total-variation regularisation on theta, the same dial the other two "
+                       "tabs have.")
+    with rc[1]:
+        st.checkbox("Sensitivity / UQ", key="v2_uq",
+                    help="k_aug extracts d(theta)/d(y) -- eq:xd_composed_jacobian -- giving the "
+                         "posterior covariance map and D-optimality. Non-fatal: if it fails "
+                         "(the covariance is intentionally rank deficient, and a starved "
+                         "geometry can make it singular) the reconstruction is still returned.")
+        st.checkbox("Frozen mechanics", key="v2_freeze",
+                    help="Take the displacement field from a numpy pre-pass and hold it fixed, "
+                         "instead of solving K dx = B dw inside the NLP. This is the "
+                         "manuscript's named 'frozen-transport approximation' -- much cheaper, "
+                         "and an untested open item. Off = the exact coupling.")
+    with rc[2]:
+        if not n_all:
+            st.caption("Take at least one measurement first.")
+        else:
+            _nrays = sum(len(_bundle_r_values(o, nb, res)) for (_a, o, nb) in seq_all)
+            st.caption(
+                "**%d** measurement%s \u00b7 %d rays \u00b7 grid %d\u00d7%d \u00b7 "
+                "%s coupling."
+                % (n_all, "" if n_all == 1 else "s", _nrays, res, res,
+                   "frozen-mechanics" if s["v2_freeze"] else "exact"))
+            if not s["v2_freeze"]:
+                st.warning(
+                    "\u26a0\ufe0f The exact coupling puts the elasticity solve and every "
+                    "smoothed-upwind face flux inside the NLP \u2014 roughly %s variables at "
+                    "this grid and horizon. Expect a long solve. **Frozen mechanics** is the "
+                    "cheap route, and a coarser grid is not offered because below ~64 numerical "
+                    "diffusion eats the moving interface (assumption S4)."
+                    % ("{:,}".format(2 * res * res * (n_all + 1)
+                                     + 2 * (res + 1) ** 2 * n_all)))
+
+    go_v2 = st.button("Reconstruct", type="primary", key="btn_v2_recon",
+                      disabled=(n_all == 0), use_container_width=False)
+
+    # Signature of everything the answer depends on, stored with it: a stale result is reported
+    # rather than silently shown. Same guard the 3D stack uses.
+    v2_key = (seq_all, res, float(s["v2_depth"]), float(s["v2_I0"]), float(s["v2_c_q"]),
+              float(s["v2_Q_c"]), float(s["v2_omega_inf"]), float(s["v2_c_cp"]),
+              float(s["v2_a"]), float(s["v2_b"]), float(s["v2_E0"]), float(s["v2_nu"]),
+              bool(s["v2_clamp"]), float(s["v2_tv_weight"]), float(s["v2_eps_rel"]),
+              bool(s["v2_freeze"]), bool(s["v2_uq"]))
+
+    if go_v2:
+        log_box = st.empty()
+        log_lines: list[str] = []
+        _last = [0.0]
+
+        def _render_v2_log() -> None:
+            body = _html.escape("".join(log_lines)[-8000:])
+            log_box.empty()
+            with log_box.container():
+                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+
+        def _v2_log(chunk: str) -> None:
+            log_lines.append(chunk)
+            now = time.time()
+            if now - _last[0] >= 0.2:
+                _last[0] = now
+                _render_v2_log()
+
+        params_v2 = V2UQParams(
+            image_res=res, optical_depth=float(s["v2_depth"]), beam_steps=seq_all,
+            I0=float(s["v2_I0"]), c_q=float(s["v2_c_q"]), Q_c=float(s["v2_Q_c"]),
+            omega_inf=float(s["v2_omega_inf"]), c_cp=float(s["v2_c_cp"]),
+            a=float(s["v2_a"]), b=float(s["v2_b"]), E0=float(s["v2_E0"]),
+            nu=float(s["v2_nu"]), clamp_bottom=bool(s["v2_clamp"]),
+            eps_rel=float(s["v2_eps_rel"]), tv_weight=float(s["v2_tv_weight"]),
+            freeze_mechanics=bool(s["v2_freeze"]), run_uq=bool(s["v2_uq"]),
+        )
+        with st.spinner("Solving the v2 estimation NLP\u2026"):
+            try:
+                out = run_v2_reconstruction(params_v2, log_callback=_v2_log)
+                st.session_state["results_v2"] = {"res": out, "key": v2_key}
+            except RuntimeError as exc:   # curated (model-drift gate, no usable linear solver)
+                st.session_state.pop("results_v2", None)
+                st.error(str(exc))
+            except Exception as exc:
+                st.session_state.pop("results_v2", None)
+                st.error("Reconstruct failed: %s" % exc)
+                st.exception(exc)
+            finally:
+                _render_v2_log()
+
+    stash = st.session_state.get("results_v2")
+    if stash is None:
+        st.info("Build a measurement sequence, then press **Reconstruct**.")
+    else:
+        out = stash["res"]
+        if stash["key"] != v2_key:
+            st.warning("Parameters or the sequence changed since this was solved \u2014 press "
+                       "**Reconstruct** again to refresh it.")
+        st.success(
+            "inverse: **%s** (%s) \u00b7 continuation: %s \u00b7 fit RMS **%.3g** \u00b7 "
+            "theta RMS error **%.3g** (%.2f%% of peak) \u00b7 D-optimality **%s** \u00b7 "
+            "%s vars / %s cons \u00b7 model-vs-simulator residual %.1e"
+            % (out.inverse_status, out.inverse_linear_solver, out.continuation_status,
+               out.obs_rms, out.theta_rms,
+               100.0 * out.theta_rms / max(float(out.theta_true.max()), 1e-30),
+               "%.6g" % out.d_optimality if out.d_optimality == out.d_optimality else "n/a",
+               "{:,}".format(out.n_vars), "{:,}".format(out.n_cons), out.forward_residual))
+        if out.uq_error:
+            st.warning("Sensitivity step failed, reconstruction kept: %s" % out.uq_error)
+        st.pyplot(_v2_recon_figure(out), use_container_width=True)
+        st.caption(
+            "**theta RMS error** is available only because the data is synthetic \u2014 it is "
+            "the estimator scored against the truth it was generated from, not something a real "
+            "experiment could report. **Fit RMS** is the residual the NLP actually minimised."
+        )
 
 
 # --- three modes, three tabs ----------------------------------------------------------
