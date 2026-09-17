@@ -66,6 +66,7 @@ Transcription notes, where a choice had to be made
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -648,8 +649,6 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
     return out
 
 
-if __name__ == "__main__":
-    check_forward(image_res=24, n_steps=3)
 
 
 # --- reconstruction ---------------------------------------------------------------------------
@@ -948,3 +947,72 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
             out.uq_error = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0][:200])
             say("    UQ failed (reconstruction kept): %s\n" % out.uq_error)
     return out
+
+
+def _cli(argv=None):
+    """``python3 degrade_v2_uq.py`` checks the model; ``--reconstruct`` runs one.
+
+    The headless route exists because the exact coupling at the v2 tab's own grid is a long
+    solve -- see CLAUDE.md for measured numbers -- and a browser session will not sit through
+    it. Results land in an .npz the app does not need to be running to produce.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--reconstruct", action="store_true",
+                    help="run a reconstruction instead of the model check")
+    ap.add_argument("--image-res", type=int, default=24)
+    ap.add_argument("--n-steps", type=int, default=3)
+    ap.add_argument("--I0", type=float, default=1.0)
+    ap.add_argument("--c-cp", type=float, default=0.3)
+    ap.add_argument("--tv-weight", type=float, default=0.05)
+    ap.add_argument("--eps-rel", type=float, default=1e-3)
+    ap.add_argument("--freeze-mechanics", action="store_true")
+    ap.add_argument("--no-uq", action="store_true")
+    ap.add_argument("--max-iter", type=int, default=3000)
+    ap.add_argument("-o", "--out", default=None, help="write results to this .npz")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    if not a.reconstruct:
+        check_forward(image_res=a.image_res, n_steps=a.n_steps, c_cp=a.c_cp,
+                      eps_rel=a.eps_rel, verbose=not a.quiet)
+        return 0
+
+    import time
+    params = V2UQParams(
+        image_res=a.image_res,
+        beam_steps=tuple((180.0 * i / a.n_steps, 0.0, 0) for i in range(a.n_steps)),
+        I0=a.I0, c_cp=a.c_cp, tv_weight=a.tv_weight, eps_rel=a.eps_rel,
+        freeze_mechanics=a.freeze_mechanics, run_uq=not a.no_uq, ipopt_max_iter=a.max_iter)
+    t0 = time.time()
+    cb = None if a.quiet else (lambda chunk: (sys.stdout.write(chunk), sys.stdout.flush()))
+    r = run_v2_reconstruction(params, log_callback=cb)
+    dt = time.time() - t0
+    print("\n%dx%d, %d measurements, %s coupling, %.1f s"
+          % (a.image_res, a.image_res, a.n_steps,
+             "frozen" if a.freeze_mechanics else "exact", dt))
+    print("  model vs simulator  %.2e" % r.forward_residual)
+    print("  inverse             %s (%s), continuation %s"
+          % (r.inverse_status, r.inverse_linear_solver, r.continuation_status))
+    print("  size                %d vars / %d cons" % (r.n_vars, r.n_cons))
+    print("  fit RMS             %.4e" % r.obs_rms)
+    print("  theta RMS error     %.4e  (%.2f%% of peak)"
+          % (r.theta_rms, 100.0 * r.theta_rms / float(r.theta_true.max())))
+    print("  transport           Courant %.3f, Rg %+.2f%%, mass left %.4f"
+          % (r.courant, r.rg_pct, r.mass_true / float(r.theta_true.sum())))
+    print("  D-optimality        %s%s"
+          % (r.d_optimality, "" if not r.uq_error else "   UQ failed: " + r.uq_error))
+    if a.out:
+        np.savez_compressed(
+            a.out, theta_true=r.theta_true, theta_hat=r.theta_hat,
+            f_final_true=r.f_final_true, f_final_hat=r.f_final_hat, Q_final_hat=r.Q_final_hat,
+            log_cov_diag_2D=(r.log_cov_diag_2D if r.log_cov_diag_2D is not None
+                             else np.zeros(0)),
+            d_optimality=r.d_optimality, obs_rms=r.obs_rms, theta_rms=r.theta_rms,
+            seconds=dt)
+        print("  wrote               %s" % a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())
