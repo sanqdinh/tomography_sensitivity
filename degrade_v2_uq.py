@@ -67,8 +67,8 @@ Transcription notes, where a choice had to be made
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pyomo.environ as pyo
