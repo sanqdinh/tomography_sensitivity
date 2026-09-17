@@ -46,6 +46,14 @@ Transcription notes, where a choice had to be made
 * **``dw`` and ``Ipix`` are variables, not expressions.**  Holding them as variables is what
   keeps ``K u = B dw`` *linear*, which is the whole content of (D2); folded in as expressions
   every elasticity row would carry four ``exp``s and the block would stop being linear.
+* **``H = I`` is half of a pair, and only the forward-model half of the Jacobian is claimed.**
+  eq:xd_obs_damage is ``H(Qbar_k) C^loc f_k``; the spec sanctions ``H = I`` but as a *variant*
+  that inflates the noise covariance instead, ``Sigma_eps -> Sigma_eps(Qbar_k)``.  This model
+  takes ``H = I`` with a CONSTANT ``Sigma_eps``, so it has not taken the variant -- it has
+  dropped the operator.  What survives is the state dependence of the Fisher information, since
+  ``Phi_k`` is dose-driven through steps 1-10, so the pivot is intact; what is lost is the
+  resolution-loss channel.  So what may be claimed from this is the forward-model half of
+  eq:xd_composed_jacobian, not the composed Jacobian.
 * **``eps_up`` must be the relative form.**  ``sqrt(v^2)`` has no derivative at ``v = 0``, so the
   tab's default ``eps_up = 0`` cannot be handed to a solver.  ``eps_rel`` scales the smoothing to
   the flow, which is differentiable *and* leaves the collapse and the ``I0 = 0`` identity exact

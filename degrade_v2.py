@@ -69,11 +69,23 @@ Discretisation choices that differ from the manuscript's scratch reference, and 
   the collapse and the ``I0 = 0`` identity.  Zero is exact, and is what the spec endorses for a
   simulator doing no sensitivity extraction -- but ``sqrt(v^2)`` is not differentiable at ``v =
   0``, so an NLP cannot use it.  ``eps_rel > 0`` selects ``eps_up^2 = eps_rel^2 * mean(|dx_k|^2)``
-  instead, which is smooth, vanishes exactly where the flow does, and is grid independent (the
-  RMS, so ``eps_rel`` is relative to a *typical* displacement rather than growing with the pixel
-  count).  It is carried as ``eps_up^2`` throughout and never square-rooted, because
-  eq:xd_upwind only ever needs the square -- and the square is a polynomial in ``dx_k``, where
-  the root would reintroduce a kink at rest.
+  instead, which is smooth, vanishes exactly where the flow does, and is grid independent.
+  It is carried as ``eps_up^2`` throughout and never square-rooted, because eq:xd_upwind only
+  ever needs the square -- and the square is a polynomial in ``dx_k``, where the root would
+  reintroduce a kink at rest.
+
+  **Two choices here are ours, not the note's.**  The spec writes ``eps_rel*||dx_k||`` with
+  "a smooth norm over the grid" and never pins the norm, and it gives ``eps_rel`` no value
+  anywhere.  The RMS is chosen because the plain 2-norm scales with the pixel count for a fixed
+  displacement field, which would make the note's own two grids (64x64 for the checks, 10 for the
+  closed-loop runs) incomparable; ``eps_rel`` is then relative to a *typical* displacement.
+  ``1e-3`` is a working value with nothing behind it.
+
+  **And the relative form has a defect the note does not record.**  Because ``eps_up^2`` is a
+  positive-definite quadratic form in ``dx_k``, ``sqrt(v^2 + eps_up^2)`` is a norm of ``dx_k``
+  and is NOT differentiable at ``dx_k = 0`` -- which a constant ``eps_up`` never was.  It is
+  reachable: both of the spec's off switches put the field exactly at rest.  The estimation NLP
+  handles it structurally by dropping the transport block there; see :mod:`degrade_v2_uq`.
 
 Tuning note
 -----------
