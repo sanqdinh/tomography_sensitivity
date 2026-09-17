@@ -678,7 +678,7 @@ class V2UQParams:
     eps_rel: float = 1e-3
 
     # --- estimation ---
-    tv_weight: float = 0.1
+    tv_weight: float = 0.001
     noise_sigma: float = 0.0           # 0 = noiseless data, as v1 does
     noise_cov_scale: float = 10.0      # sigma^2 in Sigma = sigma^2 J J^T
     freeze_mechanics: bool = False

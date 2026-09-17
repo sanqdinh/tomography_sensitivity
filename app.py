@@ -523,7 +523,11 @@ for _k, _v in {
     # which is exact, but sqrt(v^2) has no derivative at v = 0 so the NLP cannot use it. See
     # degrade_v2.check_invariants -- the relative form is the one that is both differentiable
     # and leaves the collapse and the I0 = 0 identity exact.
-    "v2_tv_weight": 0.05, "v2_eps_rel": 1e-3, "v2_freeze": False, "v2_uq": True,
+    # 0.001, not the 2D tab's 0.1: this objective normalises both terms (see
+    # degrade_v2_uq.add_estimation_objective), so the weight means something different here.
+    # Measured at grid 12 with an over-determined geometry, theta error vs peak:
+    # tv 0 -> 0.63%, 0.001 -> 0.80%, 0.01 -> 3.47%, 0.05 -> 9.28%, 0.2 -> 19.0%.
+    "v2_tv_weight": 0.001, "v2_eps_rel": 1e-3, "v2_freeze": False, "v2_uq": True,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -612,6 +616,10 @@ def _recon_slice_figure(original, recon, logcov, k: int, status: str):
         axes[1].set_title("Reconstruction  (mean |err| %.4g)" % err, fontsize=10)
     fig.tight_layout()
     return fig
+
+
+# Log-spaced, because the useful range is 1e-3..1e-1 and a linear 0.01 step cannot reach it.
+_V2_TV_WEIGHTS = (0.0, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)
 
 
 def _v2_recon_figure(res):
@@ -2000,9 +2008,15 @@ def _render_2d_v2_tab():
 
     rc = st.columns([1, 1, 2])
     with rc[0]:
-        st.slider("TV weight", 0.0, 1.0, step=0.01, key="v2_tv_weight",
-                  help="Total-variation regularisation on theta, the same dial the other two "
-                       "tabs have.")
+        st.select_slider(
+            "TV weight", options=_V2_TV_WEIGHTS, key="v2_tv_weight",
+            format_func=lambda v: ("%g" % v) if v else "0",
+            help="Total-variation regularisation on theta. **This is not the 2D tab's scale** "
+                 "-- that objective sums raw residuals, this one normalises both terms to O(1) "
+                 "first, because theta peaks near 0.03 here while the ray integrals are still "
+                 "O(1). Measured on an over-determined geometry, theta error against the truth: "
+                 "0 gives 0.63% of peak, 0.001 gives 0.80%, 0.01 gives 3.5%, 0.05 gives 9.3%. "
+                 "Raise it when the geometry is starved of rays, not otherwise.")
     with rc[1]:
         st.checkbox("Sensitivity / UQ", key="v2_uq",
                     help="k_aug extracts d(theta)/d(y) -- eq:xd_composed_jacobian -- giving the "
