@@ -65,11 +65,21 @@ Transcription notes, where a choice had to be made
   off switch ("the eigenstrain vanishes, so Delta x = 0 and every flux with it"), and taking it
   literally avoids handing the solver ``sqrt(0)``, whose derivative does not exist, at every
   face at once.
-* **The travel-order walk is mirrored exactly, including its quirk.**  Travelling against the
+* **The travel-order walk is mirrored exactly, including a defect.**  Travelling against the
   vendored ascending-(x, y) crossing order, ``accumulate_dose`` deposits dose into the pixel at
-  crossing ``i`` while shielding with the attenuation of the pixel at crossing ``i-1``.  Whether
-  that is what was intended is a question for the forward model; here the only requirement is
-  that the two implementations agree, so it is reproduced rather than corrected.
+  crossing ``i`` while the chord it uses, and the shielding increment it then adds, belong to the
+  pixel at crossing ``i-1``.  So on those rays **each pixel is shielded by its own chord**.  This
+  is a violation of a written equation, not a filled-in gap: eq:xd_dose_state is
+  ``Q_{k+1,p} = Q_{k,p} + c_q I_p delta_p`` -- deposit pixel and chord owner are the same symbol
+  ``p``, in one line -- and eq:xd_local_intensity gives ``f_{p_m}`` and ``delta_{p_m}`` the same
+  subscript.  The fix is one index (deposit into ``rows[s]``, not ``rows[i]``); the walk order is
+  already correct and must not be touched.  Measured by :func:`check_photon_balance`: forward
+  rays 0.0, antiparallel rays 1.0, which is exactly ``I0``.
+  It is reproduced rather than corrected because the decision is not this module's to take --
+  ``dose_response.degradation_dose_response`` shares the split, so it moves the 2D live picture
+  and the 3D simulator, and because ``degrade_v2`` turns out to BE the "independent reproduction"
+  quoted at the note's line 609 (it returns -0.93 / -3.63 / -7.95 for Rg, the printed digits
+  exactly), the fix also edits three numbers already written into section 3.4.
 """
 
 from __future__ import annotations
@@ -374,6 +384,15 @@ def reference_local_intensity(f, r, angle_rad, I0, c_q):
     delta_{p_i}" and sums over ``m < i``: upstream material shields downstream material, and a
     pixel never shields itself.  So: walk the SEGMENTS in travel order; the pixel owning chord
     ``s`` is ``rows[s]``; deposit there; then let it shield everything after it.
+
+    **How this resolves delta_p for a bundle, which the spec leaves implicit.**  The note writes
+    ``delta_p`` as though a pixel has one chord, and under a single ray it does.  Under a bundle
+    it does not: eq:xd_local_intensity "sums the contributions" of simultaneous rays and a pixel
+    is crossed ~1.17 times per projection on a 64 grid, so the chord is really per
+    ``(ray, pixel)`` pair while the notation carries no ray index.  This resolves it as:
+    ``I_p`` is the sum over rays of the per-ray intensity and carries NO chord factor, while the
+    dose increment is the sum over rays of ``c_q * I_ray * delta_(ray,p)``.  That is the same
+    reading :func:`degrade_v2.accumulate_dose` takes, so the two differ only in the deposit index.
 
     This exists because agreeing with :mod:`degrade_v2` to 1e-16 proves only that two
     implementations share a convention -- including a wrong one.  The manuscript records exactly
