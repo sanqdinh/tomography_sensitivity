@@ -864,6 +864,16 @@ class V2UQResults:
     uq_error: Optional[str] = None
     uq_conditioning: float = float("nan")   # cond(J J^T); large is expected, see CLAUDE.md
     courant: float = float("nan")           # max|dx|/dx over the run -- how much moved at all
+    # eq:xd_box's active set on theta.  The spec appends the box to "g <= 0"; this renders it as
+    # variable bounds, which is the same feasible set but reaches k_aug as bound multipliers
+    # rather than constraint rows, and the manuscript's IFT sensitivity is built on the active
+    # set.  So the counts are reported rather than assumed.  SCOPE: this is the active set of
+    # THIS model -- v2 dynamics, this grid, this phantom.  The manuscript's active-constraint
+    # claim is evidenced by a different codebase (sDOE_senNLP, 10x10, v1 dose-response, no
+    # transport), so nothing here confirms or falsifies that.
+    n_theta_at_lower: int = 0
+    n_theta_at_upper: int = 0
+    n_theta_interior: int = 0
     rg_pct: float = float("nan")            # contraction of the true field, % change in Rg
     mass_true: float = float("nan")
     mass_hat: float = float("nan")
@@ -1038,6 +1048,14 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
     status = str(r1.solver.termination_condition)
     say("    %s (%s)\n" % (status, ls1))
 
+    # eq:xd_box active-set census, before anything else reads the solution.
+    lo_b, hi_b = 0.0, 1.5 * scale
+    _vals = [pyo.value(m.f[q, 0]) for q in m.PIX]
+    n_lo = sum(1 for v in _vals if abs(v - lo_b) < 1e-8)
+    n_hi = sum(1 for v in _vals if abs(v - hi_b) < 1e-8)
+    say("    eq:xd_box active set on theta: %d at lower, %d at upper, %d interior\n"
+        % (n_lo, n_hi, len(_vals) - n_lo - n_hi))
+
     theta_hat = np.array([pyo.value(m.f[q, 0]) for q in m.PIX]).reshape(res, res)
     f_hat = np.array([pyo.value(m.f[q, len(seq)]) for q in m.PIX]).reshape(res, res)
     Q_hat = np.array([pyo.value(m.Q[q, len(seq)]) for q in m.PIX]).reshape(res, res)
@@ -1051,6 +1069,8 @@ def run_v2_reconstruction(params: V2UQParams, log_callback=None) -> V2UQResults:
         rg_pct=_rg_pct(theta, f_true),
         obs_rms=float(np.sqrt(np.mean(np.square(resid)))),
         theta_rms=float(np.sqrt(np.mean((theta_hat - theta) ** 2))),
+        n_theta_at_lower=n_lo, n_theta_at_upper=n_hi,
+        n_theta_interior=len(_vals) - n_lo - n_hi,
         forward_residual=fwd_resid, n_measurements=len(seq), n_rays=n_rays,
         n_vars=n_v, n_cons=n_c,
         mass_true=float(f_true.sum()), mass_hat=float(f_hat.sum()))

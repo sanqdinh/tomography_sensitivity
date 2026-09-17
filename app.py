@@ -2129,6 +2129,16 @@ def _render_2d_v2_tab():
         # How much the mechanics actually did. Without this the exact/frozen choice looks like a
         # free lunch: they agree to four figures whenever the transport barely moved anything,
         # which is most of the default parameter range.
+        _act = out.n_theta_at_lower + out.n_theta_at_upper
+        st.caption(
+            "eq:xd_box active set on theta: **%d** at the lower bound, **%d** at the upper, "
+            "%d interior. %s This is the active set of *this* model \u2014 the manuscript's "
+            "active-constraint claim is evidenced by a different codebase, so nothing here "
+            "speaks to it."
+            % (out.n_theta_at_lower, out.n_theta_at_upper, out.n_theta_interior,
+               "With nothing active, the box constraint is indistinguishable from omitting it "
+               "for this geometry." if _act == 0 else
+               "The box is load-bearing here, so the bound multipliers k_aug consumes matter."))
         st.caption(
             "Transport this run: Courant **%.3f**, radius of gyration **%+.2f%%**, mass left "
             "**%.3f** (simulated) vs **%.3f** (reconstructed). If the first two are near zero "
