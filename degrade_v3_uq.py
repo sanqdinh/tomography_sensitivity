@@ -167,14 +167,25 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
     def _pi(mm, q, k):
         return mm.dw[q, k] * _ft(mm, q, k) / sm
 
+    eh = float(p.eps_h) * max(float(np.abs(theta_ref).max()), 1e-300)
+
     def _mass(mm, q, k):
         rhs = _ft(mm, q, k)
         if p.c_cp != 0.0:
             pip = _pi(mm, q, k)
+            ftp = _ft(mm, q, k)
             for nb in _neighbours(q, res):
                 g = _pi(mm, nb, k) - pip
-                w = 1.0 / (1.0 + pyo.exp(-p.beta * g))
-                rhs -= p.c_cp * (w * _ft(mm, q, k) + (1.0 - w) * _ft(mm, nb, k)) * g
+                ftq = _ft(mm, nb, k)
+                if p.flux == "harmonic":
+                    # H vanishes when either side is empty -- the vacuum is inert structurally,
+                    # and there is no exponential and no beta.
+                    rhs -= p.c_cp * (2.0 * ftp * ftq / (ftp + ftq + eh)) * g
+                elif p.flux == "upwind":
+                    w = 1.0 / (1.0 + pyo.exp(-p.beta * g))
+                    rhs -= p.c_cp * (w * ftp + (1.0 - w) * ftq) * g
+                else:
+                    rhs -= p.c_cp * 0.5 * (ftp + ftq) * g
         return mm.f[q, k + 1] == rhs
     m.c_mass = pyo.Constraint(m.PIX, m.TM, rule=_mass)
 

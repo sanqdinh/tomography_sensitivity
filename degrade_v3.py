@@ -124,6 +124,13 @@ class V3Params:
     # At a material/vacuum face Pi_q = 0 and Pi_p >= 0, so g <= 0, the donor is the vacuum pixel,
     # and it has no mass -- so the flux is exactly zero and nothing leaks out of the specimen.
     # The central scheme instead carries a nonzero flux there and drives the vacuum negative.
+    # Face weighting. "upwind" is the logistic donor cell; "harmonic" weights by
+    # H = 2 ab/(a+b+eps_h), which vanishes when EITHER side is empty and so makes the vacuum
+    # inert structurally rather than via the sign of g -- no exponential, no beta, and the
+    # second derivatives are a rational function rather than a logistic. "central" is the
+    # arithmetic mean, kept only because it is what the first version did.
+    flux: str = "upwind"
+    eps_h: float = 1e-12     # removable-singularity guard for "harmonic", x peak density
     upwind: bool = True
     # Logistic sharpness, units of 1/Pi. The switch must SATURATE: beta*max|g| >~ 5, and Pi is
     # small (dw ~ 0.06 times a density ratio), so max|g| ~ 0.2 and beta ~ 20 leaves the scheme
@@ -181,8 +188,9 @@ def _faces(state_t, dw):
     return (sh, gh), (sv, gv)
 
 
-def compaction_flux_divergence(state_t, dw, c_cp: float, upwind: bool = True,
-                               beta: float = 20.0, state_max: float = 1.0):
+def compaction_flux_divergence(state_t, dw, c_cp: float, mode: str = "upwind",
+                               beta: float = 20.0, state_max: float = 1.0,
+                               eps_h: float = 1e-12):
     """``sum_{q~p} F_{p->q}`` for the nearest-neighbour compaction flux.
 
     ``F_{p->q} = c_cp * 0.5 * (state~_p + state~_q) * (dw_q - dw_p)``, zero on boundary faces.
@@ -206,7 +214,16 @@ def compaction_flux_divergence(state_t, dw, c_cp: float, upwind: bool = True,
     gh = Pi[:, 1:] - Pi[:, :-1]
     gv = Pi[1:, :] - Pi[:-1, :]
 
-    if upwind:
+    if mode == "harmonic":
+        # H vanishes when either side is empty: no mass crosses a face touching vacuum, in
+        # either direction, for any sign of g. Stronger than the logistic, which relied on the
+        # sign of g happening to be favourable at such a face.
+        eh = eps_h * max(float(np.abs(state_t).max()), 1e-300)
+        ah, bh = state_t[:, :-1], state_t[:, 1:]
+        av, bv = state_t[:-1, :], state_t[1:, :]
+        Fh = c_cp * (2.0 * ah * bh / (ah + bh + eh)) * gh
+        Fv = c_cp * (2.0 * av * bv / (av + bv + eh)) * gv
+    elif mode == "upwind":
         wh = 1.0 / (1.0 + np.exp(-beta * gh))
         wv = 1.0 / (1.0 + np.exp(-beta * gv))
         Fh = c_cp * (wh * state_t[:, :-1] + (1.0 - wh) * state_t[:, 1:]) * gh
@@ -286,7 +303,7 @@ def step(state, Q, r_values, angle_rad: float, p: V3Params, _decay_last: bool = 
         dw = (om_k - p.omega_inf) * (1.0 - s) / om_k
 
     if _decay_last:                                      # deliberately wrong order
-        moved, _F = compaction_flux_divergence(state, dw, p.c_cp, p.upwind, p.beta, sm)
+        moved, _F = compaction_flux_divergence(state, dw, p.c_cp, p.flux, p.beta, sm, p.eps_h)
         state_next = (state - moved) * p.decay_factor(I_p)
         lost = float(state.sum() - (state * p.decay_factor(I_p)).sum())
         state_t = state
@@ -295,7 +312,7 @@ def step(state, Q, r_values, angle_rad: float, p: V3Params, _decay_last: bool = 
         # and the entire change in the total is the decay. That is prop:xd_mass.
         state_t = state * p.decay_factor(I_p)
         lost = float(state.sum() - state_t.sum())
-        div, _F = compaction_flux_divergence(state_t, dw, p.c_cp, p.upwind, p.beta, sm)
+        div, _F = compaction_flux_divergence(state_t, dw, p.c_cp, p.flux, p.beta, sm, p.eps_h)
         state_next = state_t - div
 
     Fh, Fv = _F
