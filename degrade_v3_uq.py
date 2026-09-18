@@ -37,7 +37,7 @@ import numpy as np
 import pyomo.environ as pyo
 
 from degrade_v2_uq import measurement_rays, ray_walk, solve_with_fallback, _make_solver
-from degrade_v3 import V3Params, simulate, _phantom, _disc, _demo_sequence
+from degrade_v3 import (V3Params, simulate, resolve, _phantom, _disc, _demo_sequence)
 from degrade_v2 import scale_to_optical_depth
 
 
@@ -62,6 +62,7 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
                    inline_decay: bool = False):
     """Steps 1-11 of the v3 model as a Pyomo model.  ``theta_ref`` seeds every variable."""
     theta_ref = np.asarray(theta_ref, dtype=float)
+    p = resolve(p, theta_ref)          # state_max is a CONSTANT, the initial peak, as in v3
     res = int(image_res)
     npix = res * res
     meas = measurement_rays(seq, res)
@@ -156,15 +157,24 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
         def _ft(mm, q, k):
             return mm.ft[q, k]
 
-    # --- 6, 7. nearest-neighbour compaction flux, then the mass balance ---------------------
-    # F_{p->q} = c_cp * 0.5 * (ft_p + ft_q) * (dw_q - dw_p), zero on boundary faces.
-    # Written directly into the mass row: no flux variables, one constraint per pixel.
+    # --- 6, 7. compaction flux on the five-point stencil, then the mass balance -------------
+    # Pi = dw * ft / state_max is the VOID CREATED -- extensive, and exactly 0 in vacuum, which
+    # is what stops mass leaking out of the specimen. The donor-cell weight makes the vacuum
+    # exactly inert: at a material/vacuum face g <= 0, the donor is the vacuum pixel, and it has
+    # no mass. Bilinearity is given up for that; the stencil is still five-point.
+    sm = float(p.state_max) if p.state_max is not None else 1.0
+
+    def _pi(mm, q, k):
+        return mm.dw[q, k] * _ft(mm, q, k) / sm
+
     def _mass(mm, q, k):
-        ftp = _ft(mm, q, k)
-        rhs = ftp
+        rhs = _ft(mm, q, k)
         if p.c_cp != 0.0:
+            pip = _pi(mm, q, k)
             for nb in _neighbours(q, res):
-                rhs -= p.c_cp * 0.5 * (ftp + _ft(mm, nb, k)) * (mm.dw[nb, k] - mm.dw[q, k])
+                g = _pi(mm, nb, k) - pip
+                w = 1.0 / (1.0 + pyo.exp(-p.beta * g))
+                rhs -= p.c_cp * (w * _ft(mm, q, k) + (1.0 - w) * _ft(mm, nb, k)) * g
         return mm.f[q, k + 1] == rhs
     m.c_mass = pyo.Constraint(m.PIX, m.TM, rule=_mass)
 
@@ -177,6 +187,7 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
 
 def numpy_trajectory(theta, seq, p: V3Params, image_res: int):
     """Every variable of the model, taken off a :func:`degrade_v3.simulate` run."""
+    p = resolve(p, theta)
     res = int(image_res)
     npix = res * res
     meas = measurement_rays(seq, res)
