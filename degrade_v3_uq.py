@@ -321,7 +321,7 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
 
 def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=0.001,
                           linear_solver="ma97", solver_opts=None, inline_decay=False,
-                          max_iter=3000, log_callback=None, gate=True):
+                          max_iter=3000, log_callback=None, gate=True, continuation=True):
     """Estimate ``theta`` from v3 dynamics.  Returns a dict of results and timings (V10)."""
     import io, re
     res = int(image_res)
@@ -341,10 +341,41 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
             raise RuntimeError("v3 Pyomo model no longer reproduces degrade_v3.simulate "
                                "(residual %.3e at %s)" % (gate_resid, where))
 
+    # --- continuation: solve the undamaged problem first ---------------------------------
+    # At I0 = 0 every dynamic constraint is the identity (no fluence -> no dose -> no dw -> no
+    # Pi -> no flux), so this is linear tomography + TV. It costs little and hands the full
+    # solve a theta that already fits the data, leaving only the dynamics to be reconciled.
+    # v2 did this; v3 did not, and was taking 139-170 iterations for a problem whose only
+    # degree of freedom is theta.
+    theta0 = np.full_like(theta, float(theta.mean()))
+    t_cont, cont_iters, cont_status = 0.0, "-", "skipped"
+    if continuation:
+        tc = time.time()
+        p0 = resolve(V3Params(**{**p.__dict__, "I0": 0.0, "c_cp": 0.0}), theta)
+        m0 = build_v3_model(theta, seq, p0, res, f_bounds=(0.0, 1.5 * scale),
+                            inline_decay=inline_decay)
+        for q in m0.PIX:
+            m0.f[q, 0].set_value(float(theta0.ravel()[q]))
+        add_estimation_objective(m0, y, tv_weight, scale)
+        b0 = io.StringIO()
+        try:
+            r0, _ls0 = solve_with_fallback(m0, linear_solver=linear_solver, max_iter=max_iter,
+                                           log_callback=b0.write,
+                                           options=dict(solver_opts or {}))
+            cont_status = str(r0.solver.termination_condition)
+            theta0 = np.array([pyo.value(m0.f[q, 0]) for q in m0.PIX]).reshape(res, res)
+        except Exception as e:
+            cont_status = "FAILED: " + str(e).splitlines()[0][:60]
+        cont_iters = (re.findall(r"Number of Iterations\.*:\s*(\S+)", b0.getvalue())
+                      or ["-"])[-1]
+        del m0
+        t_cont = time.time() - tc
+
     t_build = time.time()
     m = build_v3_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale), inline_decay=inline_decay)
-    # start from a flat field: only theta is unknown, the dynamics are seeded by the simulator
-    t0 = numpy_trajectory(np.full_like(theta, float(theta.mean())), seq, p, res)
+    # Seed the dynamics from a trajectory of the CURRENT theta estimate, so every dynamic
+    # constraint starts at residual ~0 and only the fit is wrong.
+    t0 = numpy_trajectory(theta0, seq, p, res)
     pin_model(m, t0, fix=False)
     for q in m.PIX:
         m.Q[q, 0].fix(0.0)
@@ -371,7 +402,8 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
     th = np.array([pyo.value(m.f[q, 0]) for q in m.PIX]).reshape(res, res)
     return dict(
         theta_hat=th, status=status, linear_solver=ls,
-        t_sim=t_sim, t_build=t_build, t_solve=t_solve,
+        t_sim=t_sim, t_build=t_build, t_solve=t_solve, t_cont=t_cont,
+        cont_iters=cont_iters, cont_status=cont_status,
         n_vars=nv, n_cons=nc,
         gate_residual=gate_resid,
         iters=g(r"Number of Iterations\.*:\s*(\S+)"),
