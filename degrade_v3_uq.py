@@ -504,6 +504,8 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
         nnz_jac=g(r"Number of nonzeros in equality constraint Jacobian\.*:\s*(\S+)"),
         ipopt_s=g(r"Total seconds in IPOPT \(w/o function evaluations\)\s*=\s*(\S+)"),
         fev_s=g(r"Total seconds in NLP function evaluations\s*=\s*(\S+)"),
+        fact_s=g(r"LinearSystemFactorization\.*:\s*(\S+)"),
+        pd_s=g(r"PDSystemSolverTotal\.*:\s*(\S+)"),
         theta_err=100.0 * float(np.sqrt(np.mean((th - theta) ** 2))) / float(theta.max()),
         courant=max(i.compaction for i in infos),
         mass=float(_s.sum()) / float(theta.sum()),
