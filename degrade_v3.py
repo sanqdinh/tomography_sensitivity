@@ -347,11 +347,17 @@ def simulate(theta, seq, p: V3Params, image_res: int, _decay_last: bool = False,
     for angle_deg, offset, n_beams in seq:
         angle_rad = np.deg2rad(float(angle_deg))
         r_values = bundle_r_values(float(offset), int(n_beams), int(image_res))
-        if record_observations:
-            # Step 11, taken BEFORE the step updates the field, so the observation and the
-            # shielding of step 1 integrate the same f_k and cannot disagree.
-            obs.append(np.array([ray_line_integral(state, r, angle_rad) for r in r_values]))
         state, Q, info = step(state, Q, r_values, angle_rad, p, _decay_last=_decay_last)
+        if record_observations:
+            # y_{k+1} = C_{u_k} f_{k+1}: the projection is recorded AFTER its own exposure has
+            # damaged the field. The angle u_k both deposits the dose and defines the geometry,
+            # so it is the same beam; only the field it is read against moved from f_k to f_k+1.
+            # Endpoint, not midpoint -- chosen deliberately, see the module docstring.
+            # Consequence, and it is a real tension rather than an oversight: within one step the
+            # beam is shielded by f_k (step 1 integrates the field it arrived at) while the
+            # projection integrates f_{k+1}. The same photons answer to two fields. That is the
+            # price of the endpoint convention.
+            obs.append(np.array([ray_line_integral(state, r, angle_rad) for r in r_values]))
         infos.append(info)
         if record_trajectory:
             s_hist.append(state.copy())

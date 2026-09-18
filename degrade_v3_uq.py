@@ -189,8 +189,33 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
         return mm.f[q, k + 1] == rhs
     m.c_mass = pyo.Constraint(m.PIX, m.TM, rule=_mass)
 
-    # --- 11. observation: the last link of the chain, no new variable -----------------------
+    # --- 11. observation: y_{k+1} = C_{u_k} f_{k+1} -----------------------------------------
+    # The projection is now read against the field AFTER its own exposure, so it is no longer
+    # the terminal entry of the shielding chain: the chain integrates f_k (what the beam was
+    # attenuated by on the way in) while the projection integrates f_{k+1}. Two different sums.
+    #
+    # ONE LINEAR ROW PER RAY, not a second chain. Only the total is needed, never the partial
+    # sums, so this is n_rays rows of ~n_pix nonzeros -- a few percent of the Jacobian, where a
+    # second chain would cost ~18% and buy nothing.
+    #
+    # It is a VARIABLE rather than an inlined expression so the fit term stays diagonal in the
+    # objective Hessian; inlined, every ray would contribute a dense n_pix clique there.
     m.obs_index = [(k, j, n) for (k, j, n) in ray_id]
+    m.RAY = pyo.Set(initialize=[(k, j) for (k, j, _n) in ray_id], dimen=2, ordered=True)
+    m.yobs = pyo.Var(m.RAY, initialize=0.0)
+
+    chords = {}
+    for k, (_ang, rays) in enumerate(meas):
+        for j, (_r, walk) in enumerate(rays):
+            acc = {}
+            for _pix, chord, owner in walk:
+                acc[owner] = acc.get(owner, 0.0) + chord
+            chords[(k, j)] = sorted(acc.items())
+    m.chords = chords
+
+    def _obs(mm, k, j):
+        return mm.yobs[k, j] == sum(c * mm.f[q, k + 1] for q, c in chords[(k, j)])
+    m.c_obs = pyo.Constraint(m.RAY, rule=_obs)
     return m
 
 
@@ -222,7 +247,14 @@ def numpy_trajectory(theta, seq, p: V3Params, image_res: int):
     s = np.exp(-dQ / p.Q_c)
     dw = (1.0 - s) if p.omega_inf == 0.0 else (om - p.omega_inf) * (1.0 - s) / om
     ft = f[:, :K] * np.exp(-p.a * Ipix - p.b * Ipix ** 2)
-    return dict(f=f, Q=Q, S=S, Ipix=Ipix, dw=dw, ft=ft)
+    yobs = {}
+    for k, (_ang, rays) in enumerate(meas):
+        for j, (_r, walk) in enumerate(rays):
+            acc = {}
+            for _pix, chord, owner in walk:
+                acc[owner] = acc.get(owner, 0.0) + chord
+            yobs[(k, j)] = float(sum(c * f[q, k + 1] for q, c in acc.items()))
+    return dict(f=f, Q=Q, S=S, Ipix=Ipix, dw=dw, ft=ft, yobs=yobs)
 
 
 def pin_model(m, traj, *, fix=True):
@@ -249,6 +281,10 @@ def pin_model(m, traj, *, fix=True):
         m.S[idx].set_value(float(traj["S"][idx]))
         if fix:
             m.S[idx].fix()
+    for idx in m.RAY:
+        m.yobs[idx].set_value(float(traj["yobs"][idx]))
+        if fix:
+            m.yobs[idx].fix()
 
 
 def max_residual(m):
@@ -324,7 +360,7 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
         m.y_data[k, j].fix()
     nobs = max(len(m.obs_index), 1)
     yscale = max(float(np.mean([abs(y_data[k][j]) for (k, j, _n) in m.obs_index])), 1e-12)
-    fit = sum((m.S[k, j, n] - m.y_data[k, j]) ** 2 for (k, j, n) in m.obs_index) / (nobs * yscale ** 2)
+    fit = sum((m.yobs[k, j] - m.y_data[k, j]) ** 2 for (k, j, _n) in m.obs_index) / (nobs * yscale ** 2)
     npix = m.res * m.res
     m.obj = pyo.Objective(expr=fit + tv_weight * _tv_expression(m, theta_scale) / (npix * theta_scale))
     return m.obj
