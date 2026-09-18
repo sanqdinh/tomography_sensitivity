@@ -59,7 +59,8 @@ def _neighbours(q, res):
 
 
 def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None,
-                   inline_decay: bool = False):
+                   inline_decay: bool = False, inline_Ipix: bool = False,
+                   inline_dw: bool = False):
     """Steps 1-11 of the v3 model as a Pyomo model.  ``theta_ref`` seeds every variable."""
     theta_ref = np.asarray(theta_ref, dtype=float)
     p = resolve(p, theta_ref)          # state_max is a CONSTANT, the initial peak, as in v3
@@ -73,6 +74,7 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
     m = pyo.ConcreteModel(name="degrade_v3")
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
     m.inline_decay = bool(inline_decay)
+    m.inline_Ipix, m.inline_dw = bool(inline_Ipix), bool(inline_dw)
 
     m.PIX = pyo.RangeSet(0, npix - 1)
     m.T = pyo.RangeSet(0, K)
@@ -108,14 +110,24 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
                 I_terms[(pix, k)].append((k, j, t))
                 dQ_terms[(pix, k)].append(((k, j, t), chord))
 
-    m.Ipix = pyo.Var(m.PIX, m.TM, initialize=0.0)
+    if inline_Ipix:
+        # Ipix appears only in c_ft, so substituting it costs npix rows + npix vars per stage
+        # and adds this pixel's crossing terms to c_ft instead. A clean one-to-one substitution.
+        def _Ipix(mm, q, k):
+            terms = I_terms[(q, k)]
+            return sum(p.I0 * pyo.exp(-mm.S[idx]) for idx in terms) if terms else 0.0
+    else:
+        m.Ipix = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
-    def _ip(mm, q, k):
-        terms = I_terms[(q, k)]
-        if not terms:
-            return mm.Ipix[q, k] == 0.0
-        return mm.Ipix[q, k] == sum(p.I0 * pyo.exp(-mm.S[idx]) for idx in terms)
-    m.c_Ipix = pyo.Constraint(m.PIX, m.TM, rule=_ip)
+        def _ip(mm, q, k):
+            terms = I_terms[(q, k)]
+            if not terms:
+                return mm.Ipix[q, k] == 0.0
+            return mm.Ipix[q, k] == sum(p.I0 * pyo.exp(-mm.S[idx]) for idx in terms)
+        m.c_Ipix = pyo.Constraint(m.PIX, m.TM, rule=_ip)
+
+        def _Ipix(mm, q, k):
+            return mm.Ipix[q, k]
 
     # --- 2. dose accumulation ---------------------------------------------------------------
     def _dose(mm, q, k):
@@ -130,6 +142,22 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
     def _om(expr):
         return p.omega_inf + (1.0 - p.omega_inf) * pyo.exp(-expr / p.Q_c)
 
+    def _dw_expr(mm, q, k):
+        s = pyo.exp(-(mm.Q[q, k + 1] - mm.Q[q, k]) / p.Q_c)
+        if p.omega_inf == 0.0:
+            return 1.0 - s
+        om = _om(mm.Q[q, k])
+        return (om - p.omega_inf) * (1.0 - s) / om
+
+    if inline_dw:
+        # dw appears at FIVE stencil positions in c_mass, and each substitution drags in two Q
+        # variables, so this trades npix vars/rows for a much denser c_mass. Expected to lose.
+        def _dwv(mm, q, k):
+            return _dw_expr(mm, q, k)
+    else:
+        def _dwv(mm, q, k):
+            return mm.dw[q, k]
+
     m.dw = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
     def _dwc(mm, q, k):
@@ -140,18 +168,23 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
             return mm.dw[q, k] == 1.0 - s
         om = _om(mm.Q[q, k])
         return mm.dw[q, k] * om == (om - p.omega_inf) * (1.0 - s)
-    m.c_dw = pyo.Constraint(m.PIX, m.TM, rule=_dwc)
+    if not inline_dw:
+        m.c_dw = pyo.Constraint(m.PIX, m.TM, rule=_dwc)
+    else:
+        for q in m.PIX:
+            for k in m.TM:
+                m.dw[q, k].fix(0.0)          # present but inert, so pinning code still works
 
     # --- 9. eq:xd_decay, verbatim -- carried as a VARIABLE so the flux stays bilinear -------
     if inline_decay:
         def _ft(mm, q, k):
-            return mm.f[q, k] * pyo.exp(-p.a * mm.Ipix[q, k] - p.b * mm.Ipix[q, k] ** 2)
+            return mm.f[q, k] * pyo.exp(-p.a * _Ipix(mm, q, k) - p.b * _Ipix(mm, q, k) ** 2)
     else:
         m.ft = pyo.Var(m.PIX, m.TM, initialize=lambda _m, q, k: float(flat[q]))
 
         def _ftc(mm, q, k):
             return mm.ft[q, k] == mm.f[q, k] * pyo.exp(
-                -p.a * mm.Ipix[q, k] - p.b * mm.Ipix[q, k] ** 2)
+                -p.a * _Ipix(mm, q, k) - p.b * _Ipix(mm, q, k) ** 2)
         m.c_ft = pyo.Constraint(m.PIX, m.TM, rule=_ftc)
 
         def _ft(mm, q, k):
@@ -165,7 +198,7 @@ def build_v3_model(theta_ref, seq, p: V3Params, image_res: int, *, f_bounds=None
     sm = float(p.state_max) if p.state_max is not None else 1.0
 
     def _pi(mm, q, k):
-        return mm.dw[q, k] * _ft(mm, q, k) / sm
+        return _dwv(mm, q, k) * _ft(mm, q, k) / sm
 
     eh = float(p.eps_h) * max(float(np.abs(theta_ref).max()), 1e-300)
 
@@ -268,13 +301,17 @@ def pin_model(m, traj, *, fix=True):
                 m.f[q, k].fix()
                 m.Q[q, k].fix()
         for k in m.TM:
-            m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
-            m.dw[q, k].set_value(float(traj["dw"][q, k]))
+            if not m.inline_Ipix:
+                m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
+            if not m.inline_dw:
+                m.dw[q, k].set_value(float(traj["dw"][q, k]))
             if not m.inline_decay:
                 m.ft[q, k].set_value(float(traj["ft"][q, k]))
             if fix:
-                m.Ipix[q, k].fix()
-                m.dw[q, k].fix()
+                if not m.inline_Ipix:
+                    m.Ipix[q, k].fix()
+                if not m.inline_dw:
+                    m.dw[q, k].fix()
                 if not m.inline_decay:
                     m.ft[q, k].fix()
     for idx in m.CH:
@@ -303,18 +340,23 @@ def max_residual(m):
 
 
 def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
-                  c_cp: float = 0.3, inline_decay: bool = False, **kw):
+                  c_cp: float = 0.3, inline_decay: bool = False,
+                  inline_Ipix: bool = False, inline_dw: bool = False, **kw):
     """Does the Pyomo model reproduce :func:`degrade_v3.simulate`?  Residual only, no solver."""
     p = V3Params(c_cp=c_cp, **kw)
     seq = _demo_sequence(n_steps)
     theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
     traj = numpy_trajectory(theta, seq, p, image_res)
-    m = build_v3_model(theta, seq, p, image_res, inline_decay=inline_decay)
+    m = build_v3_model(theta, seq, p, image_res, inline_decay=inline_decay,
+                       inline_Ipix=inline_Ipix, inline_dw=inline_dw)
     pin_model(m, traj)
     r, where = max_residual(m)
     if verbose:
+        tags = [n for n, on in (("Ipix", inline_Ipix), ("dw", inline_dw),
+                                ("ft", inline_decay)) if on]
         print("v3 Pyomo model vs numpy simulator: grid %d, %d steps, c_cp = %g%s"
-              % (image_res, n_steps, c_cp, ", inlined decay" if inline_decay else ""))
+              % (image_res, n_steps, c_cp,
+                 ("  [inlined: %s]" % ", ".join(tags)) if tags else ""))
         print("  max constraint residual  %.3e   (%s)" % (r, where or "-"))
         print("  %s" % ("PASS" if r < 1e-10 else "FAIL"))
     return r
@@ -368,7 +410,8 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
 
 def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=0.001,
                           linear_solver="ma97", solver_opts=None, inline_decay=False,
-                          max_iter=3000, log_callback=None, gate=True, continuation=True):
+                          max_iter=3000, log_callback=None, gate=True, continuation=True,
+                          inline_Ipix=False, inline_dw=False):
     """Estimate ``theta`` from v3 dynamics.  Returns a dict of results and timings (V10)."""
     import io, re
     res = int(image_res)
@@ -380,7 +423,8 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
     gate_resid = float("nan")
     if gate:
         traj = numpy_trajectory(theta, seq, p, res)
-        mg = build_v3_model(theta, seq, p, res, inline_decay=inline_decay)
+        mg = build_v3_model(theta, seq, p, res, inline_decay=inline_decay,
+                            inline_Ipix=inline_Ipix, inline_dw=inline_dw)
         pin_model(mg, traj)
         gate_resid, where = max_residual(mg)
         del mg
@@ -400,7 +444,8 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
         tc = time.time()
         p0 = resolve(V3Params(**{**p.__dict__, "I0": 0.0, "c_cp": 0.0}), theta)
         m0 = build_v3_model(theta, seq, p0, res, f_bounds=(0.0, 1.5 * scale),
-                            inline_decay=inline_decay)
+                            inline_decay=inline_decay, inline_Ipix=inline_Ipix,
+                            inline_dw=inline_dw)
         for q in m0.PIX:
             m0.f[q, 0].set_value(float(theta0.ravel()[q]))
         add_estimation_objective(m0, y, tv_weight, scale)
@@ -419,7 +464,8 @@ def run_v3_reconstruction(theta, seq, p: V3Params, image_res: int, *, tv_weight=
         t_cont = time.time() - tc
 
     t_build = time.time()
-    m = build_v3_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale), inline_decay=inline_decay)
+    m = build_v3_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale),
+                       inline_decay=inline_decay, inline_Ipix=inline_Ipix, inline_dw=inline_dw)
     # Seed the dynamics from a trajectory of the CURRENT theta estimate, so every dynamic
     # constraint starts at residual ~0 and only the fit is wrong.
     t0 = numpy_trajectory(theta0, seq, p, res)
