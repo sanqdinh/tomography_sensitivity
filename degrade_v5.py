@@ -78,8 +78,13 @@ class V5Params:
     a: float = 0.05          # decay, linear in fluence
     b: float = 0.0           # decay, quadratic
     c_cp: float = 0.3        # compaction number
-    # COMPACTION REACH, a physical length in the same units as dx. None/inf is the pure Poisson
-    # closure (varsigma = 0), the default. varsigma = (dx/reach)^2, and reach -> 0 recovers v4.
+    # COMPACTION REACH, a physical length in the same units as dx. MANDATORY and strictly
+    # positive: varsigma = (dx/reach)^2 is the only unconditional regulariser of the potential
+    # operator, and l = infinity is NOT a legal setting -- see resolve(). None means "resolve to
+    # the specimen radius R", the default, not "infinite".
+    #   lower bound, physical : l >~ R/2, or the potential stays rim-peaked and you are back in
+    #                           v4's regime (centre/rim 0.42 at R/5, 2.24 at R/2, 4.06 as l->inf)
+    #   upper bound, numerical: cond(A) ~ (gamma+8)*(l/dx)^2, so l ~ 90 px is still unremarkable
     reach: Optional[float] = None
     gamma: float = 100.0     # vacuum absorption. Numerical. Needs gamma >> max(varsigma, 1).
     # Density at which material starts conducting. Numerical. None -> the linear indicator
@@ -93,9 +98,16 @@ class V5Params:
     dx: float = 1.0
 
     def varsigma(self) -> float:
-        """``(dx/reach)^2``.  0 for the pure Poisson closure."""
-        if self.reach is None or not np.isfinite(self.reach) or self.reach <= 0:
-            return 0.0
+        """``(dx/reach)^2``.  Strictly positive; ``reach`` must have been resolved first."""
+        if self.reach is None:
+            raise ValueError("reach is unresolved: call degrade_v5.resolve(p, theta) first")
+        if not np.isfinite(self.reach) or self.reach <= 0:
+            raise ValueError(
+                "reach = %r is not a legal setting. The pure Poisson closure (l = infinity, "
+                "varsigma = 0) is a LIMIT to be approached and reported, never selected: with "
+                "no varsigma the only regulariser is the absorption gamma*(1-sigma), which "
+                "vanishes on any field without vacuum, leaving a singular pure Neumann "
+                "Laplacian. Use a finite l; l ~ R is the default." % (self.reach,))
         return float((self.dx / self.reach) ** 2)
 
     def decay_factor(self, I_p):
@@ -118,10 +130,21 @@ class StepInfo5:
 
 
 def resolve(p: V5Params, theta) -> V5Params:
-    if p.f_max is not None:
-        return p
-    peak = float(np.abs(np.asarray(theta, dtype=float)).max())
-    return replace(p, f_max=(peak if peak > 0.0 else 1.0))
+    """Fill ``f_max`` from the initial peak and ``reach`` from the specimen radius.
+
+    The default reach is ``R``, the radius containing 99% of the mass, which is the same
+    statistic the shrinkage is reported against.  It is a physical length, so unlike v4's
+    ``c_cp`` it transfers across grids.
+    """
+    theta = np.asarray(theta, dtype=float)
+    out = p
+    if out.f_max is None:
+        peak = float(np.abs(theta).max())
+        out = replace(out, f_max=(peak if peak > 0.0 else 1.0))
+    if out.reach is None:
+        out = replace(out, reach=float(support_radius(theta)))
+    out.varsigma()          # raises here, at entry, rather than downstream on a degenerate solve
+    return out
 
 
 # --- step 4a: the compaction potential ---------------------------------------------------
@@ -133,9 +156,15 @@ def material_indicator(ft, f_max: float, f_ref_frac: Optional[float]):
     makes a low-contrast interior behave partly like vacuum.  Both are testable.
     """
     ft = np.asarray(ft, dtype=float)
+    # NO CLIPPING. The clip was a guard against the logistic's ~1e-6 negative residual, but it
+    # is not expressible in Pyomo, so numpy and the NLP would compute different functions and
+    # the gate fails on exactly those pixels (measured: 9.2e-05 on c_sig). The guard is not
+    # needed: at ft = -1e-6 the indicator is -2e-4 against a diagonal of gamma ~ 100, so the
+    # operator stays strongly diagonally dominant and the M-matrix property survives. In the
+    # NLP f carries a lower bound of 0 anyway, so ft >= 0 there by construction.
     if f_ref_frac is None:
-        return np.clip(ft / f_max, 0.0, 1.0)
-    return 1.0 - np.exp(-np.clip(ft, 0.0, None) / (f_ref_frac * f_max))
+        return ft / f_max
+    return 1.0 - np.exp(-ft / (f_ref_frac * f_max))
 
 
 def potential_operator(sigma, varsigma: float, gamma: float):
@@ -169,8 +198,18 @@ def compaction_potential(ft, dw, p: V5Params):
     fm = float(p.f_max)
     Pi = np.asarray(dw, dtype=float) * np.asarray(ft, dtype=float) / fm
     sigma = material_indicator(ft, fm, p.f_ref_frac)
-    A = potential_operator(sigma, p.varsigma(), p.gamma)
+    vs = p.varsigma()          # raises if reach is illegal, so varsigma > 0 from here on
+    A = potential_operator(sigma, vs, p.gamma)
     phi = spla.spsolve(A, Pi.ravel()).reshape(Pi.shape)
+    # EXACT bound, not a heuristic. A is irreducibly diagonally dominant with row sums at least
+    # varsigma, so the M-matrix structure gives ||phi||_inf <= ||Pi||_inf / varsigma, and the
+    # bound is attained on a vacuum-free field with uniform void. Anything above it means the
+    # solve did not converge or the operator was assembled wrong.
+    bound = float(np.abs(Pi).max()) / vs
+    if not np.all(np.isfinite(phi)) or float(np.abs(phi).max()) > bound * (1.0 + 1e-6) + 1e-12:
+        raise ValueError("compaction potential violates its M-matrix bound: max|phi| = %.6e "
+                         "against ||Pi||_inf/varsigma = %.6e"
+                         % (float(np.abs(phi).max()), bound))
     return phi, Pi, sigma
 
 
