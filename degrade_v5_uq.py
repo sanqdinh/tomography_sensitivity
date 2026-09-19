@@ -44,7 +44,7 @@ from degrade_v2 import scale_to_optical_depth
 
 def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None,
                    inline_Ipix: bool = False, inline_dw: bool = False,
-                   inline_ft: bool = False):
+                   inline_ft: bool = False, sigma_fixed=None):
     """Steps 1-7 of the reduced model as a Pyomo model."""
     theta_ref = np.asarray(theta_ref, dtype=float)
     p = resolve(p, theta_ref)
@@ -158,16 +158,31 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
         return mm.Pi[q, k] * fm == _dwv(mm, q, k) * _ft(mm, q, k)
     m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
 
-    # sigma < 1 is structural (1 - exp(-x) < 1); the lower bound is left open because ft can be
-    # marginally negative from the logistic residual and a hard 0 would make pinning the gate
-    # trajectory an out-of-bounds write.
-    m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
+    # sigma: a VARIABLE by default, or FROZEN to supplied constants.
+    #
+    # Frozen is not an approximation of the model, it is the inner problem of a Picard loop --
+    # see run_v5_picard. It matters because A(ftilde) phi = Pi is BILINEAR in (sigma, phi), and
+    # that cross term is what spoils the projected Hessian: it is off-diagonal with zero
+    # diagonal, so it contributes an indefinite block at every iterate and IPOPT regularises on
+    # essentially every iteration (measured: 201 of 200 with sigma free, against 2 of 139 for
+    # v4). Holding sigma constant makes c_phi LINEAR in phi, so it contributes nothing to the
+    # Hessian at all and the indefiniteness is removed by construction rather than by tuning.
+    m.sigma_frozen = sigma_fixed is not None
+    if m.sigma_frozen:
+        sf = np.asarray(sigma_fixed, dtype=float).reshape(npix, K)
+        m.sig = pyo.Param(m.PIX, m.TM, initialize=lambda _m, q, k: float(sf[q, k]),
+                          mutable=True, within=pyo.Reals)
+    else:
+        # sigma < 1 is structural (1 - exp(-x) < 1); the lower bound is left open because ft can
+        # be marginally negative from the logistic residual and a hard 0 would make pinning the
+        # gate trajectory an out-of-bounds write.
+        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
 
-    def _sigc(mm, q, k):
-        if f_ref is None:
-            return mm.sig[q, k] * fm == _ft(mm, q, k)
-        return mm.sig[q, k] == 1.0 - pyo.exp(-_ft(mm, q, k) / f_ref)
-    m.c_sig = pyo.Constraint(m.PIX, m.TM, rule=_sigc)
+        def _sigc(mm, q, k):
+            if f_ref is None:
+                return mm.sig[q, k] * fm == _ft(mm, q, k)
+            return mm.sig[q, k] == 1.0 - pyo.exp(-_ft(mm, q, k) / f_ref)
+        m.c_sig = pyo.Constraint(m.PIX, m.TM, rule=_sigc)
 
     m.phi = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
@@ -280,7 +295,8 @@ def pin_model(m, traj, *, fix=True):
             if not m.inline_ft:
                 m.ft[q, k].set_value(float(traj["ft"][q, k]))
             m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
-            m.sig[q, k].set_value(float(traj["sig"][q, k]))
+            if not m.sigma_frozen:
+                m.sig[q, k].set_value(float(traj["sig"][q, k]))
             m.phi[q, k].set_value(float(traj["phi"][q, k]))
             if fix:
                 if not m.inline_Ipix:
@@ -290,7 +306,8 @@ def pin_model(m, traj, *, fix=True):
                 if not m.inline_ft:
                     m.ft[q, k].fix()
                 m.Pi[q, k].fix()
-                m.sig[q, k].fix()
+                if not m.sigma_frozen:
+                    m.sig[q, k].fix()
                 m.phi[q, k].fix()
     for idx in m.CH:
         m.S[idx].set_value(float(traj["S"][idx]))
