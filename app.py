@@ -69,6 +69,11 @@ from degrade_v2 import (
     simulate as simulate_v2_seq,
 )
 from degrade_v2_uq import V2UQParams, run_v2_reconstruction
+from degrade_v4 import (
+    V4Params,
+    simulate as simulate_v4_seq,
+    support_radius as support_radius_v4,
+)
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -528,6 +533,22 @@ for _k, _v in {
     # Measured at grid 12 with an over-determined geometry, theta error vs peak:
     # tv 0 -> 0.63%, 0.001 -> 0.80%, 0.01 -> 3.47%, 0.05 -> 9.28%, 0.2 -> 19.0%.
     "v2_tv_weight": 0.001, "v2_eps_rel": 1e-3, "v2_freeze": False, "v2_uq": True,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+# 2D reduced model (v4) -- its own namespace again. The dose state is gone, so there is no
+# c_q / Q_c / omega_inf here: the converted fraction is dw = 1 - exp(-c_omega * I_p * delta_p),
+# a function of THIS exposure alone. c_omega carries v3's c_q/Q_c = 0.1.
+if "beam_table_v4" not in st.session_state:
+    st.session_state["beam_table_v4"] = _empty_beam_table()
+for _k, _v in {
+    "v4_angle": 45.0, "v4_offset": 0.0, "v4_nbeams": 0, "v4_res": 32,
+    "v4_view": "Attenuation f", "v4_showbeams": True,
+    "v4_depth": 1.1, "v4_I0": 1.0,
+    "v4_c_omega": 0.1, "v4_c_cp": 0.3, "v4_a": 0.05, "v4_b": 0.0,
+    "v4_flux": "upwind", "v4_beta": 1000.0,
+    "v4_preset_lo": 0.0, "v4_preset_hi": 180.0, "v4_preset_n": 10,
+    "v4_view_k": 0,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -1817,8 +1838,292 @@ def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     return theta, f, Q, summary
 
 
+# --- 2D reduced model (v4) tab: forward simulation only, no reconstruction ---------------
+# v3 with the dose state removed. Setting the response floor to zero collapses the accumulated
+# dose out of the algebra, so the converted fraction depends on THIS exposure alone:
+#   dw = 1 - omega(Q_k+1)/omega(Q_k) = 1 - exp(-(Q_k+1 - Q_k)/Qc) = 1 - exp(-c_omega I_p delta_p)
+# The state is the single field f. Verified bit-identical to v3 at omega_inf = 0
+# (degrade_v4's G4), so this tab is the same physics with one fewer state variable.
+_V4_RESOLUTIONS = (32, 48, 64, 96)
+_V4_VIEWS = ("Attenuation f", "Converted fraction dw", "Change (f - theta)")
+_V4_FLUXES = ("upwind", "harmonic")
+
+
+def _cb_v4_step():
+    """Take a v4 measurement: append the current bundle to the v4 sequence table."""
+    s = st.session_state
+    s["beam_table_v4"] = pd.concat(
+        [s["beam_table_v4"], pd.DataFrame([{
+            "angle_deg": float(s["v4_angle"]),
+            "offset": float(s["v4_offset"]),
+            "n_beams": int(s["v4_nbeams"]),
+        }])], ignore_index=True)
+    s["v4_view_k"] = len(s["beam_table_v4"])
+
+
+def _cb_v4_reset():
+    """Clear the v4 sequence -- back to the undamaged sample."""
+    st.session_state["beam_table_v4"] = _empty_beam_table()
+
+
+def _cb_sync_live_sim_v4():
+    """Fold the component's reported bundle back into the canonical ``v4_*`` values."""
+    _sync_live_sim("v4", "live_sim_v4")
+
+
+@st.cache_data(show_spinner=False)
+def _simulate_v4(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
+                 c_cp: float, a: float, b: float, flux: str, beta: float):
+    """``(theta, f, dw, summary)`` for the sequence -- a pure function of table + parameters.
+
+    Cached like ``_simulate_v2``: scrubbing the view or switching the panel is a cache hit, only
+    a new measurement or a moved parameter recomputes. ``summary`` is plain floats so nothing
+    exotic crosses the cache.
+
+    The shrinkage statistic is the SUPPORT RADIUS about the FIXED INITIAL CENTROID, not the
+    radius of gyration and not the support radius about the field's own centroid. Both of those
+    were measured to be misleading on this model: Rg reported the WRONG SIGN in both directions,
+    and the own-centroid support radius reported +1.0% growth for a specimen that had not grown,
+    because asymmetric mass loss drags the centroid 0.36 px. Rg is kept as a secondary readout
+    and labelled.
+    """
+    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
+    p = V4Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
+                 beta=float(beta), flux=str(flux))
+    f, infos = simulate_v4_seq(theta, seq, p, int(image_res))
+
+    nr, nc = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m0 = float(theta.sum())
+    cx0, cy0 = (xx * theta).sum() / m0, (yy * theta).sum() / m0
+    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2).ravel()
+    order = np.argsort(rad)
+    rsort = rad[order]
+
+    def _sup(img):
+        w = np.clip(np.asarray(img, dtype=float).ravel(), 0.0, None)[order]
+        c = np.cumsum(w)
+        return float(rsort[np.searchsorted(c, 0.99 * c[-1])]) if c[-1] > 0 else float("nan")
+
+    r0, r1 = _sup(theta), _sup(f)
+    msum = float(f.sum())
+    drift = (float(np.hypot((xx * f).sum() / msum - cx0, (yy * f).sum() / msum - cy0))
+             if msum > 0 else float("nan"))
+    rg0, rg1 = radius_of_gyration(theta), radius_of_gyration(f)
+    # dw of the NEXT exposure at the current aim, for the panel -- a view, not a state.
+    dw_panel = np.zeros_like(theta)
+    if seq:
+        from degrade_v2 import accumulate_dose as _acc
+        from dose_response import bundle_r_values as _brv
+        ang, off, nb = seq[-1]
+        cid, _ip = _acc(f, _brv(float(off), int(nb), int(image_res)),
+                        float(np.deg2rad(float(ang))), float(I0), float(c_omega))
+        dw_panel = 1.0 - np.exp(-cid)
+    summary = {
+        "mass0": m0, "mass1": msum, "lost": sum((i.lost for i in infos), 0.0),
+        "sup0": r0, "sup1": r1,
+        "sup_pct": (100.0 * (r1 - r0) / r0) if r0 > 0 else float("nan"),
+        "drift": drift,
+        "rg0": rg0, "rg1": rg1,
+        "rg_pct": (100.0 * (rg1 - rg0) / rg0) if rg0 > 0 else float("nan"),
+        "ck": max((i.compaction for i in infos), default=0.0),
+        "dw_max": max((i.dw_max for i in infos), default=0.0),
+        "f_min": min((i.state_min for i in infos), default=float(f.min())),
+        "beta_g": float(beta) * max((i.max_g for i in infos), default=0.0),
+    }
+    return theta, f, dw_panel, summary
+
+
+def _render_2d_v4_tab():
+    """The reduced damage model: one state field, no dose. Forward simulation only."""
+    s = st.session_state
+    st.caption(
+        "**Reduced damage model (v4).** v3 with the dose state removed. Setting the response "
+        "floor to zero makes the accumulated dose cancel out of the algebra, so the converted "
+        "fraction is `dw = 1 - exp(-c_omega * I_p * delta_p)` -- a function of *this* exposure "
+        "and nothing carried forward. **The state is the single field f.** Gone with the dose: "
+        "`omega_inf`, `Q_c`, `c_q`, the energy density and the dose budget. Kept verbatim: the "
+        "photon balance, the decay `exp(-aI - bI^2)`, the compaction flux and the mass balance. "
+        "Verified bit-identical to v3 at `omega_inf = 0`. Forward simulation only -- no "
+        "reconstruction, no solver."
+    )
+    left, mid, right = st.columns([3, 2, 2])
+
+    res = int(s["v4_res"])
+    seq_all = _table_to_seq(s["beam_table_v4"])
+    n_all = len(seq_all)
+    seq = seq_all[:max(0, min(int(s["v4_view_k"]), n_all))]
+    n_meas = len(seq)
+
+    theta, f, dw_panel, summary = _simulate_v4(
+        seq, res, float(s["v4_depth"]), float(s["v4_I0"]), float(s["v4_c_omega"]),
+        float(s["v4_c_cp"]), float(s["v4_a"]), float(s["v4_b"]),
+        str(s["v4_flux"]), float(s["v4_beta"]),
+    )
+
+    view = s["v4_view"]
+    if view == _V4_VIEWS[1]:
+        panel, vlo, vhi = dw_panel, 0.0, max(float(dw_panel.max()), 1e-12)
+    elif view == _V4_VIEWS[2]:
+        panel = f - theta
+        span = max(float(np.abs(panel).max()), 1e-12)
+        vlo, vhi = -span, span
+    else:
+        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
+
+    with left:
+        _nav_block("v4_view_k", n_all)
+        _live_sim(
+            image_uri=_live_background_uri(panel, vlo, vhi),
+            image_res=res,
+            k=n_meas,
+            angle=float(s["v4_angle"]),
+            offset=float(s["v4_offset"]),
+            nbeams=int(s["v4_nbeams"]),
+            committed=(list(seq[-1]) if n_meas else None),
+            beams_visible=bool(s["v4_showbeams"]),
+            angle_range=[0, 360, 1],
+            offset_range=[-float(res) / 2, float(res) / 2, 0.5],
+            nbeams_range=[0, res, 1],
+            title="%s   \u00b7   %d measurement%s applied   \u00b7   %d\u00d7%d"
+                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
+            hint='<b style="color:#ff2b2b">Red</b> dashes = next-measurement preview '
+                 '(these sliders); <b style="color:#1f77ff">blue</b> dashes = the last '
+                 'measurement taken. # Beams at 0 means the full fan.',
+            legend="%.3g" % vhi,
+            default={"angle": float(s["v4_angle"]), "offset": float(s["v4_offset"]),
+                     "nbeams": int(s["v4_nbeams"])},
+            key="live_sim_v4",
+            on_change=_cb_sync_live_sim_v4,
+        )
+        # Return value deliberately unused -- it is the standing widget value and survives
+        # reruns, so writing it back each run resurrects a stale bundle. The on_change owns the
+        # sync and runs before these args are rebuilt.
+        st.radio("View", _V4_VIEWS, key="v4_view", horizontal=True)
+
+    with mid:
+        act = st.columns(2)
+        act[0].button("\u2795 Take measurement", on_click=_cb_v4_step,
+                      use_container_width=True, key="v4_take")
+        act[1].button("Reset", on_click=_cb_v4_reset, use_container_width=True, key="v4_clear")
+        st.caption(
+            "Aiming at **%.0f\u00b0**, offset **%.1f**, **%s** \u2014 set these under the picture."
+            % (float(s["v4_angle"]), float(s["v4_offset"]),
+               "full fan" if int(s["v4_nbeams"]) == 0 else "%d beams" % int(s["v4_nbeams"])))
+        st.checkbox("Show beams", key="v4_showbeams")
+
+        with st.expander("Beam and conversion", expanded=True):
+            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v4_I0",
+                      help="0 is the undamaged limit: the step map is exactly the identity, "
+                           "bitwise, with no structural special case in the code.")
+            st.slider("c_omega \u2014 conversion coefficient", 0.0, 3.0, step=0.05,
+                      key="v4_c_omega",
+                      help="dw = 1 - exp(-c_omega * I_p * delta_p). Replaces v3's c_q/Q_c and "
+                           "carries its value, 0.1. It SATURATES: dw is bounded by 1, so the "
+                           "whole available gain from this knob is about 10x. Above c_omega "
+                           "~1 the largest dw exceeds 0.8 and the flux starts running on the "
+                           "density gradient rather than on dose contrast \u2014 aggregation "
+                           "rather than radiation damage. Watch the max dw readout.")
+
+        with st.expander("Compaction and mass", expanded=True):
+            st.slider("c_cp \u2014 compaction number", 0.0, 3.0, step=0.05, key="v4_c_cp",
+                      help="Dimensionless and GRID DEPENDENT: at nearest-neighbour range the "
+                           "compaction length IS one cell, so a value does not transfer between "
+                           "grids. Linear in the flux, bounded only by positivity \u2014 watch "
+                           "C_k.")
+            st.slider("a \u2014 decay coefficient", 0.0, 0.5, step=0.005, format="%.3f",
+                      key="v4_a",
+                      help="Mass leaves by exp(-a*I - b*I^2), driven by instantaneous fluence. "
+                           "**a = b = 0 conserves mass exactly, whatever c_cp does** \u2014 that "
+                           "is the switch, and it is the clean test of shrinkage, since any "
+                           "change in support is then transport alone.")
+            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
+                      key="v4_b",
+                      help="Keep at 0. A non-zero b makes one large exposure damage more than "
+                           "many small ones of the same total fluence, against the dose "
+                           "fractionation theorem.")
+
+        with st.expander("Numerics", expanded=False):
+            st.radio("Face weighting", _V4_FLUXES, key="v4_flux", horizontal=True,
+                     help="**upwind** is the logistic donor cell: the vacuum is inert because "
+                          "at a material/vacuum face the donor is the empty side. **harmonic** "
+                          "weights by 2ab/(a+b), which vanishes when EITHER side is empty, so "
+                          "the vacuum is inert structurally and there is no beta. Harmonic is "
+                          "exactly positive in the working window and loses positivity faster "
+                          "above it; it also costs more per step on easy problems and much less "
+                          "on hard ones.")
+            st.select_slider("beta \u2014 logistic sharpness", options=(20.0, 100.0, 500.0,
+                             1000.0, 2000.0, 5000.0), key="v4_beta",
+                             help="Only read for the upwind flux. The switch must SATURATE: "
+                                  "beta*max|g| needs to be well above 5 or the scheme is still "
+                                  "effectively central. The readout below shows it.")
+            st.select_slider("Grid", options=_V4_RESOLUTIONS, key="v4_res",
+                             help="Unlike v2 this model has no moving-interface diffusion "
+                                  "constraint forcing 64+, so 32 is usable and fast. c_cp is "
+                                  "grid dependent, so re-read the contraction after changing it.")
+
+    with right:
+        _preset_block("v4", "beam_table_v4", "v4_view_k")
+        st.markdown("**Measurement sequence**")
+        st.dataframe(s["beam_table_v4"], use_container_width=True, height=200)
+
+        if summary["ck"] > 1.0:
+            st.warning(
+                "C_k = %.2f \u2014 above 1 the donor-cell positivity bound no longer holds. "
+                "The bound is sufficient, not necessary, so check **min f** below: that is the "
+                "real test. Lower c_cp or c_omega." % summary["ck"])
+        if summary["dw_max"] > 0.8:
+            st.warning(
+                "max dw = %.3f \u2014 above ~0.8 the conversion has saturated, Pi tends to the "
+                "density alone, and the flux runs up the density gradient rather than on dose "
+                "contrast. The model is doing aggregation, not radiation damage."
+                % summary["dw_max"])
+
+        m = st.columns(2)
+        m[0].metric("Total attenuation", "%.4g" % summary["mass1"],
+                    delta="%+.3g" % (summary["mass1"] - summary["mass0"]),
+                    help="Conserved EXACTLY at a = b = 0, whatever c_cp does: the face fluxes "
+                         "are antisymmetric so transport moves mass and never removes it. Above "
+                         "that, the whole change is the decay.")
+        m[1].metric("Support radius (99% mass)", "%.4g" % summary["sup1"],
+                    delta="%+.3f%%" % summary["sup_pct"], delta_color="inverse",
+                    help="**This is what shrinkage means here.** Measured about the FIXED "
+                         "initial centroid, deliberately: about the field's own centroid the "
+                         "same run reads +1.0% growth for a specimen that has not grown, "
+                         "because asymmetric mass loss drags the centroid ~0.36 px. Read it at "
+                         "a = b = 0 for the clean answer.")
+        m2 = st.columns(2)
+        m2[0].metric("C_k (positivity)", "%.3f" % summary["ck"],
+                     help="c_cp * max_p sum_q max(Pi_q - Pi_p, 0). C_k <= 1 is SUFFICIENT for "
+                          "f >= 0 under a saturated donor cell; it is not necessary, so min f "
+                          "is the real check.")
+        m2[1].metric("Max dw", "%.4g" % summary["dw_max"],
+                     help="Largest converted fraction in any one step. Above ~0.8 the "
+                          "conversion has saturated \u2014 see the warning above.")
+        st.caption(
+            "Radius of gyration **%.4g** (%+.2f%%) \u00b7 centroid drift **%.3f px** \u00b7 "
+            "min f **%.3g** \u00b7 beta\u00b7max|g| **%.0f** \u00b7 mass lost **%.4g**"
+            % (summary["rg1"], summary["rg_pct"], summary["drift"], summary["f_min"],
+               summary["beta_g"], summary["lost"]))
+        st.caption(
+            ":gray[Rg is reported for continuity and is **not** the shrinkage statistic: on this "
+            "model it has been measured returning the *opposite sign* to the support radius, in "
+            "both directions. Trust the support radius.]")
+        if float(s["v4_I0"]) == 0.0:
+            st.info("I0 = 0: the step map is the identity, bitwise. The sample stays undamaged.")
+        if float(s["v4_a"]) == 0.0 and float(s["v4_b"]) == 0.0:
+            st.success("a = b = 0: mass is conserved exactly, so any change in support radius "
+                       "is transport alone. This is the clean shrinkage test.")
+
+
 def _render_2d_v2_tab():
-    """The revised damage model: dose is a state, and mass moves instead of vanishing."""
+    """The revised damage model: dose is a state, and mass moves instead of vanishing.
+
+    **NOT WIRED INTO THE TAB BAR.** v4 took this slot; the reduced model is bit-identical to v3
+    at ``omega_inf = 0`` and v3 superseded v2. Kept, unused, the same way ``_live_figure`` and
+    ``_slice_figure`` are kept: it is the reference implementation of the elasticity closure and
+    the only UI that ever drove it. Re-wire by swapping the call in the ``with tab_v4:`` block.
+    """
     s = st.session_state
     st.caption(
         "**Revised damage model (v2).** The 2D tab's model is a pure local sink -- "
@@ -2159,8 +2464,8 @@ def _render_2d_v2_tab():
 
 
 # --- three modes, three tabs ----------------------------------------------------------
-tab_2d, tab_3d, tab_v2 = st.tabs(
-    ["2D dose-response + reconstruction", "3D degradation", "2D model v2"]
+tab_2d, tab_3d, tab_v4 = st.tabs(
+    ["2D dose-response + reconstruction", "3D degradation", "2D reduced model (v4)"]
 )
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
@@ -2169,8 +2474,8 @@ tab_2d, tab_3d, tab_v2 = st.tabs(
 with tab_3d:
     _render_3d_tab()
 
-with tab_v2:
-    _render_2d_v2_tab()
+with tab_v4:
+    _render_2d_v4_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----
