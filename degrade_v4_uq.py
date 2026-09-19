@@ -104,7 +104,7 @@ def build_v4_model(theta_ref, seq, p: V4Params, image_res: int, *, f_bounds=None
         ts = Id_terms[(q, k)]
         if not ts:
             return 0.0
-        return 1.0 - pyo.exp(-p.c * sum(p.I0 * pyo.exp(-mm.S[i]) * ch for i, ch in ts))
+        return 1.0 - pyo.exp(-sum(p.c * p.I0 * pyo.exp(-mm.S[i]) * ch for i, ch in ts))
 
     if inline_dw:
         def _dwv(mm, q, k):
@@ -193,7 +193,7 @@ def numpy_trajectory(theta, seq, p: V4Params, image_res: int):
     _f, _infos, hist = simulate(theta, seq, p, res, record_trajectory=True)
     f = np.stack([h.ravel() for h in hist], axis=1)
 
-    S, Ipix, Idelta = {}, np.zeros((npix, K)), np.zeros((npix, K))
+    S, Ipix, cIdelta = {}, np.zeros((npix, K)), np.zeros((npix, K))
     for k, (_ang, rays) in enumerate(meas):
         for j, (_r, walk) in enumerate(rays):
             acc = 0.0
@@ -201,10 +201,10 @@ def numpy_trajectory(theta, seq, p: V4Params, image_res: int):
             for t, (pix, chord, shield) in enumerate(walk):
                 loc = p.I0 * np.exp(-acc)
                 Ipix[pix, k] += loc
-                Idelta[pix, k] += loc * chord
+                cIdelta[pix, k] += p.c * loc * chord
                 acc += chord * f[shield, k]
                 S[(k, j, t + 1)] = acc
-    dw = 1.0 - np.exp(-p.c * Idelta)
+    dw = 1.0 - np.exp(-cIdelta)
     ft = f[:, :K] * np.exp(-p.a * Ipix - p.b * Ipix ** 2)
     yobs = {}
     for k, (_ang, rays) in enumerate(meas):

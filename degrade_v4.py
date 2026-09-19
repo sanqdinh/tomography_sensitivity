@@ -111,12 +111,16 @@ def step(f, r_values, angle_rad: float, p: V4Params):
     f = np.asarray(f, dtype=float)
     fm = p.f_max if p.f_max is not None else 1.0
 
-    # 1. photon balance. c_q = 1 makes the first return sum_r I_r * delta_r and the second
-    #    sum_r I_r -- the same walk, chord convention and deposit index v2 and v3 use.
-    Idelta, I_p = accumulate_dose(f, r_values, angle_rad, p.I0, 1.0)
+    # 1. photon balance. Passing c as the accumulator's coefficient returns
+    #    sum_r c * I_r * delta_r directly, on the same walk, chord convention and deposit index
+    #    v2 and v3 use. The coefficient goes INSIDE the sum deliberately: v3 forms
+    #    sum(c_q * I * delta) and float addition is not associative, so accumulating
+    #    sum(I*delta) and multiplying afterwards would differ from v3 at ~1e-16 and cost the
+    #    exact bit-identity that gate G4 is for. Same arithmetic, same order, same bits.
+    cIdelta, I_p = accumulate_dose(f, r_values, angle_rad, p.I0, p.c)
 
-    # 2. converted fraction, a direct function of THIS exposure. In [0, 1) since Idelta >= 0.
-    dw = 1.0 - np.exp(-p.c * Idelta)
+    # 2. converted fraction, a direct function of THIS exposure. In [0, 1) since cIdelta >= 0.
+    dw = 1.0 - np.exp(-cIdelta)
 
     # 3. mass loss, unchanged, driven by instantaneous fluence.
     ft = f * p.decay_factor(I_p)
