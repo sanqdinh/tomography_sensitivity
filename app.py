@@ -74,6 +74,7 @@ from degrade_v4 import (
     simulate as simulate_v4_seq,
     support_radius as support_radius_v4,
 )
+from degrade_v5 import V5Params, simulate as simulate_v5_seq, resolve as resolve_v5
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -549,6 +550,21 @@ for _k, _v in {
     "v4_flux": "upwind", "v4_beta": 1000.0,
     "v4_preset_lo": 0.0, "v4_preset_hi": 180.0, "v4_preset_n": 10,
     "v4_view_k": 0,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+# 2D nonlocal model (v5). v4 plus a compaction POTENTIAL: the flux driver stops being pointwise,
+# which is what lets a uniformly damaged bulk condense instead of shuffling at the rim.
+if "beam_table_v5" not in st.session_state:
+    st.session_state["beam_table_v5"] = _empty_beam_table()
+for _k, _v in {
+    "v5_angle": 45.0, "v5_offset": 0.0, "v5_nbeams": 0, "v5_res": 32,
+    "v5_view": "Attenuation f", "v5_showbeams": True,
+    "v5_depth": 1.1, "v5_I0": 1.0,
+    "v5_c_omega": 0.1, "v5_c_cp": 0.3, "v5_a": 0.05, "v5_b": 0.0,
+    "v5_reach": 7.0, "v5_gamma": 100.0, "v5_fref": 0.002, "v5_beta": 1000.0,
+    "v5_preset_lo": 0.0, "v5_preset_hi": 180.0, "v5_preset_n": 10,
+    "v5_view_k": 0,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -1934,6 +1950,227 @@ def _simulate_v4(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     return theta, f, dw_panel, summary
 
 
+# --- 2D nonlocal model (v5) tab: forward simulation only ---------------------------------
+# v4 with the compaction potential made NONLOCAL. v4's flux is driven by Pi, a pointwise
+# function of the local state, and prop:xd_locality then forbids a uniformly damaged bulk from
+# moving at all -- measured interior flux divergence exactly 0.000e+00, which is why v4 shuffles
+# mass at the rim instead of condensing the specimen. v5 drives the same flux with a potential
+# phi solved across the whole specimen, so the bulk can move.
+#
+# THE REACH SLIDER IS THE POINT. l -> small recovers v4 (rim shuffling); l ~ R and above gives
+# whole-body contraction. Sliding it walks the closure between the two behaviours.
+_V5_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
+_V5_RESOLUTIONS = (32, 48, 64)
+
+
+def _cb_v5_step():
+    s = st.session_state
+    s["beam_table_v5"] = pd.concat(
+        [s["beam_table_v5"], pd.DataFrame([{
+            "angle_deg": float(s["v5_angle"]), "offset": float(s["v5_offset"]),
+            "n_beams": int(s["v5_nbeams"])}])], ignore_index=True)
+    s["v5_view_k"] = len(s["beam_table_v5"])
+
+
+def _cb_v5_reset():
+    st.session_state["beam_table_v5"] = _empty_beam_table()
+
+
+def _cb_sync_live_sim_v5():
+    _sync_live_sim("v5", "live_sim_v5")
+
+
+@st.cache_data(show_spinner=False)
+def _simulate_v5(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
+                 c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
+                 beta: float):
+    """``(theta, f, phi, summary)``. Support radius is about the FIXED initial centroid."""
+    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
+    p = V5Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
+                 reach=float(reach), gamma=float(gamma), f_ref_frac=float(fref),
+                 beta=float(beta))
+    try:
+        f, infos = simulate_v5_seq(theta, seq, p, int(image_res))
+        err = None
+    except Exception as exc:                 # the potential's guards raise rather than return junk
+        f, infos, err = theta.copy(), [], str(exc).split(":")[0]
+
+    nr, nc = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m0 = float(theta.sum())
+    cx0, cy0 = (xx * theta).sum() / m0, (yy * theta).sum() / m0
+    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2).ravel()
+    order = np.argsort(rad)
+    rsort = rad[order]
+
+    def _q(img, frac):
+        w = np.clip(np.asarray(img, float).ravel(), 0.0, None)[order]
+        c = np.cumsum(w)
+        return float(rsort[np.searchsorted(c, frac * c[-1])]) if c[-1] > 0 else float("nan")
+
+    r0, r1 = _q(theta, 0.99), _q(f, 0.99)
+    h0, h1 = _q(theta, 0.50), _q(f, 0.50)
+    # signed radial transport: one sign change is condensation, many is rim shuffling
+    d = f - theta
+    bands = [float(d[(rad.reshape(nr, nc) >= lo) & (rad.reshape(nr, nc) < lo + 2)].sum())
+             for lo in range(0, int(0.55 * nr), 2)]
+    flips = sum(1 for i in range(len(bands) - 1) if bands[i] * bands[i + 1] < 0)
+    msum = float(f.sum())
+    phi_panel = np.zeros_like(theta)
+    if infos and seq:
+        from degrade_v5 import compaction_potential
+        from degrade_v2 import accumulate_dose as _acc
+        from dose_response import bundle_r_values as _brv
+        pr = resolve_v5(p, theta)
+        ang, off, nb = seq[-1]
+        cid, I_p = _acc(f, _brv(float(off), int(nb), int(image_res)),
+                        float(np.deg2rad(float(ang))), pr.I0, pr.c)
+        try:
+            phi_panel, _Pi, _sg = compaction_potential(f * pr.decay_factor(I_p),
+                                                       1.0 - np.exp(-cid), pr)
+        except Exception:
+            pass
+    summary = {
+        "err": err, "mass0": m0, "mass1": msum,
+        "sup0": r0, "sup1": r1, "sup_pct": (100.0 * (r1 - r0) / r0) if r0 > 0 else float("nan"),
+        "half_pct": (100.0 * (h1 - h0) / h0) if h0 > 0 else float("nan"),
+        "flips": flips,
+        "inner": float(d[(rad.reshape(nr, nc) < 0.25 * nr)].sum()),
+        "outer": float(d[(rad.reshape(nr, nc) > 0.30 * nr)].sum()),
+        "ck": max((i.compaction for i in infos), default=0.0),
+        "dw_max": max((i.dw_max for i in infos), default=0.0),
+        "f_min": min((i.state_min for i in infos), default=float(f.min())),
+        "phi_cr": (infos[-1].phi_core_rim if infos else float("nan")),
+    }
+    return theta, f, phi_panel, summary
+
+
+def _render_2d_v5_tab():
+    """The nonlocal closure: whole-body condensation rather than rim shuffling."""
+    s = st.session_state
+    st.caption(
+        "**Nonlocal damage model (v5).** v4 with one change: the compaction flux is driven by a "
+        "**potential solved across the whole specimen** instead of by the pointwise `Pi`. That "
+        "matters because a pointwise antisymmetric flux *cannot* move a uniformly damaged bulk "
+        "\u2014 measured interior divergence exactly 0.000e+00 in v4 \u2014 so v4 shuffles mass "
+        "between neighbours at the rim where v5 condenses the sample. **The reach slider walks "
+        "between them:** small reach reproduces v4, reach of order the specimen radius gives the "
+        "elasticity-like whole-body contraction. Forward simulation only."
+    )
+    left, mid, right = st.columns([3, 2, 2])
+    res = int(s["v5_res"])
+    seq_all = _table_to_seq(s["beam_table_v5"])
+    n_all = len(seq_all)
+    seq = seq_all[:max(0, min(int(s["v5_view_k"]), n_all))]
+    n_meas = len(seq)
+    theta, f, phi, summary = _simulate_v5(
+        seq, res, float(s["v5_depth"]), float(s["v5_I0"]), float(s["v5_c_omega"]),
+        float(s["v5_c_cp"]), float(s["v5_a"]), float(s["v5_b"]), float(s["v5_reach"]),
+        float(s["v5_gamma"]), float(s["v5_fref"]), float(s["v5_beta"]))
+
+    view = s["v5_view"]
+    if view == _V5_VIEWS[1]:
+        panel, vlo, vhi = phi, 0.0, max(float(phi.max()), 1e-12)
+    elif view == _V5_VIEWS[2]:
+        panel = f - theta
+        span = max(float(np.abs(panel).max()), 1e-12); vlo, vhi = -span, span
+    else:
+        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
+
+    with left:
+        _nav_block("v5_view_k", n_all)
+        _live_sim(
+            image_uri=_live_background_uri(panel, vlo, vhi), image_res=res, k=n_meas,
+            angle=float(s["v5_angle"]), offset=float(s["v5_offset"]),
+            nbeams=int(s["v5_nbeams"]),
+            committed=(list(seq[-1]) if n_meas else None),
+            beams_visible=bool(s["v5_showbeams"]),
+            angle_range=[0, 360, 1], offset_range=[-float(res)/2, float(res)/2, 0.5],
+            nbeams_range=[0, res, 1],
+            title="%s   \u00b7   %d measurement%s   \u00b7   %d\u00d7%d"
+                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
+            hint='<b style="color:#ff2b2b">Red</b> = next-measurement preview; '
+                 '<b style="color:#1f77ff">blue</b> = last measurement taken.',
+            legend="%.3g" % vhi,
+            default={"angle": float(s["v5_angle"]), "offset": float(s["v5_offset"]),
+                     "nbeams": int(s["v5_nbeams"])},
+            key="live_sim_v5", on_change=_cb_sync_live_sim_v5)
+        st.radio("View", _V5_VIEWS, key="v5_view", horizontal=True)
+
+    with mid:
+        act = st.columns(2)
+        act[0].button("\u2795 Take measurement", on_click=_cb_v5_step,
+                      use_container_width=True, key="v5_take")
+        act[1].button("Reset", on_click=_cb_v5_reset, use_container_width=True, key="v5_clear")
+        st.checkbox("Show beams", key="v5_showbeams")
+        with st.expander("Compaction reach \u2014 the v4/v5 dial", expanded=True):
+            st.slider("l \u2014 compaction reach (px)", 0.5, 32.0, step=0.5, key="v5_reach",
+                      help="A PHYSICAL length, so unlike c_cp it transfers across grids. Small l "
+                           "recovers v4 exactly and the sample shuffles at the rim; l of order "
+                           "the specimen radius (~15 px here) gives whole-body contraction. "
+                           "Below about R/2 the potential is still rim-peaked.")
+            st.slider("c_cp \u2014 compaction number", 0.0, 3.0, step=0.05, key="v5_c_cp")
+        with st.expander("Beam, conversion and decay", expanded=True):
+            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v5_I0")
+            st.slider("c_omega \u2014 conversion", 0.0, 3.0, step=0.05, key="v5_c_omega")
+            st.slider("a \u2014 decay", 0.0, 0.5, step=0.005, format="%.3f", key="v5_a",
+                      help="a = b = 0 conserves mass EXACTLY, whatever c_cp does. That is the "
+                           "clean shrinkage test: any change in support is then transport alone.")
+            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
+                      key="v5_b")
+        with st.expander("Potential numerics", expanded=False):
+            st.select_slider("f_ref / f_max", options=(0.0005, 0.002, 0.01, 0.05, 0.2),
+                             key="v5_fref",
+                             help="Density at which material starts conducting. PHYSICAL, not "
+                                  "numerical: at most a fifth of the smallest interior value the "
+                                  "phantom carries. Too large and the closure switches off over "
+                                  "a low-contrast interior \u2014 on Shepp-Logan 0.05 expands "
+                                  "and 0.01 or below contracts.")
+            st.select_slider("gamma \u2014 vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
+                             key="v5_gamma", help="Sets how fast the potential decays into "
+                                                  "vacuum. Needs gamma >> 1.")
+            st.select_slider("beta", options=(100.0, 1000.0, 5000.0), key="v5_beta")
+            st.select_slider("Grid", options=_V5_RESOLUTIONS, key="v5_res")
+
+    with right:
+        _preset_block("v5", "beam_table_v5", "v5_view_k")
+        st.markdown("**Measurement sequence**")
+        st.dataframe(s["beam_table_v5"], use_container_width=True, height=180)
+        if summary["err"]:
+            st.error("Potential solve refused: %s. The guards raise rather than return a wrong "
+                     "answer \u2014 raise the reach or f_ref." % summary["err"])
+        if summary["ck"] > 1.0:
+            st.warning("C_k = %.2f > 1: the positivity bound no longer holds. Check min f."
+                       % summary["ck"])
+        m = st.columns(2)
+        m[0].metric("Support radius (99%)", "%.4g" % summary["sup1"],
+                    delta="%+.3f%%" % summary["sup_pct"], delta_color="inverse",
+                    help="About the FIXED initial centroid. Negative is contraction.")
+        m[1].metric("Half-mass radius (50%)", "%.4g" % summary["half_pct"] if False else
+                    "%+.3f%%" % summary["half_pct"],
+                    help="The interior statistic. v4 leaves this at 0.000% because it only ever "
+                         "moves the rim; v5 moving it is the whole-body condensation.")
+        m2 = st.columns(2)
+        m2[0].metric("Radial sign changes", "%d" % summary["flips"],
+                     help="**The elasticity test.** ONE sign change is coherent condensation: "
+                          "mass leaves the outside and arrives inside. Several means mass is "
+                          "shuffling between neighbours, which is what v4 does.")
+        m2[1].metric("Total attenuation", "%.4g" % summary["mass1"],
+                     delta="%+.3g" % (summary["mass1"] - summary["mass0"]))
+        st.caption(
+            "net mass inside **%+.3g** \u00b7 outside **%+.3g** \u00b7 C_k **%.3f** \u00b7 "
+            "min f **%.2e** \u00b7 phi centre/rim **%.2f**"
+            % (summary["inner"], summary["outer"], summary["ck"], summary["f_min"],
+               summary["phi_cr"]))
+        if float(s["v5_a"]) == 0.0 and float(s["v5_b"]) == 0.0:
+            st.success("a = b = 0: mass exactly conserved, so any support change is transport "
+                       "alone \u2014 the clean shrinkage test.")
+        if summary["phi_cr"] == summary["phi_cr"] and summary["phi_cr"] < 1.0:
+            st.info("phi is still rim-peaked (centre/rim %.2f < 1): raise the reach above about "
+                    "half the specimen radius to get whole-body contraction."
+                    % summary["phi_cr"])
+
+
 def _render_2d_v4_tab():
     """The reduced damage model: one state field, no dose. Forward simulation only."""
     s = st.session_state
@@ -2464,8 +2701,8 @@ def _render_2d_v2_tab():
 
 
 # --- three modes, three tabs ----------------------------------------------------------
-tab_2d, tab_3d, tab_v4 = st.tabs(
-    ["2D dose-response + reconstruction", "3D degradation", "2D reduced model (v4)"]
+tab_2d, tab_3d, tab_v5 = st.tabs(
+    ["2D dose-response + reconstruction", "3D degradation", "2D nonlocal model (v5)"]
 )
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
@@ -2474,8 +2711,8 @@ tab_2d, tab_3d, tab_v4 = st.tabs(
 with tab_3d:
     _render_3d_tab()
 
-with tab_v4:
-    _render_2d_v4_tab()
+with tab_v5:
+    _render_2d_v5_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----
