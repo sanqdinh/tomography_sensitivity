@@ -57,6 +57,9 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
 
     m = pyo.ConcreteModel(name="degrade_v5")
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
+    # carried so initialize_from_numpy is self-contained: it re-runs the numpy model
+    # through the SAME fixed measurement sequence this model was built around.
+    m.seq, m.theta_ref = tuple(tuple(x) for x in seq), np.array(theta_ref, dtype=float)
     m.inline_Ipix, m.inline_dw, m.inline_ft = bool(inline_Ipix), bool(inline_dw), bool(inline_ft)
 
     m.PIX = pyo.RangeSet(0, npix - 1)
@@ -668,3 +671,79 @@ def forward_solve_staged(theta, seq, p: V5Params, image_res: int, *, linear_solv
                 f_pyomo=f_py, f_numpy=ref["f"],
                 err_rel=float(np.abs(f_py - ref["f"]).max()) / scale,
                 staged_err_rel=float(np.abs(acc["f"] - ref["f"]).max()) / scale)
+
+
+# --- initialisation from the numpy model ------------------------------------------------
+
+def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False):
+    """Initialise every variable of a v5 Pyomo model from a :mod:`degrade_v5` run.
+
+    **Spec-agnostic by construction.**  The forward model and the estimation model differ only
+    in whether ``f[:,0]`` is fixed; the initialisation is the same operation in both, because in
+    both the measurement sequence is *given*.  So: hold the angles fixed, run the numpy model
+    through them to get the field at every time step, and copy the result across.  Nothing here
+    inspects which spec it was handed.
+
+    ``theta_seed`` is the field the numpy run starts from -- the quantity the Pyomo model is
+    being initialised *about*, not necessarily the truth:
+
+    * forward     -- the true ``theta``.  The trajectory is then the answer, and the model starts
+                     feasible to ~1e-16.
+    * estimation  -- the current estimate (a flat field, a continuation solution, a previous
+                     outer iterate).  Every dynamic row then starts at residual ~0 and only the
+                     data-fit rows are wrong, which is the initialisation the v2/v3 drivers used
+                     and the reason they began dynamically feasible.
+
+    Defaults to the ``theta_ref`` the model was built with.
+
+    ``fix_theta`` additionally fixes ``f[:,0]``, which is what turns the estimation model into
+    the forward one.  Left False the caller keeps whatever the model already had.
+
+    Returns a dict with the seed, the worst constraint residual after initialising, and which
+    blocks were written -- the residual is the useful number, since it says how good the start
+    actually is rather than asserting that it is good.
+    """
+    theta_seed = m.theta_ref if theta_seed is None else np.asarray(theta_seed, dtype=float)
+    theta_seed = np.asarray(theta_seed, dtype=float).reshape(m.res, m.res)
+
+    traj = numpy_trajectory(theta_seed, m.seq, m.p, m.res)
+    written = []
+
+    # f and the per-stage scalar fields. Blocks absent through inlining, or frozen to Params,
+    # are skipped rather than special-cased at the call site.
+    for q in m.PIX:
+        for k in m.T:
+            m.f[q, k].set_value(float(traj["f"][q, k]))
+        for k in m.TM:
+            if not m.inline_Ipix:
+                m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
+            if not m.inline_dw:
+                m.dw[q, k].set_value(float(traj["dw"][q, k]))
+            if not m.inline_ft:
+                m.ft[q, k].set_value(float(traj["ft"][q, k]))
+            m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
+            m.phi[q, k].set_value(float(traj["phi"][q, k]))
+            if not m.sigma_frozen:
+                m.sig[q, k].set_value(float(traj["sig"][q, k]))
+    written += ["f"] + [n for n, on in (("Ipix", m.inline_Ipix), ("dw", m.inline_dw),
+                                        ("ft", m.inline_ft)) if not on]
+    written += ["Pi", "phi"] + ([] if m.sigma_frozen else ["sig"])
+
+    for idx in m.CH:
+        m.S[idx].set_value(float(traj["S"][idx]))
+    for idx in m.RAY:
+        m.yobs[idx].set_value(float(traj["yobs"][idx]))
+    written += ["S", "yobs"]
+
+    if fix_theta:
+        for q in m.PIX:
+            m.f[q, 0].fix(float(theta_seed.ravel()[q]))
+
+    resid, where = max_residual(m)
+    out = dict(seed_is_theta_ref=theta_seed is m.theta_ref, residual=resid, worst_row=where,
+               blocks=written, n_steps=m.n_steps, res=m.res,
+               sigma_frozen=m.sigma_frozen, theta_fixed=bool(fix_theta))
+    if verbose:
+        print("  initialised %d blocks from the numpy model over %d steps; worst residual "
+              "%.3e (%s)" % (len(written), m.n_steps, resid, where))
+    return out
