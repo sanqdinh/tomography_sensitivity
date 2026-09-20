@@ -1005,3 +1005,96 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
         print("  initialised %d blocks from the numpy model over %d steps; worst residual "
               "%.3e (%s)" % (len(written), m.n_steps, resid, where))
     return out
+
+
+# --- CLI ------------------------------------------------------------------------------------
+#
+# A grid-32 reconstruction takes minutes and must not need a browser session open for the whole
+# of it. Same shape as degrade_v2_uq's: no subcommands, one --reconstruct flag switching between
+# the model check (the default, and the cheap one) and a run.
+
+def _cli(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--reconstruct", action="store_true",
+                    help="run a reconstruction instead of the model check")
+    ap.add_argument("--image-res", type=int, default=24)
+    ap.add_argument("--n-steps", type=int, default=3)
+    ap.add_argument("--optical-depth", type=float, default=1.1)
+    ap.add_argument("--I0", type=float, default=1.0,
+                    help="0 is the CONTROL: identity dynamics, so the error is tomography+TV "
+                         "alone and the gap to I0>0 is the cost of inverting the damage model")
+    ap.add_argument("--c", type=float, default=0.1)
+    ap.add_argument("--a", type=float, default=0.05)
+    ap.add_argument("--c-cp", type=float, default=0.3)
+    ap.add_argument("--reach", type=float, default=7.0)
+    ap.add_argument("--gamma", type=float, default=100.0)
+    ap.add_argument("--f-ref-frac", type=float, default=0.002)
+    ap.add_argument("--tv-weight", type=float, default=0.001)
+    ap.add_argument("--noise-sigma", type=float, default=0.0)
+    ap.add_argument("--max-iter", type=int, default=3000)
+    ap.add_argument("--linear-solver", default="ma97")
+    ap.add_argument("--no-continuation", action="store_true")
+    ap.add_argument("-o", "--out", default=None, help="write results to this .npz")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    if not a.reconstruct:
+        check_forward(image_res=a.image_res, n_steps=a.n_steps, I0=a.I0, c=a.c, a=a.a,
+                      c_cp=a.c_cp, reach=a.reach, gamma=a.gamma, f_ref_frac=a.f_ref_frac,
+                      verbose=not a.quiet)
+        return 0
+
+    params = V5UQParams(
+        image_res=a.image_res, optical_depth=a.optical_depth,
+        beam_steps=tuple((180.0 * i / a.n_steps, 0.0, 0) for i in range(a.n_steps)),
+        I0=a.I0, c=a.c, a=a.a, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
+        f_ref_frac=a.f_ref_frac, tv_weight=a.tv_weight, noise_sigma=a.noise_sigma,
+        continuation=not a.no_continuation, ipopt_max_iter=a.max_iter,
+        linear_solver=a.linear_solver)
+
+    cb = None if a.quiet else (lambda chunk: (sys.stdout.write(chunk), sys.stdout.flush()))
+    t0 = time.time()
+    r = run_v5_reconstruction(params, log_callback=cb)
+    secs = time.time() - t0
+
+    print("\n=== v5 reconstruction, grid %d, %d measurements, I0 = %g ==="
+          % (a.image_res, a.n_steps, a.I0))
+    print("  model vs simulator : %.3e   (the gate; a reconstruction against a drifted model "
+          "means nothing)" % r.forward_residual)
+    print("  start residual     : %.3e   (dynamically feasible start, so only the fit is wrong)"
+          % r.init_residual)
+    print("  continuation       : %-24s %4s it  %6.1fs  err %6.2f%%"
+          % (r.continuation_status, r.continuation_iters, r.t_cont, r.theta_rms_cont))
+    print("  monolithic solve   : %-24s %4s it  %6.1fs  (%s)"
+          % (r.status, r.iters, r.t_solve, r.linear_solver))
+    print("  regularised        : %d of %d iterations (%.0f%%)"
+          % (r.regularised, r.n_iter_lines, r.regularised_pct))
+    print("  size               : %s vars, %s cons" % (format(r.n_vars, ","),
+                                                       format(r.n_cons, ",")))
+    print("  fit RMS            : %.4e   (what the NLP minimised)" % r.obs_rms)
+    print("  theta error        : %.3f%% of peak   (synthetic data only)" % r.theta_pct_peak)
+    print("  eq:xd_box          : %d at lower, %d at upper, %d interior"
+          % (r.n_theta_at_lower, r.n_theta_at_upper, r.n_theta_interior))
+    print("  damage context     : mass %.4g -> %.4g, C_k %.3f, max phi %.3g"
+          % (r.theta_true.sum(), r.mass_true, r.ck_max, r.phi_max))
+    print("  shape              : support %+.3f%%, half-mass %+.3f%%, %d radial sign change(s)"
+          % (r.support_pct, r.half_pct, r.flips))
+    print("  total              : %.1f s" % secs)
+    if "optimal" not in r.status:
+        print("\n  NOT CONVERGED. Read it this way: a LOW start residual with a HIGH")
+        print("  regularisation fraction points at the bilinear (sigma, phi) block in c_phi,")
+        print("  not at the initialisation; a high start residual points at the start.")
+        print("  Compare against --I0 0, which keeps the same block but removes the dynamics.")
+
+    if a.out:
+        np.savez_compressed(a.out, theta_true=r.theta_true, theta_hat=r.theta_hat,
+                            f_final_true=r.f_final_true, f_final_hat=r.f_final_hat,
+                            theta_rms=r.theta_rms, theta_pct_peak=r.theta_pct_peak,
+                            obs_rms=r.obs_rms, seconds=secs)
+        print("  wrote %s" % a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())
