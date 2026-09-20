@@ -44,8 +44,19 @@ from degrade_v2 import scale_to_optical_depth
 
 def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None,
                    inline_Ipix: bool = False, inline_dw: bool = False,
-                   inline_ft: bool = False, sigma_fixed=None):
-    """Steps 1-7 of the reduced model as a Pyomo model."""
+                   inline_ft: bool = False, sigma_fixed=None, potential: bool = True):
+    """Steps 1-7 of the reduced model as a Pyomo model.
+
+    ``potential=False`` omits the whole ``Pi``/``sigma``/``phi`` block.  Legal ONLY at
+    ``c_cp == 0``, where nothing reads ``phi``: the flux terms of :func:`_mass` are the only
+    other consumer.  It exists for the ``I0 = 0, c_cp = 0`` continuation solve, where the block
+    is provably inert -- ``Ipix = 0`` gives ``dw = 0`` and hence ``Pi = 0``, a finite reach makes
+    ``A`` nonsingular so ``A phi = 0`` forces ``phi = 0`` exactly, and with ``phi`` appearing in
+    no other row its multiplier is zero, so even the bilinear ``(sigma, phi)`` cross block
+    contributes nothing.  Inert but not free: measured at grid 32 / K=4 it is 12,288 of the
+    model's 34,520 variables, 36%, which made the continuation the same size as the problem it
+    is supposed to cheaply initialise.
+    """
     theta_ref = np.asarray(theta_ref, dtype=float)
     p = resolve(p, theta_ref)
     res = int(image_res)
@@ -54,6 +65,11 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
     K = len(meas)
     if K == 0:
         raise ValueError("no measurements: the sequence is empty")
+    if not potential and p.c_cp != 0.0:
+        raise ValueError(
+            "potential=False needs c_cp == 0 (got %r): the flux terms of the mass balance read "
+            "phi, so dropping the potential block at c_cp != 0 would silently build a DIFFERENT "
+            "model rather than a cheaper one." % (p.c_cp,))
 
     m = pyo.ConcreteModel(name="degrade_v5")
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
@@ -61,6 +77,7 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
     # through the SAME fixed measurement sequence this model was built around.
     m.seq, m.theta_ref = tuple(tuple(x) for x in seq), np.array(theta_ref, dtype=float)
     m.inline_Ipix, m.inline_dw, m.inline_ft = bool(inline_Ipix), bool(inline_dw), bool(inline_ft)
+    m.has_potential = bool(potential)
 
     m.PIX = pyo.RangeSet(0, npix - 1)
     m.T = pyo.RangeSet(0, K)
@@ -155,49 +172,56 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
     gam = float(p.gamma)
     f_ref = (None if p.f_ref_frac is None else float(p.f_ref_frac) * fm)
 
-    m.Pi = pyo.Var(m.PIX, m.TM, initialize=0.0)
+    if potential:
+        m.Pi = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
-    def _pic(mm, q, k):
-        return mm.Pi[q, k] * fm == _dwv(mm, q, k) * _ft(mm, q, k)
-    m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
+        def _pic(mm, q, k):
+            return mm.Pi[q, k] * fm == _dwv(mm, q, k) * _ft(mm, q, k)
+        m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
 
-    # sigma: a VARIABLE by default, or FROZEN to supplied constants.
-    #
-    # Frozen is not an approximation of the model, it is the inner problem of a Picard loop --
-    # see run_v5_picard. It matters because A(ftilde) phi = Pi is BILINEAR in (sigma, phi), and
-    # that cross term is what spoils the projected Hessian: it is off-diagonal with zero
-    # diagonal, so it contributes an indefinite block at every iterate and IPOPT regularises on
-    # essentially every iteration (measured: 201 of 200 with sigma free, against 2 of 139 for
-    # v4). Holding sigma constant makes c_phi LINEAR in phi, so it contributes nothing to the
-    # Hessian at all and the indefiniteness is removed by construction rather than by tuning.
-    m.sigma_frozen = sigma_fixed is not None
-    if m.sigma_frozen:
-        sf = np.asarray(sigma_fixed, dtype=float).reshape(npix, K)
-        m.sig = pyo.Param(m.PIX, m.TM, initialize=lambda _m, q, k: float(sf[q, k]),
-                          mutable=True, within=pyo.Reals)
+        # sigma: a VARIABLE by default, or FROZEN to supplied constants.
+        #
+        # Frozen is the Picard iteration's frozen-sigma problem -- see v5_picard_demo.py. It
+        # matters because A(ftilde) phi = Pi is BILINEAR in (sigma, phi), and that cross term is
+        # what spoils the projected Hessian: it is off-diagonal with zero diagonal, so it
+        # contributes an indefinite block at every iterate. Measured at grid 32 / K=4, sigma free
+        # regularised on 62% of iterations against 3% for v4's pointwise driver. (An earlier
+        # "201 of 200" figure was a parser defect, not a measurement: it counted the header and
+        # the restoration lines. The correct test splits the iteration line and checks that
+        # field 6, lg(rg), is not "-".) Holding sigma constant makes c_phi LINEAR in phi, so it
+        # contributes nothing to the Hessian and the indefiniteness is gone by construction.
+        m.sigma_frozen = sigma_fixed is not None
+        if m.sigma_frozen:
+            sf = np.asarray(sigma_fixed, dtype=float).reshape(npix, K)
+            m.sig = pyo.Param(m.PIX, m.TM, initialize=lambda _m, q, k: float(sf[q, k]),
+                              mutable=True, within=pyo.Reals)
+        else:
+            # sigma < 1 is structural (1 - exp(-x) < 1); the lower bound is left open because ft can
+            # be marginally negative from the logistic residual and a hard 0 would make pinning the
+            # gate trajectory an out-of-bounds write.
+            m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
+
+            def _sigc(mm, q, k):
+                if f_ref is None:
+                    return mm.sig[q, k] * fm == _ft(mm, q, k)
+                return mm.sig[q, k] == 1.0 - pyo.exp(-_ft(mm, q, k) / f_ref)
+            m.c_sig = pyo.Constraint(m.PIX, m.TM, rule=_sigc)
+
+        m.phi = pyo.Var(m.PIX, m.TM, initialize=0.0)
+
+        def _phic(mm, q, k):
+            # [varsigma + gamma(1-sigma_p)] phi_p - sum_q sigma_pq (phi_q - phi_p) = Pi_p.
+            # Written with sigma_pq = (sigma_p + sigma_q)/2 inline: bilinear in (sigma, phi), so the
+            # second derivatives are constants and the row has ~6 variables on a 5-point stencil.
+            acc = (vsig + gam * (1.0 - mm.sig[q, k])) * mm.phi[q, k]
+            for nb in _neighbours(q, res):
+                acc -= 0.5 * (mm.sig[q, k] + mm.sig[nb, k]) * (mm.phi[nb, k] - mm.phi[q, k])
+            return acc == mm.Pi[q, k]
+        m.c_phi = pyo.Constraint(m.PIX, m.TM, rule=_phic)
     else:
-        # sigma < 1 is structural (1 - exp(-x) < 1); the lower bound is left open because ft can
-        # be marginally negative from the logistic residual and a hard 0 would make pinning the
-        # gate trajectory an out-of-bounds write.
-        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
-
-        def _sigc(mm, q, k):
-            if f_ref is None:
-                return mm.sig[q, k] * fm == _ft(mm, q, k)
-            return mm.sig[q, k] == 1.0 - pyo.exp(-_ft(mm, q, k) / f_ref)
-        m.c_sig = pyo.Constraint(m.PIX, m.TM, rule=_sigc)
-
-    m.phi = pyo.Var(m.PIX, m.TM, initialize=0.0)
-
-    def _phic(mm, q, k):
-        # [varsigma + gamma(1-sigma_p)] phi_p - sum_q sigma_pq (phi_q - phi_p) = Pi_p.
-        # Written with sigma_pq = (sigma_p + sigma_q)/2 inline: bilinear in (sigma, phi), so the
-        # second derivatives are constants and the row has ~6 variables on a 5-point stencil.
-        acc = (vsig + gam * (1.0 - mm.sig[q, k])) * mm.phi[q, k]
-        for nb in _neighbours(q, res):
-            acc -= 0.5 * (mm.sig[q, k] + mm.sig[nb, k]) * (mm.phi[nb, k] - mm.phi[q, k])
-        return acc == mm.Pi[q, k]
-    m.c_phi = pyo.Constraint(m.PIX, m.TM, rule=_phic)
+        # No sigma Var and no sigma Param: nothing downstream may read either, which is
+        # what has_potential tells pin_model and initialize_from_numpy.
+        m.sigma_frozen = False
 
     # --- 4b, 5. the flux, driven by phi, and the mass balance. Same shape as v4. ----------
     def _mass(mm, q, k):
@@ -297,10 +321,11 @@ def pin_model(m, traj, *, fix=True):
                 m.dw[q, k].set_value(float(traj["dw"][q, k]))
             if not m.inline_ft:
                 m.ft[q, k].set_value(float(traj["ft"][q, k]))
-            m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
-            if not m.sigma_frozen:
-                m.sig[q, k].set_value(float(traj["sig"][q, k]))
-            m.phi[q, k].set_value(float(traj["phi"][q, k]))
+            if m.has_potential:
+                m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
+                if not m.sigma_frozen:
+                    m.sig[q, k].set_value(float(traj["sig"][q, k]))
+                m.phi[q, k].set_value(float(traj["phi"][q, k]))
             if fix:
                 if not m.inline_Ipix:
                     m.Ipix[q, k].fix()
@@ -308,10 +333,11 @@ def pin_model(m, traj, *, fix=True):
                     m.dw[q, k].fix()
                 if not m.inline_ft:
                     m.ft[q, k].fix()
-                m.Pi[q, k].fix()
-                if not m.sigma_frozen:
-                    m.sig[q, k].fix()
-                m.phi[q, k].fix()
+                if m.has_potential:
+                    m.Pi[q, k].fix()
+                    if not m.sigma_frozen:
+                        m.sig[q, k].fix()
+                    m.phi[q, k].fix()
     for idx in m.CH:
         m.S[idx].set_value(float(traj["S"][idx]))
         if fix:
@@ -703,7 +729,10 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
     blocks were written -- the residual is the useful number, since it says how good the start
     actually is rather than asserting that it is good.
     """
-    theta_seed = m.theta_ref if theta_seed is None else np.asarray(theta_seed, dtype=float)
+    # Recorded BEFORE the reshape below: `reshape` returns a view, not the same object, so an
+    # `is` test against m.theta_ref afterwards is always False even on the default path.
+    default_seed = theta_seed is None
+    theta_seed = m.theta_ref if default_seed else np.asarray(theta_seed, dtype=float)
     theta_seed = np.asarray(theta_seed, dtype=float).reshape(m.res, m.res)
 
     traj = numpy_trajectory(theta_seed, m.seq, m.p, m.res)
@@ -721,13 +750,15 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
                 m.dw[q, k].set_value(float(traj["dw"][q, k]))
             if not m.inline_ft:
                 m.ft[q, k].set_value(float(traj["ft"][q, k]))
-            m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
-            m.phi[q, k].set_value(float(traj["phi"][q, k]))
-            if not m.sigma_frozen:
-                m.sig[q, k].set_value(float(traj["sig"][q, k]))
+            if m.has_potential:
+                m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
+                m.phi[q, k].set_value(float(traj["phi"][q, k]))
+                if not m.sigma_frozen:
+                    m.sig[q, k].set_value(float(traj["sig"][q, k]))
     written += ["f"] + [n for n, on in (("Ipix", m.inline_Ipix), ("dw", m.inline_dw),
                                         ("ft", m.inline_ft)) if not on]
-    written += ["Pi", "phi"] + ([] if m.sigma_frozen else ["sig"])
+    if m.has_potential:
+        written += ["Pi", "phi"] + ([] if m.sigma_frozen else ["sig"])
 
     for idx in m.CH:
         m.S[idx].set_value(float(traj["S"][idx]))
@@ -740,7 +771,7 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
             m.f[q, 0].fix(float(theta_seed.ravel()[q]))
 
     resid, where = max_residual(m)
-    out = dict(seed_is_theta_ref=theta_seed is m.theta_ref, residual=resid, worst_row=where,
+    out = dict(seed_is_theta_ref=default_seed, residual=resid, worst_row=where,
                blocks=written, n_steps=m.n_steps, res=m.res,
                sigma_frozen=m.sigma_frozen, theta_fixed=bool(fix_theta))
     if verbose:
