@@ -69,6 +69,7 @@ from degrade_v2 import (
     simulate as simulate_v2_seq,
 )
 from degrade_v2_uq import V2UQParams, run_v2_reconstruction
+from degrade_v5_uq import V5UQParams, run_v5_reconstruction
 from degrade_v4 import (
     V4Params,
     simulate as simulate_v4_seq,
@@ -565,6 +566,10 @@ for _k, _v in {
     "v5_reach": 7.0, "v5_gamma": 100.0, "v5_fref": 0.002, "v5_beta": 1000.0,
     "v5_preset_lo": 0.0, "v5_preset_hi": 180.0, "v5_preset_n": 10,
     "v5_view_k": 0,
+    # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D
+    # tab's scale; maxiter is what keeps a browser run bounded, since the
+    # monolithic v5 NLP is not reliably convergent.
+    "v5_tv_weight": 0.001, "v5_maxiter": 300,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -677,6 +682,35 @@ def _v2_recon_figure(res):
     if res.log_cov_diag_2D is not None:
         lc = np.where(np.isfinite(res.log_cov_diag_2D), res.log_cov_diag_2D, np.nan)
         panels.append((lc, "log10 posterior variance", "viridis", {}))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
+    axes = np.atleast_1d(axes)
+    for ax, (img, ttl, cmap, kw) in zip(axes, panels):
+        if not np.any(np.isfinite(img)):
+            ax.text(0.5, 0.5, "unavailable", ha="center", va="center", transform=ax.transAxes)
+        else:
+            im = ax.imshow(img, cmap=cmap, interpolation="nearest", **kw)
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_title(ttl, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.tight_layout()
+    return fig
+
+
+def _v5_recon_figure(res):
+    """theta | reconstruction | error, drawn from the stored arrays.
+
+    Three panels, not v2's four: there is no covariance panel because v5 runs no k_aug.  The
+    backend returns arrays rather than Figures, so the layout is built here.
+    """
+    theta, hat = res.theta_true, res.theta_hat
+    err = hat - theta
+    span = max(float(np.abs(err).max()), 1e-12)
+    vmax = max(float(theta.max()), 1e-12)
+    panels = [
+        (theta, "theta (truth)", "gray", dict(vmin=0.0, vmax=vmax)),
+        (hat, "theta reconstructed", "gray", dict(vmin=0.0, vmax=vmax)),
+        (err, "error (hat - truth)", "coolwarm", dict(vmin=-span, vmax=span)),
+    ]
     fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
     axes = np.atleast_1d(axes)
     for ax, (img, ttl, cmap, kw) in zip(axes, panels):
@@ -2169,6 +2203,151 @@ def _render_2d_v5_tab():
             st.info("phi is still rim-peaked (centre/rim %.2f < 1): raise the reach above about "
                     "half the specimen radius to get whole-body contraction."
                     % summary["phi_cr"])
+
+    # --- Reconstruct ------------------------------------------------------------------------
+    # Appended below the live layout rather than given a sub-tab, mirroring the 2D and v2 tabs.
+    # The solve runs the WHOLE table however far the view is scrubbed back.
+    st.divider()
+    st.subheader("Reconstruct")
+    st.caption(
+        "Estimate the undamaged reference field **theta = f_0** from the projections, by "
+        "solving the v5 dynamics backwards. The measurements come from the numpy simulator "
+        "above; the NLP is an independent Pyomo transcription of the same steps, and it is "
+        "re-checked against the simulator on your geometry before every solve. **One "
+        "monolithic solve** — no Picard iteration, and no retry on a better start."
+    )
+
+    rc = st.columns([1, 1, 2])
+    with rc[0]:
+        st.select_slider(
+            "TV weight", options=_V2_TV_WEIGHTS, key="v5_tv_weight",
+            format_func=lambda v: ("%g" % v) if v else "0",
+            help="Total-variation regularisation on theta. Both objective terms are normalised "
+                 "to O(1) first, so this is a dimensionless trade-off ratio and **not** the 2D "
+                 "tab's scale. Raise it when the geometry is starved of rays, not otherwise.")
+    with rc[1]:
+        st.number_input("Max IPOPT iterations", min_value=50, max_value=5000, step=50,
+                        key="v5_maxiter",
+                        help="One shot: if this cap is hit the run reports and stops rather "
+                             "than retrying. The cap is what makes a browser run bounded.")
+    with rc[2]:
+        if not n_all:
+            st.caption("Take at least one measurement first.")
+        else:
+            _nr = sum(len(_bundle_r_values(o, nb, res)) for (_a, o, nb) in seq_all)
+            st.caption("**%d** measurement%s · %d rays · grid %d×%d · "
+                       "%d observations for %d pixels."
+                       % (n_all, "" if n_all == 1 else "s", _nr, res, res, _nr, res * res))
+            if _nr < res * res:
+                st.caption("Underdetermined by **%.1fx** — the TV term, not the data, is "
+                           "choosing among the fields that fit. A theta error here mixes the "
+                           "estimator with the regulariser; set **I0 = 0** above to see the "
+                           "tomography-only baseline and read the gap."
+                           % (res * res / max(_nr, 1)))
+            st.warning(
+                "⚠️ **The monolithic v5 estimation NLP is not reliably convergent.** "
+                "`c_phi` is bilinear in `(sigma, phi)`, which puts an indefinite cross block in "
+                "the Lagrangian Hessian at every iterate. Measured at grid 32 / K=4: the "
+                "`I0 = 0` control converges (116 iterations, 49% regularised), the full "
+                "dynamics is the open question this surface exists to answer. For a long run "
+                "use the CLI, not a browser tab: `python3 degrade_v5_uq.py --reconstruct "
+                "--image-res %d --n-steps %d -o out.npz`." % (res, n_all))
+
+    go_v5 = st.button("Reconstruct", type="primary", key="btn_v5_recon",
+                      disabled=(n_all == 0), use_container_width=False)
+
+    # Signature of everything the answer depends on, stored with it: a stale result is reported
+    # rather than silently shown. Same guard the v2 and 3D surfaces use.
+    v5_key = (seq_all, res, float(s["v5_depth"]), float(s["v5_I0"]), float(s["v5_c_omega"]),
+              float(s["v5_c_cp"]), float(s["v5_a"]), float(s["v5_b"]), float(s["v5_reach"]),
+              float(s["v5_gamma"]), float(s["v5_fref"]), float(s["v5_beta"]),
+              float(s["v5_tv_weight"]), int(s["v5_maxiter"]))
+
+    if go_v5:
+        log_box = st.empty()
+        log_lines: list[str] = []
+        _last = [0.0]
+
+        def _render_v5_log() -> None:
+            body = _html.escape("".join(log_lines)[-8000:])
+            log_box.empty()
+            with log_box.container():
+                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+
+        def _v5_log(chunk: str) -> None:
+            log_lines.append(chunk)
+            now = time.time()
+            if now - _last[0] >= 0.2:
+                _last[0] = now
+                _render_v5_log()
+
+        params_v5 = V5UQParams(
+            image_res=res, optical_depth=float(s["v5_depth"]), beam_steps=seq_all,
+            I0=float(s["v5_I0"]), c=float(s["v5_c_omega"]), a=float(s["v5_a"]),
+            b=float(s["v5_b"]), c_cp=float(s["v5_c_cp"]), reach=float(s["v5_reach"]),
+            gamma=float(s["v5_gamma"]), f_ref_frac=float(s["v5_fref"]),
+            beta=float(s["v5_beta"]), tv_weight=float(s["v5_tv_weight"]),
+            ipopt_max_iter=int(s["v5_maxiter"]))
+        with st.spinner("Solving the v5 estimation NLP…"):
+            try:
+                out = run_v5_reconstruction(params_v5, log_callback=_v5_log)
+                st.session_state["results_v5"] = {"res": out, "key": v5_key}
+            except RuntimeError as exc:      # curated: the drift gate, or no usable solver
+                st.session_state.pop("results_v5", None)
+                st.error(str(exc))
+            except Exception as exc:
+                st.session_state.pop("results_v5", None)
+                st.error("Reconstruct failed: %s" % exc)
+                st.exception(exc)
+            finally:
+                _render_v5_log()
+
+    stash5 = st.session_state.get("results_v5")
+    if stash5 is None:
+        st.info("Build a measurement sequence, then press **Reconstruct**.")
+    else:
+        out = stash5["res"]
+        if stash5["key"] != v5_key:
+            st.warning("Parameters or the sequence changed since this was solved — press "
+                       "**Reconstruct** again to refresh it.")
+        _ok = "optimal" in out.status
+        (st.success if _ok else st.error)(
+            "inverse: **%s** (%s) · %s iterations · continuation: %s · "
+            "fit RMS **%.3g** · theta error **%.2f%% of peak** · %s vars / %s cons "
+            "· model-vs-simulator residual %.1e"
+            % (out.status, out.linear_solver, out.iters, out.continuation_status, out.obs_rms,
+               out.theta_pct_peak, "{:,}".format(out.n_vars), "{:,}".format(out.n_cons),
+               out.forward_residual))
+        # The two numbers that separate "the start was bad" from "the Hessian is indefinite".
+        # Without both, a non-convergence is unattributable and the run says nothing.
+        st.caption(
+            "Start residual **%.1e** · Hessian regularised on **%d of %d** iterations "
+            "(**%.0f%%**) · continuation reached %.2f%% on its own. %s"
+            % (out.init_residual, out.regularised, out.n_iter_lines, out.regularised_pct,
+               out.theta_rms_cont,
+               "" if _ok else
+               "**Not converged.** A low start residual with a high regularisation fraction "
+               "points at the bilinear `(sigma, phi)` block in `c_phi`, not at the "
+               "initialisation — set **I0 = 0** to keep that block but remove the "
+               "dynamics, and compare."))
+        st.caption(
+            "eq:xd_box active set on theta: **%d** at the lower bound, **%d** at the upper, "
+            "%d interior. Damage this run: mass **%.3f → %.3f**, C_k **%.3f**, max phi "
+            "**%.3g**, support **%+.2f%%**, half-mass **%+.2f%%**, %d radial sign change(s). "
+            "If the shape numbers are near zero the transport did almost nothing, and the "
+            "reconstruction was not really asked to invert it."
+            % (out.n_theta_at_lower, out.n_theta_at_upper, out.n_theta_interior,
+               out.theta_true.sum(), out.mass_true, out.ck_max, out.phi_max,
+               out.support_pct, out.half_pct, out.flips))
+        st.pyplot(_v5_recon_figure(out), use_container_width=True)
+        st.caption(
+            "**theta error** is available only because the data is synthetic — the "
+            "estimator scored against the truth it was generated from, not something a real "
+            "experiment could report. **Fit RMS** is the residual the NLP actually minimised. "
+            "No covariance and no D-optimality here: v5 is scoped to the damage model and its "
+            "solve, so the k_aug step the v2 surface carries is deliberately absent."
+        )
+
 
 
 def _render_2d_v4_tab():
