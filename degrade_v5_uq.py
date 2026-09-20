@@ -265,8 +265,6 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
 
 def numpy_trajectory(theta, seq, p: V5Params, image_res: int):
     """Every variable of the model, taken off a :func:`degrade_v5.simulate` run."""
-    from degrade_v2 import accumulate_dose
-    from dose_response import bundle_r_values
     p = resolve(p, theta)
     res = int(image_res)
     npix = res * res
@@ -288,17 +286,19 @@ def numpy_trajectory(theta, seq, p: V5Params, image_res: int):
                 S[(k, j, t + 1)] = acc
     dw = 1.0 - np.exp(-cIdelta)
     ft = f[:, :K] * np.exp(-p.a * Ipix - p.b * Ipix ** 2)
-    from degrade_v5 import material_indicator, potential_operator
-    import scipy.sparse.linalg as _spla
-    fmv = float(p.f_max)
-    Pi = dw * ft / fmv
+    # Through compaction_potential, NOT a local spsolve: that function carries the exact
+    # M-matrix bound ||phi||_inf <= ||Pi||_inf/varsigma, and a sparse direct solver handed a
+    # near-singular operator returns a large finite answer rather than an error. Re-solving it
+    # here would have skipped the one guard that catches that, on the very path -- estimation
+    # initialisation -- whose iterates can carry no vacuum and so trigger it.
+    from degrade_v5 import compaction_potential
+    Pi = np.zeros_like(ft)
     sig = np.zeros_like(ft)
     phi = np.zeros_like(ft)
     for k in range(K):
-        s_k = material_indicator(ft[:, k].reshape(res, res), fmv, p.f_ref_frac)
-        sig[:, k] = s_k.ravel()
-        A = potential_operator(s_k, p.varsigma(), p.gamma)
-        phi[:, k] = _spla.spsolve(A, Pi[:, k])
+        ph_k, pi_k, sg_k = compaction_potential(ft[:, k].reshape(res, res),
+                                                dw[:, k].reshape(res, res), p)
+        phi[:, k], Pi[:, k], sig[:, k] = ph_k.ravel(), pi_k.ravel(), sg_k.ravel()
     yobs = {}
     for k, (_ang, rays) in enumerate(meas):
         for j, (_r, walk) in enumerate(rays):
