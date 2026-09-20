@@ -58,7 +58,12 @@ COPY senDOE/ ./senDOE/
 COPY .streamlit/ ./.streamlit/
 COPY live_sim_component/ ./live_sim_component/
 COPY volume_sim_component/ ./volume_sim_component/
-COPY tomography_uq.py tomography_3d.py dose_response.py degrade_v2.py degrade_v2_uq.py app.py ./
+# The v3/v4/v5 chain is a dependency of app.py, not optional extras: app.py imports
+# degrade_v5 and degrade_v5_uq, degrade_v5 imports degrade_v3, and degrade_v5_uq imports
+# degrade_v3_uq. A module missing here is simply absent from the image.
+COPY tomography_uq.py tomography_3d.py dose_response.py app.py ./
+COPY degrade_v2.py degrade_v2_uq.py degrade_v3.py degrade_v3_uq.py ./
+COPY degrade_v4.py degrade_v4_uq.py degrade_v5.py degrade_v5_uq.py ./
 
 # 6b) Materialize plotly.min.js for the 3D Volume component from THIS image's plotly, so the
 #     browser-side bundle always matches the figure JSON the app emits. app.py does the same copy
@@ -85,6 +90,13 @@ print('v2 damage-model invariants OK')" \
 r=degrade_v2_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
 print('v2 Pyomo model == numpy model: residual %.1e, forward %.1e rel, photon balance %.1e' \
       % (r['residual'], r['f_err_rel'], r['photon_balance']))" \
+    && python3 -c "import degrade_v3, degrade_v3_uq, degrade_v4, degrade_v4_uq, degrade_v5, degrade_v5_uq; \
+print('v3/v4/v5 chain present and importable')" \
+    && python3 -m py_compile app.py && echo 'app.py compiles' \
+    && python3 -c "import degrade_v5_uq; \
+r=degrade_v5_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
+assert r < 1e-10, r; \
+print('v5 Pyomo model == numpy model: residual %.1e' % r)" \
     && python3 -c "import pyomo.environ as pyo; \
 m=pyo.ConcreteModel(); m.x=pyo.Var(initialize=1.0); \
 m.c=pyo.Constraint(expr=m.x>=2.0); m.o=pyo.Objective(expr=(m.x-3.0)**2); \
