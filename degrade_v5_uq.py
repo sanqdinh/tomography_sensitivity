@@ -460,3 +460,211 @@ def run_v5_reconstruction(theta, seq, p: V5Params, image_res: int, *, tv_weight=
                 fev_s=g(r"Total seconds in NLP function evaluations\s*=\s*(\S+)"),
                 fact_s=g(r"LinearSystemFactorization\.*:\s*(\S+)"),
                 theta_err=100.0 * float(np.sqrt(np.mean((th - theta) ** 2))) / float(theta.max()))
+
+
+# --- the FORWARD solve ----------------------------------------------------------------------
+
+def forward_solve(theta, seq, p: V5Params, image_res: int, *, linear_solver="ma97",
+                  solver_opts=None, max_iter=3000, start="undamaged", tee=False,
+                  sigma_fixed=None):
+    """Fix ``f[:,0] = theta`` and let IPOPT find the whole trajectory.
+
+    Strictly stronger than :func:`check_forward`, which pins every variable to a
+    :func:`degrade_v5.simulate` trajectory and evaluates residuals.  That check can only say the
+    equations were transcribed correctly at a point it was handed.  This one starts IPOPT
+    somewhere else and asks it to *find* the trajectory, so it additionally says the model is
+    square, solvable, and scaled well enough to converge -- which for v5 is a real question,
+    since the ESTIMATION NLP does not converge monolithically at this grid.
+
+    ``start="undamaged"`` initialises every stage at ``theta`` and the undamaged potential, so
+    convergence to the damaged trajectory is genuinely found rather than handed over.
+    ``start="true"`` starts at the answer and only confirms it is a fixed point.
+
+    Returns a dict with the solved trajectory and the comparison against the numpy simulator.
+    """
+    res = int(image_res)
+    p = resolve(p, theta)
+    npix = res * res
+    K = len(measurement_rays(seq, res))
+
+    m = build_v5_model(theta, seq, p, res, sigma_fixed=sigma_fixed)
+    # The forward problem is SQUARE: fixing f[:,0] removes the only degrees of freedom the
+    # estimation problem has. A constant objective keeps IPOPT solving a feasibility problem
+    # rather than optimising anything.
+    flat = np.asarray(theta, dtype=float).ravel()
+    for q in m.PIX:
+        m.f[q, 0].fix(float(flat[q]))
+    m.obj = pyo.Objective(expr=0.0)
+
+    if start == "true":
+        pin_model(m, numpy_trajectory(theta, seq, p, res), fix=False)
+    else:
+        und = numpy_trajectory(theta, [], p, res) if False else None
+        # undamaged start: every stage at theta, zero fluence, zero dose, zero potential
+        for q in m.PIX:
+            for k in m.T:
+                if k:
+                    m.f[q, k].set_value(float(flat[q]))
+            for k in m.TM:
+                if not m.inline_Ipix:
+                    m.Ipix[q, k].set_value(0.0)
+                if not m.inline_dw:
+                    m.dw[q, k].set_value(0.0)
+                if not m.inline_ft:
+                    m.ft[q, k].set_value(float(flat[q]))
+                m.Pi[q, k].set_value(0.0)
+                m.phi[q, k].set_value(0.0)
+                if not m.sigma_frozen:
+                    m.sig[q, k].set_value(0.0)
+        for idx in m.CH:
+            m.S[idx].set_value(0.0)
+        for idx in m.RAY:
+            m.yobs[idx].set_value(0.0)
+
+    nv = sum(1 for v in m.component_data_objects(pyo.Var) if not v.fixed)
+    nc = sum(1 for _ in m.component_data_objects(pyo.Constraint, active=True))
+    buf = io.StringIO()
+    t0 = time.time()
+    try:
+        r, ls = solve_with_fallback(m, linear_solver=linear_solver, max_iter=max_iter,
+                                    log_callback=buf.write, tee=tee,
+                                    options=dict(solver_opts or {}))
+        status = str(r.solver.termination_condition)
+    except Exception as exc:
+        status, ls = "FAILED: " + str(exc).splitlines()[0][:90], linear_solver
+    wall = time.time() - t0
+
+    log = buf.getvalue()
+    g = lambda pat: (re.findall(pat, log) or ["-"])[-1]
+    f_py = np.array([[pyo.value(m.f[q, k]) for k in range(K + 1)] for q in m.PIX])
+    ref = numpy_trajectory(theta, seq, p, res)
+    f_np = ref["f"]
+    scale = max(float(np.abs(f_np).max()), 1e-300)
+    return dict(
+        status=status, linear_solver=ls, wall=wall, n_vars=nv, n_cons=nc,
+        dof=nv - nc,
+        iters=g(r"Number of Iterations\.*:\s*(\S+)"),
+        nnz_jac=g(r"Number of nonzeros in equality constraint Jacobian\.*:\s*(\S+)"),
+        nnz_hess=g(r"Number of nonzeros in Lagrangian Hessian\.*:\s*(\S+)"),
+        f_pyomo=f_py, f_numpy=f_np,
+        err_abs=float(np.abs(f_py - f_np).max()),
+        err_rel=float(np.abs(f_py - f_np).max()) / scale,
+        err_final_rel=float(np.abs(f_py[:, -1] - f_np[:, -1]).max()) / scale,
+        phi_rel=float(np.abs(np.array([[pyo.value(m.phi[q, k]) for k in range(K)]
+                                       for q in m.PIX]) - ref["phi"]).max())
+        / max(float(np.abs(ref["phi"]).max()), 1e-300),
+    )
+
+
+def forward_solve_staged(theta, seq, p: V5Params, image_res: int, *, linear_solver="ma97",
+                         solver_opts=None, max_iter=3000, warmstart_duals=True, verbose=False):
+    """Solve the horizon one step at a time, then warm-start the full horizon from the result.
+
+    The undamaged start is a poor guess for a long horizon: every stage begins at ``theta`` while
+    the true field decays monotonically, so the initial error grows with k and the last stages
+    start furthest from their answer.  Solving stage by stage costs K small square solves and
+    hands the full model a trajectory that is already nearly feasible everywhere.
+
+    Duals are carried too, not just primals.  Each single-step solve produces multipliers for the
+    same rows the full model has at that stage, so they transfer directly, and IPOPT can start
+    from them instead of rediscovering them -- which is what ``warm_start_init_point`` wants.
+
+    Returns the same dict as :func:`forward_solve`, plus the staging cost.
+    """
+    res = int(image_res)
+    p = resolve(p, theta)
+    npix = res * res
+    K = len(measurement_rays(seq, res))
+    flat = np.asarray(theta, dtype=float).ravel()
+
+    # --- stage-by-stage --------------------------------------------------------------------
+    acc = {"f": np.zeros((npix, K + 1))}
+    for nm in ("Ipix", "dw", "ft", "Pi", "sig", "phi"):
+        acc[nm] = np.zeros((npix, K))
+    acc["f"][:, 0] = flat
+    acc["S"], acc["yobs"] = {}, {}
+    duals = {}
+    field = np.asarray(theta, dtype=float).copy()
+    t_stage = time.time()
+    for k in range(K):
+        sub = build_v5_model(field, seq[k:k + 1], p, res)
+        for q in sub.PIX:
+            sub.f[q, 0].fix(float(field.ravel()[q]))
+        sub.obj = pyo.Objective(expr=0.0)
+        sub.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        solve_with_fallback(sub, linear_solver=linear_solver, max_iter=max_iter,
+                            log_callback=lambda _s: None, options=dict(solver_opts or {}))
+        for q in sub.PIX:
+            acc["f"][q, k + 1] = pyo.value(sub.f[q, 1])
+            for nm in ("Ipix", "dw", "ft", "Pi", "phi"):
+                acc[nm][q, k] = pyo.value(getattr(sub, nm)[q, 0])
+            acc["sig"][q, k] = float(pyo.value(sub.sig[q, 0]))
+        for (kk, j, t) in sub.CH:
+            acc["S"][(k, j, t)] = pyo.value(sub.S[kk, j, t])
+        for (kk, j) in sub.RAY:
+            acc["yobs"][(k, j)] = pyo.value(sub.yobs[kk, j])
+        for c in sub.component_data_objects(pyo.Constraint, active=True):
+            idx = c.index()
+            comp = c.parent_component().name
+            if isinstance(idx, tuple) and len(idx) >= 2:
+                duals[(comp, idx[0], k)] = sub.dual.get(c, 0.0)
+        field = acc["f"][:, k + 1].reshape(res, res)
+        if verbose:
+            print("    stage %d done" % (k + 1)); sys.stdout.flush()
+        del sub
+    t_stage = time.time() - t_stage
+
+    # --- full horizon, warm-started from the staged trajectory -------------------------------
+    m = build_v5_model(theta, seq, p, res)
+    for q in m.PIX:
+        m.f[q, 0].fix(float(flat[q]))
+    m.obj = pyo.Objective(expr=0.0)
+    for q in m.PIX:
+        for k in m.T:
+            if k:
+                m.f[q, k].set_value(float(acc["f"][q, k]))
+        for k in m.TM:
+            for nm in ("Ipix", "dw", "ft", "Pi", "phi"):
+                getattr(m, nm)[q, k].set_value(float(acc[nm][q, k]))
+            m.sig[q, k].set_value(float(acc["sig"][q, k]))
+    for idx in m.CH:
+        m.S[idx].set_value(float(acc["S"].get(idx, 0.0)))
+    for idx in m.RAY:
+        m.yobs[idx].set_value(float(acc["yobs"].get(idx, 0.0)))
+
+    opts = dict(solver_opts or {})
+    if warmstart_duals:
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT_EXPORT)
+        for c in m.component_data_objects(pyo.Constraint, active=True):
+            idx = c.index()
+            if isinstance(idx, tuple) and len(idx) >= 2:
+                v = duals.get((c.parent_component().name, idx[0], idx[-1]))
+                if v is not None:
+                    m.dual[c] = float(v)
+        opts.setdefault("warm_start_init_point", "yes")
+        opts.setdefault("warm_start_bound_push", 1e-9)
+        opts.setdefault("warm_start_mult_bound_push", 1e-9)
+
+    nv = sum(1 for v in m.component_data_objects(pyo.Var) if not v.fixed)
+    nc = sum(1 for _ in m.component_data_objects(pyo.Constraint, active=True))
+    buf = io.StringIO()
+    t0 = time.time()
+    try:
+        r, ls = solve_with_fallback(m, linear_solver=linear_solver, max_iter=max_iter,
+                                    log_callback=buf.write, options=opts)
+        status = str(r.solver.termination_condition)
+    except Exception as exc:
+        status, ls = "FAILED: " + str(exc).splitlines()[0][:90], linear_solver
+    wall = time.time() - t0
+
+    log = buf.getvalue()
+    g = lambda pat: (re.findall(pat, log) or ["-"])[-1]
+    f_py = np.array([[pyo.value(m.f[q, k]) for k in range(K + 1)] for q in m.PIX])
+    ref = numpy_trajectory(theta, seq, p, res)
+    scale = max(float(np.abs(ref["f"]).max()), 1e-300)
+    return dict(status=status, linear_solver=ls, wall=wall, t_stage=t_stage,
+                n_vars=nv, n_cons=nc, dof=nv - nc,
+                iters=g(r"Number of Iterations\.*:\s*(\S+)"),
+                f_pyomo=f_py, f_numpy=ref["f"],
+                err_rel=float(np.abs(f_py - ref["f"]).max()) / scale,
+                staged_err_rel=float(np.abs(acc["f"] - ref["f"]).max()) / scale)
