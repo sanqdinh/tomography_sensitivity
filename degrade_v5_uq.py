@@ -31,6 +31,7 @@ import io
 import re
 import sys
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -411,85 +412,311 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     return m.obj
 
 
-def run_v5_reconstruction(theta, seq, p: V5Params, image_res: int, *, tv_weight=0.001,
-                          linear_solver="ma97", solver_opts=None, max_iter=3000,
-                          gate=True, continuation=True, **inline):
-    """Estimate theta from the reduced dynamics. Returns a dict of results and timings."""
-    res = int(image_res)
+def _reg_fraction(log: str):
+    """``(regularised, total)`` IPOPT iterations.
+
+    Column 6 of an iteration line is ``lg(rg)``; ``"-"`` means no Hessian regularisation was
+    applied on that iteration.  Counting any other way is how the bogus "201 of 200" figure
+    arose -- a substring test that also matched the header and the restoration lines.
+    """
+    n = r = 0
+    for ln in log.splitlines():
+        f = ln.split()
+        if len(f) < 10 or not re.fullmatch(r"\d+r?", f[0]):
+            continue
+        n += 1
+        if f[6] != "-":
+            r += 1
+    return r, n
+
+
+def _shape_diagnostics(theta, f):
+    """``(support_pct, half_pct, flips)`` -- what the damage did to the body's shape.
+
+    Radii are measured about the **fixed initial centroid**, not a moving one, so a body that
+    translates does not read as a body that contracted.  ``flips`` counts sign changes in the
+    radially banded mass difference: ONE is coherent condensation (mass leaves the outside and
+    arrives inside), several means mass is shuffling between neighbours.
+
+    Kept identical to the forward tab's readout in ``app.py`` so the two cannot disagree.
+    """
+    theta = np.asarray(theta, dtype=float)
+    f = np.asarray(f, dtype=float)
+    nr, nc = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m0 = float(theta.sum())
+    if m0 <= 0.0:
+        return float("nan"), float("nan"), 0
+    cx0, cy0 = (xx * theta).sum() / m0, (yy * theta).sum() / m0
+    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2).ravel()
+    order = np.argsort(rad)
+    rsort = rad[order]
+
+    def _q(img, frac):
+        w = np.clip(np.asarray(img, float).ravel(), 0.0, None)[order]
+        c = np.cumsum(w)
+        return float(rsort[np.searchsorted(c, frac * c[-1])]) if c[-1] > 0 else float("nan")
+
+    r0, r1 = _q(theta, 0.99), _q(f, 0.99)
+    h0, h1 = _q(theta, 0.50), _q(f, 0.50)
+    d = (f - theta).reshape(nr, nc)
+    r2 = rad.reshape(nr, nc)
+    bands = [float(d[(r2 >= lo) & (r2 < lo + 2)].sum()) for lo in range(0, int(0.55 * nr), 2)]
+    flips = sum(1 for i in range(len(bands) - 1) if bands[i] * bands[i + 1] < 0)
+    sup = (100.0 * (r1 - r0) / r0) if r0 > 0 else float("nan")
+    half = (100.0 * (h1 - h0) / h0) if h0 > 0 else float("nan")
+    return sup, half, flips
+
+
+@dataclass
+class V5UQParams:
+    """Inputs to :func:`run_v5_reconstruction`.  Physics defaults match the v5 tab's seeds."""
+
+    image_res: int = 32
+    optical_depth: float = 1.1
+    beam_steps: tuple = ()             # (angle_deg, offset, n_beams) triples, _table_to_seq form
+    phantom: Optional[np.ndarray] = None
+
+    # --- v5 physics (V5Params) ---
+    I0: float = 1.0
+    c: float = 0.1
+    a: float = 0.05
+    b: float = 0.0
+    c_cp: float = 0.3
+    reach: Optional[float] = 7.0
+    gamma: float = 100.0
+    f_ref_frac: Optional[float] = 0.002
+    beta: float = 1000.0
+    flux: str = "upwind"
+    eps_h: float = 1e-12
+    dx: float = 1.0
+
+    # --- estimation ---
+    tv_weight: float = 0.001
+    noise_sigma: float = 0.0           # 0 = noiseless data, as v1/v2 do
+    continuation: bool = True          # seed from the I0 = 0 linear-tomography + TV solve
+    gate: bool = True
+    ipopt_max_iter: int = 3000
+    linear_solver: str = "ma97"
+    solver_opts: Optional[dict] = None
+
+    def physics(self, **over) -> V5Params:
+        kw = dict(I0=self.I0, c=self.c, a=self.a, b=self.b, c_cp=self.c_cp, reach=self.reach,
+                  gamma=self.gamma, f_ref_frac=self.f_ref_frac, beta=self.beta, flux=self.flux,
+                  eps_h=self.eps_h, dx=self.dx)
+        kw.update(over)
+        return V5Params(**kw)
+
+
+@dataclass
+class V5UQResults:
+    """Arrays and scalars, not matplotlib figures -- the caller draws.
+
+    No covariance and no D-optimality: v5 is scoped to the damage model and its solve, so the
+    k_aug step v2 carries is deliberately absent rather than merely unimplemented.
+    """
+
+    theta_true: np.ndarray
+    theta_hat: np.ndarray
+    f_final_true: np.ndarray
+    f_final_hat: np.ndarray
+
+    # --- the solve ---
+    status: str = ""
+    linear_solver: str = ""
+    iters: str = "-"
+    regularised: int = 0               # IPOPT iterations that needed Hessian regularisation
+    n_iter_lines: int = 0              # ... out of this many
+    ipopt_s: str = "-"
+    fev_s: str = "-"
+    n_vars: int = 0
+    n_cons: int = 0
+    t_sim: float = float("nan")
+    t_cont: float = float("nan")
+    t_solve: float = float("nan")
+
+    # --- how good the start was, and whether the model still means anything ---
+    forward_residual: float = float("nan")   # the drift gate, on THIS geometry
+    init_residual: float = float("nan")      # worst dynamic residual at the starting point
+    continuation_status: str = "skipped"
+    continuation_iters: str = "-"
+    theta_rms_cont: float = float("nan")     # error of the continuation estimate alone
+
+    # --- the answer ---
+    obs_rms: float = float("nan")            # fit residual, RMS over all rays
+    theta_rms: float = float("nan")          # ||theta_hat - theta_true|| RMS, synthetic only
+    theta_pct_peak: float = float("nan")     # the same as a % of peak theta -- the quotable one
+    n_theta_at_lower: int = 0
+    n_theta_at_upper: int = 0
+    n_theta_interior: int = 0
+
+    # --- what the damage actually did, so the answer can be read in context ---
+    mass_true: float = float("nan")
+    mass_hat: float = float("nan")
+    ck_max: float = float("nan")             # C_k positivity number; sufficient bound is <= 1
+    phi_max: float = float("nan")
+    support_pct: float = float("nan")
+    half_pct: float = float("nan")
+    flips: int = 0
+
+    @property
+    def regularised_pct(self) -> float:
+        return 100.0 * self.regularised / max(self.n_iter_lines, 1)
+
+
+def run_v5_reconstruction(params: V5UQParams, log_callback=None) -> V5UQResults:
+    """Estimate ``theta`` from the v5 dynamics.  ONE monolithic solve, no Picard iteration.
+
+    If IPOPT does not converge this reports that and stops -- it does not retry on a better
+    start and it does not fall back.  The three numbers that separate the two explanations are
+    on the result: ``init_residual`` (was the start dynamically feasible?), ``regularised`` /
+    ``n_iter_lines`` (was the Hessian indefinite throughout?) and ``iters``.  A low init
+    residual with a high regularisation fraction points at the bilinear ``(sigma, phi)`` block;
+    a high init residual points at the start.
+    """
+    def say(msg):
+        if log_callback:
+            log_callback(msg)
+
+    res = int(params.image_res)
+    seq = tuple(params.beam_steps)
+    if not seq:
+        raise ValueError("no measurements: take at least one before reconstructing")
+    p = params.physics()
+    base = _phantom(res) if params.phantom is None else np.asarray(params.phantom, dtype=float)
+    theta = scale_to_optical_depth(base, params.optical_depth, res)
     p = resolve(p, theta)
     scale = float(np.abs(theta).max())
-    t_sim = time.time()
-    _f, infos, y = simulate(theta, seq, p, res, record_observations=True)
-    t_sim = time.time() - t_sim
 
+    # --- data, from the numpy simulator: an implementation independent of the NLP ----------
+    t_sim = time.time()
+    f_true, infos, y = simulate(theta, seq, p, res, record_observations=True)
+    t_sim = time.time() - t_sim
+    if params.noise_sigma > 0.0:
+        rng = np.random.default_rng(0)      # fixed seed: a rerun must be comparable
+        y = [np.asarray(v, float) + params.noise_sigma * rng.standard_normal(np.shape(v))
+             for v in y]
+
+    # --- the gate: does the Pyomo model still reproduce the simulator HERE? -----------------
     gate_resid = float("nan")
-    if gate:
-        traj = numpy_trajectory(theta, seq, p, res)
-        mg = build_v5_model(theta, seq, p, res, **inline)
-        pin_model(mg, traj)
+    if params.gate:
+        say("Checking the Pyomo model against the simulator on this geometry...\n")
+        mg = build_v5_model(theta, seq, p, res)
+        pin_model(mg, numpy_trajectory(theta, seq, p, res))
         gate_resid, where = max_residual(mg)
         del mg
+        say("    max constraint residual %.3e  (%s)\n" % (gate_resid, where))
         if gate_resid > 1e-8:
-            raise RuntimeError("v5 Pyomo model no longer reproduces degrade_v5.simulate "
-                               "(residual %.3e at %s)" % (gate_resid, where))
+            raise RuntimeError(
+                "The Pyomo model no longer reproduces degrade_v5.simulate on this geometry "
+                "(residual %.3e at %s). Reconstructing against it would not mean anything; "
+                "run degrade_v5_uq.check_forward() to localise the disagreement."
+                % (gate_resid, where))
 
+    opts = dict(params.solver_opts or {})
+    opts.setdefault("ma97_order", "metis")
+
+    # --- continuation: I0 = 0, c_cp = 0 is linear tomography + TV ---------------------------
+    # The seed matters more than its amplitude: a mis-SCALED theta converges in a handful of
+    # iterations, a structurally wrong field does not (a flat mean field dies in restoration).
+    # The continuation estimate is structurally close by construction, which is the point.
     theta0 = np.full_like(theta, float(theta.mean()))
-    t_cont, cont_iters, cont_status = 0.0, "-", "skipped"
-    if continuation:
+    cont_status, cont_iters, t_cont = "skipped", "-", 0.0
+    if params.continuation:
+        say("Continuation solve at I0 = 0 (linear tomography + TV)...\n")
         tc = time.time()
-        from dataclasses import replace
-        p0 = replace(p, I0=0.0, c_cp=0.0)
-        m0 = build_v5_model(theta, seq, p0, res, f_bounds=(0.0, 1.5 * scale), **inline)
+        p0 = params.physics(I0=0.0, c_cp=0.0)
+        # potential=False: at I0 = 0 the whole Pi/sigma/phi block is inert, and carrying it made
+        # the continuation the same size as the problem it is supposed to cheaply initialise.
+        m0 = build_v5_model(theta, seq, resolve(p0, theta), res,
+                            f_bounds=(0.0, 1.5 * scale), potential=False)
         for q in m0.PIX:
             m0.f[q, 0].set_value(float(theta0.ravel()[q]))
-        add_estimation_objective(m0, y, tv_weight, scale)
+        add_estimation_objective(m0, y, params.tv_weight, scale)
         b0 = io.StringIO()
+
+        def _cont_log(chunk):
+            b0.write(chunk)
+            if log_callback:
+                log_callback(chunk)
         try:
-            r0, _ls = solve_with_fallback(m0, linear_solver=linear_solver, max_iter=max_iter,
-                                          log_callback=b0.write, options=dict(solver_opts or {}))
+            r0, _ls0 = solve_with_fallback(m0, linear_solver=params.linear_solver,
+                                           max_iter=params.ipopt_max_iter,
+                                           log_callback=_cont_log, options=opts)
             cont_status = str(r0.solver.termination_condition)
             theta0 = np.array([pyo.value(m0.f[q, 0]) for q in m0.PIX]).reshape(res, res)
-        except Exception as e:
-            cont_status = "FAILED: " + str(e).splitlines()[0][:60]
+        except Exception as exc:
+            cont_status = "FAILED: " + str(exc).splitlines()[0][:60]
         cont_iters = (re.findall(r"Number of Iterations\.*:\s*(\S+)", b0.getvalue()) or ["-"])[-1]
         del m0
         t_cont = time.time() - tc
+        say("    %s (%s iterations)\n" % (cont_status, cont_iters))
+    e_cont = 100.0 * float(np.sqrt(np.mean((theta0 - theta) ** 2))) / scale
 
-    t_build = time.time()
-    m = build_v5_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale), **inline)
-    t0 = numpy_trajectory(theta0, seq, p, res)
-    pin_model(m, t0, fix=False)
-    add_estimation_objective(m, y, tv_weight, scale)
-    t_build = time.time() - t_build
+    # --- the monolithic estimation NLP ------------------------------------------------------
+    say("Building the v5 estimation NLP...\n")
+    m = build_v5_model(theta, seq, p, res, f_bounds=(0.0, 1.5 * scale))
+    init = initialize_from_numpy(m, theta0)
+    add_estimation_objective(m, y, params.tv_weight, scale)
+    n_v = sum(1 for _ in m.component_data_objects(pyo.Var))
+    n_c = sum(1 for _ in m.component_data_objects(pyo.Constraint, active=True))
+    say("    %d variables, %d constraints; start residual %.3e (%s)\n"
+        % (n_v, n_c, init["residual"], init["worst_row"]))
 
-    nv = sum(1 for _ in m.component_data_objects(pyo.Var))
-    nc = sum(1 for _ in m.component_data_objects(pyo.Constraint, active=True))
-    opts = dict(solver_opts or {})
-    opts["print_timing_statistics"] = "yes"
     buf = io.StringIO()
+
+    def _log(chunk):
+        buf.write(chunk)
+        if log_callback:
+            log_callback(chunk)
+
     t_solve = time.time()
     try:
-        r, ls = solve_with_fallback(m, linear_solver=linear_solver, max_iter=max_iter,
-                                    log_callback=buf.write, options=opts)
+        r, ls = solve_with_fallback(m, linear_solver=params.linear_solver,
+                                    max_iter=params.ipopt_max_iter, log_callback=_log,
+                                    options=dict(opts, print_timing_statistics="yes"))
         status = str(r.solver.termination_condition)
-    except Exception as e:
-        status, ls = "FAILED: " + str(e).splitlines()[0][:90], linear_solver
+    except Exception as exc:
+        status, ls = "FAILED: " + str(exc).splitlines()[0][:90], params.linear_solver
     t_solve = time.time() - t_solve
 
     log = buf.getvalue()
-    g = lambda pat: (re.findall(pat, log) or ["-"])[-1]
-    th = np.array([pyo.value(m.f[q, 0]) for q in m.PIX]).reshape(res, res)
-    return dict(theta_hat=th, status=status, linear_solver=ls, gate_residual=gate_resid,
-                t_sim=t_sim, t_build=t_build, t_solve=t_solve, t_cont=t_cont,
-                cont_iters=cont_iters, cont_status=cont_status, n_vars=nv, n_cons=nc,
-                iters=g(r"Number of Iterations\.*:\s*(\S+)"),
-                nnz_hess=g(r"Number of nonzeros in Lagrangian Hessian\.*:\s*(\S+)"),
-                nnz_jac=g(r"Number of nonzeros in equality constraint Jacobian\.*:\s*(\S+)"),
-                ipopt_s=g(r"Total seconds in IPOPT \(w/o function evaluations\)\s*=\s*(\S+)"),
-                fev_s=g(r"Total seconds in NLP function evaluations\s*=\s*(\S+)"),
-                fact_s=g(r"LinearSystemFactorization\.*:\s*(\S+)"),
-                theta_err=100.0 * float(np.sqrt(np.mean((th - theta) ** 2))) / float(theta.max()))
+    grab = lambda pat: (re.findall(pat, log) or ["-"])[-1]
+    reg, n_lines = _reg_fraction(log)
 
+    theta_hat = np.array([pyo.value(m.f[q, 0]) for q in m.PIX]).reshape(res, res)
+    f_hat = np.array([pyo.value(m.f[q, m.n_steps]) for q in m.PIX]).reshape(res, res)
+    resid = [pyo.value(m.yobs[k, j]) - float(y[k][j]) for (k, j, _n) in m.obs_index]
+
+    # eq:xd_box active set, counted before anything else reads the solution
+    lo, hi, tol = 0.0, 1.5 * scale, 1e-9 * max(scale, 1.0)
+    flat_hat = theta_hat.ravel()
+    at_lo = int(np.sum(flat_hat <= lo + tol))
+    at_hi = int(np.sum(flat_hat >= hi - tol))
+
+    sup, half, flips = _shape_diagnostics(theta, f_true)
+    out = V5UQResults(
+        theta_true=theta, theta_hat=theta_hat, f_final_true=f_true, f_final_hat=f_hat,
+        status=status, linear_solver=ls, iters=grab(r"Number of Iterations\.*:\s*(\S+)"),
+        regularised=reg, n_iter_lines=n_lines,
+        ipopt_s=grab(r"Total seconds in IPOPT \(w/o function evaluations\)\s*=\s*(\S+)"),
+        fev_s=grab(r"Total seconds in NLP function evaluations\s*=\s*(\S+)"),
+        n_vars=n_v, n_cons=n_c, t_sim=t_sim, t_cont=t_cont, t_solve=t_solve,
+        forward_residual=gate_resid, init_residual=float(init["residual"]),
+        continuation_status=cont_status, continuation_iters=cont_iters, theta_rms_cont=e_cont,
+        obs_rms=float(np.sqrt(np.mean(np.square(resid)))) if resid else float("nan"),
+        theta_rms=float(np.sqrt(np.mean((theta_hat - theta) ** 2))),
+        n_theta_at_lower=at_lo, n_theta_at_upper=at_hi,
+        n_theta_interior=int(flat_hat.size - at_lo - at_hi),
+        mass_true=float(f_true.sum()), mass_hat=float(f_hat.sum()),
+        ck_max=max((i.compaction for i in infos), default=float("nan")),
+        phi_max=max((i.phi_max for i in infos), default=float("nan")),
+        support_pct=sup, half_pct=half, flips=flips,
+    )
+    out.theta_pct_peak = 100.0 * out.theta_rms / scale
+    say("    %s, %s iterations, %d/%d regularised, theta error %.2f%% of peak\n"
+        % (status, out.iters, reg, n_lines, out.theta_pct_peak))
+    return out
 
 # --- the FORWARD solve ----------------------------------------------------------------------
 
