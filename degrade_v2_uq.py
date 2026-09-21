@@ -84,6 +84,7 @@ Transcription notes, where a choice had to be made
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 from typing import Optional
@@ -707,7 +708,15 @@ def _is_model_error(text: str) -> bool:
     """
     return ("can't evaluate" in text or "Error evaluating" in text
             or "Invalid number" in text or "Ipopt " in text
-            or "too few degrees of freedom" in text)
+            or "too few degrees of freedom" in text
+            # A TERMINATION is a result, not a missing binary. Without these three, a v5 grid-32
+            # run that died in restoration at iteration 748 was handed to ma57 and mumps, each of
+            # which re-solved the whole problem to the same end before the caller was told "no
+            # usable IPOPT linear solver" -- the exact misdirection this function exists to
+            # prevent, and ~20 minutes of wasted solve per fallback.
+            or "Restoration Failed" in text
+            or "restoration phase failed" in text
+            or "Error in step computation" in text)
 
 
 def _curate(text: str) -> str:
@@ -718,6 +727,16 @@ def _curate(text: str) -> str:
                 "flow by design, so raising eps_rel does NOT fix a field that is identically "
                 "motionless -- set eps_up > 0 (a constant, which does not vanish) or switch "
                 "transport off with c_cp = 0.")
+    if "Restoration Failed" in text or "restoration phase failed" in text:
+        it = (re.findall(r"Number of Iterations\.*:\s*(\S+)", text) or ["?"])[-1]
+        return ("IPOPT terminated in RESTORATION FAILURE after %s iterations. This is a result, "
+                "not a missing solver: the binary ran, could not restore feasibility, and gave "
+                "up. Switching linear solver will not help. Read the last iteration line -- a "
+                "large lg(rg) with ||d|| = 0 means the step computation degenerated. Common "
+                "causes here: a constraint that saturates in floating point (v5's "
+                "sigma = 1 - exp(-ft/f_ref) is exactly 1.0 for ft/f_ref > 36.7, pinning sig on "
+                "its own declared upper bound), or an AMPL evaluation error upstream of it."
+                % it)
     first = [ln for ln in text.splitlines() if "valuat" in ln]
     return "IPOPT rejected the model: %s" % (first[0].strip() if first else text[:300])
 
