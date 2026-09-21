@@ -497,11 +497,35 @@ class V5UQParams:
     continuation: bool = True          # seed from the I0 = 0 linear-tomography + TV solve
     gate: bool = True
     ipopt_max_iter: int = 3000
-    # ma57, not ma97. Measured on this model at grid 12/K=3, changing ONLY the linear solver:
-    # ma97 fails in restoration at iteration 828, ma57 reaches optimal in 308 (14 s) and ma27 in
-    # 1479 (172 s). ma97 was inherited from forward_solve, where it is fine -- the forward
-    # problem is square and does not exercise the estimation NLP's KKT system.
-    linear_solver: str = "ma57"
+
+    # LIFT THE OBJECTIVE. Measured with PyNumero at the start point, grid 32: the objective
+    # gradient inf-norm is 3.17e-05 against constraint row inf-norms of 1 to 5.09e+03. IPOPT's
+    # gradient-based scaling is min(1, 100/||g||) -- it caps large gradients and NEVER lifts a
+    # small one, so obj_scaling_factor comes out 1, the objective stays eight orders below the
+    # constraints, and scaled == unscaled bit-for-bit in every exit block. The consequence is not
+    # cosmetic: without this the solve dies in restoration (grid 32 at iteration 748, grid 12 at
+    # 828), and with it the SAME model reaches optimal.
+    #
+    # 1e4, not 1e5: the magnitude does NOT transfer. Measured at K=4/K=3, full budget --
+    #   grid 32:  none -> Restoration Failed 748 | 1e4 -> optimal 479 it, theta 10.31% (277 s)
+    #                                            | 1e5 -> Restoration Failed at 117
+    #   grid 12:  none -> Restoration Failed 828 | 1e3 -> optimal 390 | 1e4 -> optimal 530,
+    #                                              theta 11.99% | 1e5 -> optimal 123
+    # 1e4 is the only value measured to converge at BOTH grids. Treat it as calibrated to this
+    # objective's scale, not as a universal constant: change the normalisation in
+    # add_estimation_objective and this needs re-measuring.
+    #
+    # The principled fix is to normalise the objective GRADIENT rather than its value --
+    # add_estimation_objective normalises both terms to O(1) in value, which is what makes
+    # tv_weight a dimensionless ratio, and nothing there touches the gradient. Until that is
+    # done this option is the stand-in.
+    obj_scaling_factor: float = 1e4
+
+    # ma97. ma57 is faster at grid 12 (optimal in 308 iterations / 14 s bare, where bare ma97
+    # fails), but that did NOT transfer: at grid 32 ma57 ran 87 minutes without returning and was
+    # abandoned, as was ma27 at 64 minutes. With obj_scaling_factor in place ma97 converges at
+    # both grids, so it is the only pairing measured at the target resolution.
+    linear_solver: str = "ma97"
     solver_opts: Optional[dict] = None
 
     def physics(self, **over) -> V5Params:
@@ -619,6 +643,10 @@ def run_v5_reconstruction(params: V5UQParams, log_callback=None) -> V5UQResults:
 
     opts = dict(params.solver_opts or {})
     opts.setdefault("ma97_order", "metis")
+    # Applied to the continuation too: it has the same tiny-gradient objective, and keeping the
+    # two solves on one scale means the warm start is not handed across a scale change.
+    if params.obj_scaling_factor and "obj_scaling_factor" not in opts:
+        opts["obj_scaling_factor"] = float(params.obj_scaling_factor)
 
     # --- continuation: I0 = 0, c_cp = 0 is linear tomography + TV ---------------------------
     # The seed matters more than its amplitude: a mis-SCALED theta converges in a handful of
@@ -969,11 +997,28 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
     traj = numpy_trajectory(theta_seed, m.seq, m.p, m.res)
     written = []
 
+    def _put(v, x):
+        """Set a value, clipped into the variable's own bounds.
+
+        The numpy trajectory carries slightly negative f where the flux overshoots (down to
+        ~-1e-8 at grid 32), and f_bounds starts at 0, so writing it raw puts the START POINT
+        outside the feasible box -- Pyomo logs W1002 for every one and IPOPT has to relocate
+        them before iteration 0, which is exactly the carefully-built feasible start being
+        thrown away. Clipping costs nothing: the excursion is at round-off next to a field
+        whose peak is ~1e-1.
+        """
+        lo, hi = v.lb, v.ub
+        if lo is not None and x < lo:
+            x = lo
+        if hi is not None and x > hi:
+            x = hi
+        v.set_value(x)
+
     # f and the per-stage scalar fields. Blocks absent through inlining, or frozen to Params,
     # are skipped rather than special-cased at the call site.
     for q in m.PIX:
         for k in m.T:
-            m.f[q, k].set_value(float(traj["f"][q, k]))
+            _put(m.f[q, k], float(traj["f"][q, k]))
         for k in m.TM:
             if not m.inline_Ipix:
                 m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
@@ -999,7 +1044,8 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
 
     if fix_theta:
         for q in m.PIX:
-            m.f[q, 0].fix(float(theta_seed.ravel()[q]))
+            _put(m.f[q, 0], float(theta_seed.ravel()[q]))
+            m.f[q, 0].fix()
 
     resid, where = max_residual(m)
     out = dict(seed_is_theta_ref=default_seed, residual=resid, worst_row=where,
@@ -1038,6 +1084,11 @@ def _cli(argv=None):
     ap.add_argument("--noise-sigma", type=float, default=0.0)
     ap.add_argument("--max-iter", type=int, default=3000)
     ap.add_argument("--linear-solver", default="ma97")
+    ap.add_argument("--obj-scaling", type=float, default=1e4,
+                    help="IPOPT obj_scaling_factor. 0 disables. The objective gradient is ~3e-05 "
+                         "against constraint rows up to 5e+03 and IPOPT's own scaling cannot "
+                         "lift it, so without this the solve dies in restoration. 1e4 is the "
+                         "only value measured to converge at both grid 12 and grid 32.")
     ap.add_argument("--no-continuation", action="store_true")
     ap.add_argument("-o", "--out", default=None, help="write results to this .npz")
     ap.add_argument("-q", "--quiet", action="store_true")
@@ -1055,7 +1106,7 @@ def _cli(argv=None):
         I0=a.I0, c=a.c, a=a.a, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
         f_ref_frac=a.f_ref_frac, tv_weight=a.tv_weight, noise_sigma=a.noise_sigma,
         continuation=not a.no_continuation, ipopt_max_iter=a.max_iter,
-        linear_solver=a.linear_solver)
+        linear_solver=a.linear_solver, obj_scaling_factor=a.obj_scaling)
 
     cb = None if a.quiet else (lambda chunk: (sys.stdout.write(chunk), sys.stdout.flush()))
     t0 = time.time()
