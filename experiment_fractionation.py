@@ -137,6 +137,33 @@ def run(image_res=32, n_angles=10, optical_depth=1.1, **over):
     return theta, A, B, p, angles
 
 
+def match_ck(target, image_res, n_angles, kw, tol=2e-3, max_iter=25, verbose=True):
+    """Scale ``c_cp`` until the WORSE of the two schedules hits ``target`` for max C_k.
+
+    One ``c_cp`` for both runs, not one each: it is a material property, and the experiment
+    varies the schedule, not the material.  Matching per-run would confound the comparison with
+    a different compaction amplitude, which is exactly what
+    :func:`degrade_v5.match_compaction_number` warns against.
+
+    The simultaneous run binds, and there C_k is EXACTLY linear in ``c_cp`` -- within one step
+    ``phi`` is solved from ``ft`` and ``dw`` before the flux, so it does not see ``c_cp`` at all.
+    Sequentially the feedback through ``f`` makes it only nearly linear, so this iterates the
+    fixed point ``c <- c * target / C_k(c)`` rather than assuming one shot is enough.
+    """
+    c = float(kw.get("c_cp", 0.3))
+    for it in range(1, max_iter + 1):
+        k = dict(kw); k["c_cp"] = c
+        _t, A, B, _p, _a = run(image_res=image_res, n_angles=n_angles, **k)
+        worst = max(A["ck"], B["ck"])
+        if verbose:
+            print("    match c_cp=%.5f -> C_k seq %.4f / sim %.4f (worst %.4f)"
+                  % (c, A["ck"], B["ck"], worst))
+        if abs(worst - target) <= tol:
+            return c
+        c *= target / max(worst, 1e-12)
+    return c
+
+
 def _figure(theta, res, title, path, vmax, span, prof_ref, dlim):
     """Four panels.  Colour scales are passed in so the two figures are directly comparable."""
     f = res["f"]
@@ -193,6 +220,11 @@ def main(argv=None):
     ap.add_argument("--reach", type=float, default=7.0)
     ap.add_argument("--gamma", type=float, default=100.0)
     ap.add_argument("--f-ref-frac", type=float, default=0.002)
+    ap.add_argument("--match-ck", type=float, default=None, metavar="TARGET",
+                    help="solve for the c_cp that puts the WORSE schedule's max C_k at TARGET, "
+                         "and use that one c_cp for both runs. Use to stay inside the donor-cell "
+                         "positivity bound (C_k <= 1), which the simultaneous schedule breaches "
+                         "at c_cp = 0.3 with c_omega = 0.8.")
     ap.add_argument("--tag", default="", help="suffix for the PNG names, so runs do not overwrite")
     a = ap.parse_args(argv)
 
@@ -201,9 +233,13 @@ def main(argv=None):
     check_equivalence()
     print()
 
-    theta, A, B, p, angles = run(image_res=a.grid, n_angles=a.angles, I0=a.I0, c=a.c, a=a.a,
-                                 b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
-                                 f_ref_frac=a.f_ref_frac)
+    kw = dict(I0=a.I0, c=a.c, a=a.a, b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
+              f_ref_frac=a.f_ref_frac)
+    if a.match_ck is not None:
+        print("  matching c_cp so the worse schedule's max C_k = %.3f" % a.match_ck)
+        kw["c_cp"] = match_ck(a.match_ck, a.grid, a.angles, kw)
+        print("    -> c_cp = %.5f (was %.5f), applied to BOTH runs\n" % (kw["c_cp"], a.c_cp))
+    theta, A, B, p, angles = run(image_res=a.grid, n_angles=a.angles, **kw)
     sfx = ("_" + a.tag) if a.tag else ""
     nr, _ = theta.shape
     yy, xx = np.mgrid[0:nr, 0:nr]
