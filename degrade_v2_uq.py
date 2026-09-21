@@ -675,13 +675,21 @@ _FEASIBILITY_OPTIONS = {
 
 def solve_with_fallback(model, *, linear_solver="ma27", max_iter=3000, tol=1e-8, tee=False,
                         log_callback=None, options=None):
-    """Solve, walking ``ma27 -> ma57 -> mumps`` only when a solver fails to *run*.
+    """Solve, walking ``ma27 -> ma57 -> mumps``.  Three outcomes, not two.
 
-    Same rule as :mod:`tomography_uq`: a non-optimal termination is a result, not a reason to
-    switch linear solvers.  ``ma86`` is deliberately absent -- it is not in the IDAES build.
+    - the binary **failed to run** (missing from the build): try the next one, and if none runs,
+      say so.
+    - IPOPT ran and rejected the **model** (``can't evaluate sqrt'(0)``, an invalid number, too
+      few degrees of freedom): raise at once.  Every other linear solver fails identically, and
+      walking the chain reports a missing binary that is sitting right there.
+    - IPOPT ran and failed **numerically** (restoration failure, step computation error): try the
+      next one, because on this model they genuinely differ -- measured at grid 12 / K=3 on the
+      v5 estimation NLP, ma97 fails in restoration at iteration 828 while ma57 reaches optimal in
+      308 and ma27 in 1479.  But if they all fail, the message must say that they RAN and failed,
+      not that none was usable.
     """
     order = [linear_solver] + [s for s in _FALLBACK_LINEAR_SOLVERS if s != linear_solver]
-    last = None
+    last, numerical = None, []
     for name in order:
         try:
             res = _solve_streaming(_make_solver(name, max_iter, tol, options), model, tee,
@@ -690,14 +698,34 @@ def solve_with_fallback(model, *, linear_solver="ma27", max_iter=3000, tol=1e-8,
         except Exception as exc:
             text = str(exc)
             if _is_model_error(text):
-                # IPOPT launched and rejected the *problem*.  Retrying it on ma57 and mumps
-                # would fail identically and report "no usable linear solver", which sends the
-                # reader hunting for a missing binary that is sitting right there.
                 raise RuntimeError(_curate(text)) from exc
+            if _is_numerical_failure(text):
+                numerical.append(name)
+                last = exc
+                if log_callback:
+                    log_callback("\n[%s ran and failed numerically; trying the next linear "
+                                 "solver, which on this model can differ]\n" % name)
+                continue
             last = exc
             if log_callback:
                 log_callback("\n[linear solver %r unavailable: %s]\n" % (name, text[:200]))
+    if numerical:
+        raise RuntimeError(
+            "every linear solver tried (%s) RAN and failed numerically; %s. This is a property "
+            "of the model at this point, not a missing binary. %s"
+            % (", ".join(order), ", ".join(numerical) + " reached a numerical failure",
+               _curate(str(last)))) from last
     raise RuntimeError("no usable IPOPT linear solver (tried %s): %s" % (order, last))
+
+
+def _is_numerical_failure(text: str) -> bool:
+    """Did IPOPT run and fail on the numbers, rather than on the model or the binary?
+
+    Distinct from :func:`_is_model_error` because the response differs: a model IPOPT rejects
+    will be rejected identically by every linear solver, whereas a numerical failure will not.
+    """
+    return ("Restoration Failed" in text or "restoration phase failed" in text
+            or "Error in step computation" in text)
 
 
 def _is_model_error(text: str) -> bool:
@@ -708,15 +736,7 @@ def _is_model_error(text: str) -> bool:
     """
     return ("can't evaluate" in text or "Error evaluating" in text
             or "Invalid number" in text or "Ipopt " in text
-            or "too few degrees of freedom" in text
-            # A TERMINATION is a result, not a missing binary. Without these three, a v5 grid-32
-            # run that died in restoration at iteration 748 was handed to ma57 and mumps, each of
-            # which re-solved the whole problem to the same end before the caller was told "no
-            # usable IPOPT linear solver" -- the exact misdirection this function exists to
-            # prevent, and ~20 minutes of wasted solve per fallback.
-            or "Restoration Failed" in text
-            or "restoration phase failed" in text
-            or "Error in step computation" in text)
+            or "too few degrees of freedom" in text)
 
 
 def _curate(text: str) -> str:
@@ -731,11 +751,15 @@ def _curate(text: str) -> str:
         it = (re.findall(r"Number of Iterations\.*:\s*(\S+)", text) or ["?"])[-1]
         return ("IPOPT terminated in RESTORATION FAILURE after %s iterations. This is a result, "
                 "not a missing solver: the binary ran, could not restore feasibility, and gave "
-                "up. Switching linear solver will not help. Read the last iteration line -- a "
-                "large lg(rg) with ||d|| = 0 means the step computation degenerated. Common "
-                "causes here: a constraint that saturates in floating point (v5's "
-                "sigma = 1 - exp(-ft/f_ref) is exactly 1.0 for ft/f_ref > 36.7, pinning sig on "
-                "its own declared upper bound), or an AMPL evaluation error upstream of it."
+                "up. SWITCHING LINEAR SOLVER OFTEN DOES HELP here -- measured on the v5 "
+                "estimation NLP at grid 12/K=3, ma97 fails this way at iteration 828 while ma57 "
+                "reaches optimal in 308 and ma27 in 1479. Also worth checking before blaming the "
+                "model: the objective scale. IPOPT's gradient-based scaling only caps large "
+                "gradients (min(1, 100/||g||)) and never lifts a small one, so an objective "
+                "whose gradient is orders below the constraint rows is left invisible -- v5's is "
+                "3.2e-05 against rows up to 5.1e+03, and obj_scaling_factor >= 1e3 converts this "
+                "same failure into an optimal solve. Read the last iteration line too: a large "
+                "lg(rg) with ||d|| = 0 means the step computation degenerated."
                 % it)
     first = [ln for ln in text.splitlines() if "valuat" in ln]
     return "IPOPT rejected the model: %s" % (first[0].strip() if first else text[:300])

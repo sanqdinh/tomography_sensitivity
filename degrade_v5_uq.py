@@ -497,7 +497,11 @@ class V5UQParams:
     continuation: bool = True          # seed from the I0 = 0 linear-tomography + TV solve
     gate: bool = True
     ipopt_max_iter: int = 3000
-    linear_solver: str = "ma97"
+    # ma57, not ma97. Measured on this model at grid 12/K=3, changing ONLY the linear solver:
+    # ma97 fails in restoration at iteration 828, ma57 reaches optimal in 308 (14 s) and ma27 in
+    # 1479 (172 s). ma97 was inherited from forward_solve, where it is fine -- the forward
+    # problem is square and does not exercise the estimation NLP's KKT system.
+    linear_solver: str = "ma57"
     solver_opts: Optional[dict] = None
 
     def physics(self, **over) -> V5Params:
