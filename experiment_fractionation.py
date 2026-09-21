@@ -24,7 +24,12 @@ removes nothing at K=1, and the whole difference measured below is the fractiona
 
 Run it::
 
-    python3 experiment_fractionation.py            # writes the two PNGs next to this file
+    python3 experiment_fractionation.py                      # defaults
+    python3 experiment_fractionation.py --a 0 --c 0.8 --tag a0_c0.8
+
+``--a 0 --b 0`` is the clean shrinkage case: the decay channel is off, :func:`prop:xd_mass`
+makes the total EXACTLY conserved, and every difference between the two runs is then transport
+alone rather than transport plus a difference in how much mass each schedule destroyed.
 """
 
 from __future__ import annotations
@@ -175,13 +180,31 @@ def _figure(theta, res, title, path, vmax, span, prof_ref, dlim):
     return path
 
 
-def main():
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--grid", type=int, default=32)
+    ap.add_argument("--angles", type=int, default=10)
+    ap.add_argument("--I0", type=float, default=1.0)
+    ap.add_argument("--c", type=float, default=0.1, help="c_omega, the conversion coefficient")
+    ap.add_argument("--a", type=float, default=0.05, help="linear decay; 0 with b=0 conserves mass")
+    ap.add_argument("--b", type=float, default=0.0)
+    ap.add_argument("--c-cp", type=float, default=0.3)
+    ap.add_argument("--reach", type=float, default=7.0)
+    ap.add_argument("--gamma", type=float, default=100.0)
+    ap.add_argument("--f-ref-frac", type=float, default=0.002)
+    ap.add_argument("--tag", default="", help="suffix for the PNG names, so runs do not overwrite")
+    a = ap.parse_args(argv)
+
     print(__doc__.splitlines()[0])
     print()
     check_equivalence()
     print()
 
-    theta, A, B, p, angles = run()
+    theta, A, B, p, angles = run(image_res=a.grid, n_angles=a.angles, I0=a.I0, c=a.c, a=a.a,
+                                 b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
+                                 f_ref_frac=a.f_ref_frac)
+    sfx = ("_" + a.tag) if a.tag else ""
     nr, _ = theta.shape
     yy, xx = np.mgrid[0:nr, 0:nr]
     m0 = float(theta.sum())
@@ -200,10 +223,12 @@ def main():
            "reach=%g gamma=%g f_ref_frac=%g"
            % (nr, len(angles), p.I0, p.c, p.a, p.b, p.c_cp, p.reach, p.gamma, p.f_ref_frac))
     pA = _figure(theta, A, "A. SEQUENTIAL - %d steps, one angle each\n%s" % (A["steps"], hdr),
-                 os.path.join(HERE, "v5_fractionation_sequential.png"), vmax, span, prof_ref, dlim)
+                 os.path.join(HERE, "v5_fractionation_sequential%s.png" % sfx),
+                 vmax, span, prof_ref, dlim)
     pB = _figure(theta, B, "B. SIMULTANEOUS - 1 step carrying all %d angles\n%s"
                  % (len(angles), hdr),
-                 os.path.join(HERE, "v5_fractionation_simultaneous.png"), vmax, span, prof_ref, dlim)
+                 os.path.join(HERE, "v5_fractionation_simultaneous%s.png" % sfx),
+                 vmax, span, prof_ref, dlim)
 
     print("  %-26s %14s %14s %14s" % ("", "A sequential", "B simultaneous", "B - A"))
     rows = [("measurement steps", "steps", "%d", 0),
@@ -223,6 +248,15 @@ def main():
 
     dif = B["f"] - A["f"]
     print()
+    if p.a == 0.0 and p.b == 0.0:
+        m0 = float(theta.sum())
+        print("  a = b = 0, so prop:xd_mass makes the total EXACTLY conserved and every")
+        print("  difference below is TRANSPORT alone:")
+        print("    mass drift  sequential %+.3e   simultaneous %+.3e   (relative to %.5f)"
+              % (A["mass"] - m0, B["mass"] - m0, m0))
+    if max(A["ck"], B["ck"]) > 1.0:
+        print("  WARNING C_k > 1: the donor-cell positivity bound no longer holds "
+              "(sequential %.3f, simultaneous %.3f). Check min f." % (A["ck"], B["ck"]))
     print("  final fields differ by %.4e max abs = %.2f%% of peak theta"
           % (np.abs(dif).max(), 100.0 * np.abs(dif).max() / vmax))
     print("  mass A -> B: %.5f -> %.5f (%+.3f%%)"
