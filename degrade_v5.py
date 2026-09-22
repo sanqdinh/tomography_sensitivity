@@ -1,4 +1,6 @@
-"""v5: v4 with the compaction potential made nonlocal. Step 4 only; nothing else moves.
+"""v5, the shrinkage dose-response model: the compaction potential made nonlocal.
+
+v4 with step 4 changed and nothing else moved.
 
 The problem v5 solves
 ---------------------

@@ -1,4 +1,6 @@
-"""Pyomo transcription of v5 -- the reduced model with a NONLOCAL compaction potential.
+"""Pyomo transcription of v5, the shrinkage dose-response model.
+
+The reduced model with a NONLOCAL compaction potential.
 
 Same checking discipline as v4: data comes from :func:`degrade_v5.simulate` (numpy), so the
 measurements and the model fitting them stay two independent implementations, and

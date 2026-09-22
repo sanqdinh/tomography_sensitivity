@@ -554,7 +554,8 @@ for _k, _v in {
 }.items():
     st.session_state.setdefault(_k, _v)
 
-# 2D nonlocal model (v5). v4 plus a compaction POTENTIAL: the flux driver stops being pointwise,
+# 2D shrinkage dose-response (v5). v4 plus a compaction POTENTIAL: the flux driver stops being
+# pointwise,
 # which is what lets a uniformly damaged bulk condense instead of shuffling at the rim.
 if "beam_table_v5" not in st.session_state:
     st.session_state["beam_table_v5"] = _empty_beam_table()
@@ -1984,7 +1985,7 @@ def _simulate_v4(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     return theta, f, dw_panel, summary
 
 
-# --- 2D nonlocal model (v5) tab: forward simulation only ---------------------------------
+# --- 2D shrinkage dose-response (v5) tab: forward simulation only ------------------------
 # v4 with the compaction potential made NONLOCAL. v4's flux is driven by Pi, a pointwise
 # function of the local state, and prop:xd_locality then forbids a uniformly damaged bulk from
 # moving at all -- measured interior flux divergence exactly 0.000e+00, which is why v4 shuffles
@@ -2080,10 +2081,11 @@ def _simulate_v5(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
 
 
 def _render_2d_v5_tab():
-    """The nonlocal closure: whole-body condensation rather than rim shuffling."""
+    """Shrinkage dose-response: whole-body condensation rather than rim shuffling."""
     s = st.session_state
     st.caption(
-        "**Nonlocal damage model (v5).** v4 with one change: the compaction flux is driven by a "
+        "**Shrinkage dose-response model (v5).** v4 with one change: the compaction flux is driven "
+        "by a "
         "**potential solved across the whole specimen** instead of by the pointwise `Pi`. That "
         "matters because a pointwise antisymmetric flux *cannot* move a uniformly damaged bulk "
         "\u2014 measured interior divergence exactly 0.000e+00 in v4 \u2014 so v4 shuffles mass "
@@ -2881,7 +2883,8 @@ def _render_2d_v2_tab():
 
 # --- three modes, three tabs ----------------------------------------------------------
 tab_2d, tab_3d, tab_v5 = st.tabs(
-    ["2D dose-response + reconstruction", "3D degradation", "2D nonlocal model (v5)"]
+    ["2D dose-response + reconstruction", "3D degradation",
+     "2D shrinkage dose-response (v5)"]
 )
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
