@@ -169,24 +169,43 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
                 I_terms[(pix, k)].append((k, j, t))
                 Id_terms[(pix, k)].append(((k, j, t), chord))
 
+    # THE PER-CROSSING LOCAL FLUENCE, LIFTED. ``L[k,j,t] = I0 exp(-S[k,j,t])`` is the fluence
+    # eq:xd_local_intensity delivers at one crossing, and it is read TWICE: unweighted by the
+    # Ipix sum that drives the decay, and chord-weighted by the dose sum that drives dw.
+    #
+    # Written inline it was built twice -- measured at grid 12 / K=6, 952 distinct exp(-S)
+    # values became 2656 exp nodes -- and, worse, the dw row came out as exp(-sum(exp(...))).
+    # That nested form makes the row's Hessian couple every S along every ray through the pixel,
+    # turning what should be a handful of entries into a dense block. Lifting L makes c_Ipix and
+    # the dose sum LINEAR and leaves exactly one exp per row, each of a single variable. Same
+    # feasible set, same solution: this is a change of algebra, not of model. It is the same
+    # argument v5 makes for lifting Pi, sigma and phi rather than inlining them.
+    m.LX = pyo.Set(initialize=sorted({i for ts in I_terms.values() for i in ts}),
+                   dimen=3, ordered=True)
+    m.L = pyo.Var(m.LX, bounds=(0.0, None), initialize=float(p.I0))
+
+    def _lc(mm, k, j, t):
+        return mm.L[k, j, t] == p.I0 * pyo.exp(-mm.S[k, j, t])
+    m.c_L = pyo.Constraint(m.LX, rule=_lc)
+
     m.Ipix = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
-    def _ip(mm, q, k):
-        ts = I_terms[(q, k)]
-        if not ts:
-            return mm.Ipix[q, k] == 0.0
-        return mm.Ipix[q, k] == sum(p.I0 * pyo.exp(-mm.S[i]) for i in ts)
+    def _ip(mm, q, k):                                   # LINEAR
+        return mm.Ipix[q, k] == sum(mm.L[i] for i in I_terms[(q, k)])
     m.c_Ipix = pyo.Constraint(m.PIX, m.TM, rule=_ip)
 
-    # --- 2. converted fraction, one row off the chain. No dose state. ----------------------
+    # --- 2. converted fraction. The chord-weighted dose sum is lifted too, so this is one
+    # exp of one variable instead of an exp of a sum of exps.
+    m.Z = pyo.Var(m.PIX, m.TM, bounds=(0.0, None), initialize=0.0)
+
+    def _zc(mm, q, k):                                   # LINEAR
+        return mm.Z[q, k] == sum(p.c * ch * mm.L[i] for i, ch in Id_terms[(q, k)])
+    m.c_Z = pyo.Constraint(m.PIX, m.TM, rule=_zc)
+
     m.dw = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
     def _dwc(mm, q, k):
-        ts = Id_terms[(q, k)]
-        if not ts:
-            return mm.dw[q, k] == 0.0
-        return mm.dw[q, k] == 1.0 - pyo.exp(
-            -sum(p.c * p.I0 * pyo.exp(-mm.S[i]) * ch for i, ch in ts))
+        return mm.dw[q, k] == 1.0 - pyo.exp(-mm.Z[q, k])
     m.c_dw = pyo.Constraint(m.PIX, m.TM, rule=_dwc)
 
     # --- 3. mass loss, carried as a variable so the rows downstream stay low order ---------
@@ -306,12 +325,14 @@ def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool
     f = np.stack([h.ravel() for h in hist], axis=1)
 
     S, Ipix, cIdelta = {}, np.zeros((npix, K)), np.zeros((npix, K))
+    L = {}
     for k, (_ang, rays) in enumerate(meas):
         for j, (_r, walk) in enumerate(rays):
             acc = 0.0
             S[(k, j, 0)] = 0.0
             for t, (pix, chord, shield) in enumerate(walk):
                 loc = p.I0 * np.exp(-acc)
+                L[(k, j, t)] = loc
                 Ipix[pix, k] += loc
                 cIdelta[pix, k] += p.c * loc * chord
                 acc += chord * f[shield, k]
@@ -346,7 +367,8 @@ def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool
             for _pix, chord, owner in walk:
                 acc[owner] = acc.get(owner, 0.0) + chord
             yobs[(k, j)] = float(sum(c * f[q, k + 1] for q, c in acc.items()))
-    return dict(f=f, S=S, Ipix=Ipix, dw=dw, ft=ft, yobs=yobs, Pi=Pi, sig=sig, phi=phi, sp=sp)
+    return dict(f=f, S=S, L=L, Z=cIdelta, Ipix=Ipix, dw=dw, ft=ft, yobs=yobs,
+                Pi=Pi, sig=sig, phi=phi, sp=sp)
 
 
 def pin_model(m, traj, *, fix=True):
@@ -358,6 +380,7 @@ def pin_model(m, traj, *, fix=True):
                 m.f[q, k].fix()
         for k in m.TM:
             m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
+            m.Z[q, k].set_value(float(traj["Z"][q, k]))
             m.dw[q, k].set_value(float(traj["dw"][q, k]))
             m.ft[q, k].set_value(float(traj["ft"][q, k]))
             if m.has_potential:
@@ -366,6 +389,7 @@ def pin_model(m, traj, *, fix=True):
                 m.phi[q, k].set_value(float(traj["phi"][q, k]))
             if fix:
                 m.Ipix[q, k].fix()
+                m.Z[q, k].fix()
                 m.dw[q, k].fix()
                 m.ft[q, k].fix()
                 if m.has_potential:
@@ -382,6 +406,10 @@ def pin_model(m, traj, *, fix=True):
         m.S[idx].set_value(float(traj["S"][idx]))
         if fix:
             m.S[idx].fix()
+    for idx in m.LX:
+        m.L[idx].set_value(float(traj["L"][idx]))
+        if fix:
+            m.L[idx].fix()
     for idx in m.RAY:
         m.yobs[idx].set_value(float(traj["yobs"][idx]))
         if fix:
@@ -630,12 +658,15 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False):
             _put(m.f[q, k], float(traj["f"][q, k]))
         for k in m.TM:
             m.Ipix[q, k].set_value(float(traj["Ipix"][q, k]))
+            _put(m.Z[q, k], float(traj["Z"][q, k]))
             m.dw[q, k].set_value(float(traj["dw"][q, k]))
             m.ft[q, k].set_value(float(traj["ft"][q, k]))
             if m.has_potential:
                 m.Pi[q, k].set_value(float(traj["Pi"][q, k]))
                 m.sig[q, k].set_value(float(traj["sig"][q, k]))
                 m.phi[q, k].set_value(float(traj["phi"][q, k]))
+    for idx in m.LX:
+        _put(m.L[idx], float(traj["L"][idx]))
     if m.has_potential:
         for (a, b) in m.FACE:
             for k in m.TM:
