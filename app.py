@@ -2619,9 +2619,19 @@ def _render_2d_v6_tab():
                 "diffuses. Change-view shows it. This is reported, not worked around — "
                 "see degrade_v6's docstring." % summary["rest_rate"])
         if summary["phi_cr"] == summary["phi_cr"] and summary["phi_cr"] < 1.0:
-            st.info("phi is still rim-peaked (centre/rim %.2f < 1): raise the reach above about "
-                    "half the specimen radius to get whole-body contraction."
-                    % summary["phi_cr"])
+            st.info(
+                "phi is rim-peaked (centre/rim %.2f < 1). Mass climbs **toward higher phi** "
+                "(`eq:xd_flux`), so the inward drive is not organised across the whole body. "
+                "Two causes, needing different responses. On a roughly **uniform** specimen the "
+                "reach is short \u2014 on a disc the ratio runs 2.8 at `l = R/5` to 4.3 at "
+                "`l = 4R`, so raising `l` fixes it. On a **structured** phantom it can instead "
+                "be the object: the void source `Pi = dw\u00b7f\u0303/f_max` is weighted by the "
+                "material present, and Shepp-Logan's mass sits in a bright ring, so phi peaks "
+                "near `r ~ 10 px` rather than at the centre and the ratio **saturates near 0.70 "
+                "at any reach**. Raising `l` still helps the contraction there (half-mass "
+                "-0.20%% at `l = 7 px` against -0.39%% at `l = R`, then flat), so read the "
+                "half-mass metric rather than this ratio to decide whether the reach is doing "
+                "anything." % summary["phi_cr"])
 
 
 def _render_2d_v4_tab():
