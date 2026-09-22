@@ -70,6 +70,7 @@ from degrade_v2 import (
 )
 from degrade_v2_uq import V2UQParams, run_v2_reconstruction
 from degrade_v5_uq import V5UQParams, run_v5_reconstruction
+from degrade_v6_uq import V6UQParams, run_v6_reconstruction
 from degrade_v4 import (
     V4Params,
     simulate as simulate_v4_seq,
@@ -594,6 +595,8 @@ for _k, _v in {
     # Measurement schedule. SIMULTANEOUS is the default: the table's rows are one exposure
     # carrying every bundle, not one exposure each.
     "v6_mode": "Simultaneous",
+    # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D tab's scale.
+    "v6_tv_weight": 0.001, "v6_maxiter": 3000, "v6_noise": 0.0,
     "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
     "v6_view_k": 0,
 }.items():
@@ -2632,6 +2635,152 @@ def _render_2d_v6_tab():
         # information and, worse, reads as a fault when nothing is wrong: positivity and
         # conservation are structural here and hold at every setting. The ratio is still in
         # StepInfo6.phi_core_rim for anyone who wants it.
+
+    # --- Reconstruct ------------------------------------------------------------------------
+    # Appended below the live layout rather than given a sub-tab, mirroring the 2D, v2 and v5
+    # tabs. The solve runs the WHOLE table however far the view is scrubbed back, and at the
+    # schedule the toggle selects -- data taken simultaneously must be fitted by the
+    # simultaneous model, or the estimator is inverting dynamics the experiment never ran.
+    st.divider()
+    st.subheader("Reconstruct")
+    st.caption(
+        "Estimate the undamaged field `theta = f_0` from the projections, inverting the v6 "
+        "dynamics, then differentiate the estimate with **k_aug** for the per-pixel posterior "
+        "variance. The forward residual gate re-runs on *this* geometry first and the solve is "
+        "**refused** if the Pyomo model has drifted from the simulator — a reconstruction "
+        "against a model that no longer matches would read as a physics result. "
+        "`I0 = 0` is the **control**: it makes the dynamics the identity, so the run is plain "
+        "linear tomography and the number it returns is the estimator alone."
+    )
+    rc = st.columns([1, 1, 1, 2])
+    with rc[0]:
+        st.select_slider("TV weight", options=_V2_TV_WEIGHTS, key="v6_tv_weight",
+                         format_func=lambda v: "%g" % v,
+                         help="Both objective terms are normalised to O(1) first, so this is a "
+                              "trade-off RATIO and not the 2D tab's scale.")
+    with rc[1]:
+        st.number_input("Max IPOPT iterations", min_value=50, max_value=5000, step=50,
+                        key="v6_maxiter")
+    with rc[2]:
+        st.number_input("Noise sigma", min_value=0.0, max_value=1.0, step=0.001,
+                        format="%.3f", key="v6_noise",
+                        help="Gaussian noise added to the synthetic projections. 0 is the "
+                             "noiseless case the other tabs use.")
+    with rc[3]:
+        n_rays_v6 = sum(len(_bundle_r_values(o, n, res)) for _a, o, n in seq_all)
+        n_obs_v6 = n_rays_v6
+        st.caption(
+            "%d measurement%s · %d rays · **%d observations for %d pixels** "
+            "(%.2fx %s) · schedule **%s**"
+            % (n_all, "" if n_all == 1 else "s", n_rays_v6, n_obs_v6, res * res,
+               (n_obs_v6 / max(res * res, 1)) if n_obs_v6 >= res * res
+               else (res * res / max(n_obs_v6, 1)),
+               "over-determined" if n_obs_v6 >= res * res else "UNDER-determined",
+               s["v6_mode"]))
+        if n_obs_v6 < res * res:
+            st.caption(
+                ":orange[Under-determined: TV rather than the data chooses among the fields "
+                "that fit, so the optimum is not unique enough to pin theta and individual "
+                "digits should not be quoted. Add measurements or drop the grid.]")
+
+    go_v6 = st.button("Reconstruct", type="primary", key="btn_v6_recon",
+                      disabled=(n_all == 0))
+
+    # Signature of everything the answer depends on, stored with it: a stale result is reported
+    # rather than silently shown. Same guard the v2, v5 and 3D surfaces use.
+    v6_key = (seq_all, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
+              float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
+              float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]),
+              str(s["v6_mode"]), float(s["v6_tv_weight"]), int(s["v6_maxiter"]),
+              float(s["v6_noise"]))
+
+    if go_v6:
+        log_box = st.empty()
+        log_lines: list[str] = []
+        _last = [0.0]
+
+        def _render_v6_log() -> None:
+            body = _html.escape("".join(log_lines)[-8000:])
+            log_box.empty()
+            with log_box.container():
+                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+
+        def _v6_log(chunk: str) -> None:
+            log_lines.append(chunk)
+            now = time.time()
+            if now - _last[0] >= 0.2:
+                _last[0] = now
+                _render_v6_log()
+
+        params_v6 = V6UQParams(
+            image_res=res, optical_depth=float(s["v6_depth"]), beam_steps=seq_all,
+            simultaneous=simultaneous,
+            I0=float(s["v6_I0"]), c=float(s["v6_c_omega"]), a=float(s["v6_a"]),
+            b=float(s["v6_b"]), c_cp=float(s["v6_c_cp"]), reach=float(s["v6_reach"]),
+            gamma=float(s["v6_gamma"]), f_ref_frac=float(s["v6_fref"]),
+            eta=float(s["v6_eta"]), tv_weight=float(s["v6_tv_weight"]),
+            noise_sigma=float(s["v6_noise"]), ipopt_max_iter=int(s["v6_maxiter"]))
+        with st.spinner("Solving the v6 estimation NLP, then k_aug…"):
+            try:
+                out = run_v6_reconstruction(params_v6, log_callback=_v6_log)
+                st.session_state["results_v6"] = {"res": out, "key": v6_key}
+            except Exception as exc:
+                st.session_state.pop("results_v6", None)
+                st.error("Reconstruction failed: %s" % exc)
+            finally:
+                _render_v6_log()
+
+    stash6 = st.session_state.get("results_v6")
+    if stash6:
+        out = stash6["res"]
+        if stash6["key"] != v6_key:
+            st.warning("These results are STALE — a setting changed since they were "
+                       "computed. Press Reconstruct again.")
+        ok = out.status == "optimal"
+        (st.success if ok else st.warning)(
+            "%s in %.1f s on %s · %d variables, %d constraints · %s iterations"
+            % (out.status, out.t_solve, out.linear_solver, out.n_vars, out.n_cons, out.iters))
+        mm = st.columns(4)
+        mm[0].metric("theta error", "%.3f%%" % out.theta_pct_peak,
+                     help="RMS of (estimate - truth) as a percent of peak theta. **The number "
+                          "to quote**, and only when the geometry is over-determined.")
+        mm[1].metric("Fit RMS", "%.3e" % out.obs_rms,
+                     help="Residual of the projections the NLP actually minimised.")
+        mm[2].metric("D-optimality",
+                     "%.4g" % out.d_optimality if out.d_optimality == out.d_optimality else "n/a",
+                     help="log-det of the posterior covariance J·σ²·Jᵀ. "
+                          "Lower is a more informative design.")
+        mm[3].metric("Half-mass change", "%+.3f%%" % out.half_pct,
+                     help="What the damage did to the TRUE field. If this is ~0 the dynamics "
+                          "barely moved anything and inverting them proved little.")
+        st.caption(
+            "forward gate **%.1e** · start residual **%.1e** (dynamically feasible) · "
+            "continuation **%s** · Hessian regularised on **%d of %d** iterations · "
+            "max |dP| **%.3g**"
+            % (out.forward_residual, out.init_residual, out.continuation_status,
+               out.regularised, out.n_iter_lines, out.dP_max))
+        if out.uq_error:
+            st.info(
+                "**k_aug did not return a covariance** (the reconstruction is kept): %s\n\n"
+                "This is non-fatal by design. The covariance is intentionally rank deficient "
+                "— a starved geometry leaves pixels that no ray constrains — so a "
+                "singular KKT system is a statement about the *design*, not a bug. Add "
+                "measurements or angles to condition it." % out.uq_error)
+        elif out.log_cov_diag_2D is not None:
+            lv = out.log_cov_diag_2D
+            st.caption(
+                "posterior variance: log10 range **%.2f to %.2f** · condition number "
+                "**%.2e** · k_aug took **%.1f s**"
+                % (np.nanmin(lv), np.nanmax(lv), out.uq_conditioning, out.t_uq))
+        # Same figure the v2 surface draws -- V6UQResults carries the same field names, so one
+        # implementation rather than a fourth copy of the same four panels.
+        st.pyplot(_v2_recon_figure(out), use_container_width=True)
+        st.caption(
+            "**theta** is the undamaged field the estimator is after; the damage is what the "
+            "measurements caused on the way. **log10 posterior variance** is the per-pixel "
+            "diagonal of J·σ²·Jᵀ with J = d(theta)/d(y) from k_aug: "
+            "bright pixels are the ones this geometry constrains worst."
+        )
 
 
 def _render_2d_v4_tab():
