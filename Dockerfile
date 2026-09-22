@@ -64,7 +64,8 @@ COPY volume_sim_component/ ./volume_sim_component/
 # A module missing here is simply absent from the image.
 COPY tomography_uq.py tomography_3d.py dose_response.py app.py ./
 COPY degrade_v2.py degrade_v2_uq.py degrade_v3.py degrade_v3_uq.py ./
-COPY degrade_v4.py degrade_v4_uq.py degrade_v5.py degrade_v5_uq.py degrade_v6.py ./
+COPY degrade_v4.py degrade_v4_uq.py degrade_v5.py degrade_v5_uq.py ./
+COPY degrade_v6.py degrade_v6_uq.py ./
 
 # 6b) Materialize plotly.min.js for the 3D Volume component from THIS image's plotly, so the
 #     browser-side bundle always matches the figure JSON the app emits. app.py does the same copy
@@ -91,13 +92,18 @@ print('v2 damage-model invariants OK')" \
 r=degrade_v2_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
 print('v2 Pyomo model == numpy model: residual %.1e, forward %.1e rel, photon balance %.1e' \
       % (r['residual'], r['f_err_rel'], r['photon_balance']))" \
-    && python3 -c "import degrade_v3, degrade_v3_uq, degrade_v4, degrade_v4_uq, degrade_v5, degrade_v5_uq, degrade_v6; \
+    && python3 -c "import degrade_v3, degrade_v3_uq, degrade_v4, degrade_v4_uq, degrade_v5, degrade_v5_uq, degrade_v6, degrade_v6_uq; \
 print('v3/v4/v5/v6 chain present and importable')" \
     && python3 -c "import degrade_v6; \
 r=degrade_v6.check_invariants(image_res=48, n_steps=4, verbose=False); \
 print('v6 invariants OK: mass drift %.1e, collapse %.1e, |colsum-1| %.1e, step4-vs-v5 %.1e, ' \
       'I0=0 leak %.1e (REPORTED: softplus is eta*log2 at rest, not 0)' \
       % (r['mass_drift'], r['collapse'], r['colsum_err'], r['step4_vs_v5'], r['I0_leak']))" \
+    && python3 -c "import degrade_v6_uq; \
+degrade_v6_uq.check_softplus_lifting(verbose=False); \
+r=degrade_v6_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
+assert r < 1e-10, r; \
+print('v6 Pyomo model == numpy model: residual %.1e (softplus lifting exact)' % r)" \
     && python3 -m py_compile app.py && echo 'app.py compiles' \
     && python3 -c "import degrade_v5_uq; \
 r=degrade_v5_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
