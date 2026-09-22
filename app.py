@@ -2568,34 +2568,14 @@ def _render_2d_v6_tab():
         if summary["err"]:
             st.error("Potential solve refused: %s. The guards raise rather than return a wrong "
                      "answer — raise the reach or lower f_ref." % summary["err"])
-        # Half-mass first: subsec:assumptions asks for shrinkage to be reported as a
-        # fixed-centroid half-mass radius, because loss contaminates moments and coarse grids
-        # quantize the support radius. The 99% radius is kept as secondary for that reason.
-        m = st.columns(2)
-        m[0].metric("Half-mass radius (50%)", "%+.3f%%" % summary["half_pct"],
-                    help="**The reported statistic**, per subsec:assumptions: fixed-centroid, so "
-                         "translation does not read as contraction. Negative is contraction.")
-        m[1].metric("Support radius (99%)", "%+.3f%%" % summary["sup_pct"],
-                    help="Secondary: a coarse grid quantizes this one, so it can jump a whole "
-                         "band on a body that barely moved.")
-        m2 = st.columns(2)
-        m2[0].metric("Radial sign changes", "%d" % summary["flips"],
-                     help="ONE sign change is coherent condensation: mass leaves the outside and "
-                          "arrives inside. Several means mass is shuffling between neighbours, "
-                          "which is what a pointwise driver does.")
-        m2[1].metric("Total attenuation", "%.4g" % summary["mass1"],
-                     delta="%+.3g" % (summary["mass1"] - summary["mass0"]))
-        st.caption(
-            "net mass inside **%+.3g** · outside **%+.3g** · min f **%.2e** · "
-            "|colsum−1| **%.1e** · transport residual **%.1e** · "
-            "phi centre/rim **%.2f**"
-            % (summary["inner"], summary["outer"], summary["f_min"], summary["colsum"],
-               summary["mass_resid"], summary["phi_cr"]))
-        st.caption(
-            "max |dP| **%.3g** · eta/max|dP| **%.1e** · resting rate "
-            "c_cp·eta·log2 **%.2e** · absorp/vs **%.2e**"
-            % (summary["dP_max"], summary["eta_ratio"], summary["rest_rate"],
-               summary["absorp"]))
+        # NO STANDING DIAGNOSTIC BLOCK. The metrics and the two numeric captions that used to sit
+        # here (half-mass / support radius / sign changes / total attenuation, then min f,
+        # |colsum-1|, transport residual, phi centre/rim, max |dP|, eta/max|dP|, resting rate,
+        # absorp/vs) were removed as confusing: most of them are healthy at every setting the tab
+        # offers, so they read as a wall of numbers demanding interpretation when there is
+        # nothing to interpret. What is left below fires only when something actually needs the
+        # user's attention. The numbers themselves are unchanged and still computed in
+        # `_simulate_v6`'s `summary`; `python3 degrade_v6.py` prints the full set.
         if summary["absorp"] > 1.0:
             st.warning(
                 "absorp/vs = %.2g > 1: the vacuum penalty is setting the scale INSIDE the "
@@ -2608,9 +2588,6 @@ def _render_2d_v6_tab():
                 "eta is %.0f%% of max |dP|: the softplus is no longer discriminating direction, "
                 "and the transport is mostly the resting diffusion. Lower eta."
                 % (100.0 * summary["eta_ratio"]))
-        if float(s["v6_a"]) == 0.0 and float(s["v6_b"]) == 0.0:
-            st.success("a = b = 0: mass exactly conserved, so any support change is transport "
-                       "alone — the clean shrinkage test.")
         if float(s["v6_I0"]) == 0.0 and float(s["v6_c_cp"]) > 0.0:
             st.info(
                 "I0 = 0 with c_cp > 0. subsec:system says this must return **bitwise** what "
@@ -2618,20 +2595,13 @@ def _render_2d_v6_tab():
                 "eta·log2 > 0, so every face still carries a rate of %.2e and the field "
                 "diffuses. Change-view shows it. This is reported, not worked around — "
                 "see degrade_v6's docstring." % summary["rest_rate"])
-        if summary["phi_cr"] == summary["phi_cr"] and summary["phi_cr"] < 1.0:
-            st.info(
-                "phi is rim-peaked (centre/rim %.2f < 1). Mass climbs **toward higher phi** "
-                "(`eq:xd_flux`), so the inward drive is not organised across the whole body. "
-                "Two causes, needing different responses. On a roughly **uniform** specimen the "
-                "reach is short \u2014 on a disc the ratio runs 2.8 at `l = R/5` to 4.3 at "
-                "`l = 4R`, so raising `l` fixes it. On a **structured** phantom it can instead "
-                "be the object: the void source `Pi = dw\u00b7f\u0303/f_max` is weighted by the "
-                "material present, and Shepp-Logan's mass sits in a bright ring, so phi peaks "
-                "near `r ~ 10 px` rather than at the centre and the ratio **saturates near 0.70 "
-                "at any reach**. Raising `l` still helps the contraction there (half-mass "
-                "-0.20%% at `l = 7 px` against -0.39%% at `l = R`, then flat), so read the "
-                "half-mass metric rather than this ratio to decide whether the reach is doing "
-                "anything." % summary["phi_cr"])
+        # The rim-peaked (centre/rim < 1) banner is gone too. It fired on essentially every
+        # Shepp-Logan setting, because that phantom's mass sits in a bright ring and the void
+        # source is weighted by material present, so phi peaks near r ~ 10 px and the ratio
+        # saturates at 0.70 whatever the reach. A banner that is always on carries no
+        # information and, worse, reads as a fault when nothing is wrong: positivity and
+        # conservation are structural here and hold at every setting. The ratio is still in
+        # StepInfo6.phi_core_rim for anyone who wants it.
 
 
 def _render_2d_v4_tab():
