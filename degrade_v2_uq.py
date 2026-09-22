@@ -648,7 +648,14 @@ def max_residual(m, per_constraint=False):
 
 # --- solving ---------------------------------------------------------------------------------
 
-_FALLBACK_LINEAR_SOLVERS = ["ma27", "ma57", "mumps"]
+# ma97 first: on the v6 estimation NLP it is 73-149x faster per iteration than ma27 (the cost
+# is 99.6% KKT factorisation, and ma27 has no nested-dissection ordering). mumps is REMOVED --
+# it is absent from the IPOPT 3.14 build /usr/local/bin/ipopt resolves to, where it aborts with
+# OPTION_INVALID rather than failing cleanly, so it was never a usable last resort. ma57 and
+# ma27 are both KEPT and both still reachable: solve_with_fallback's own docstring records a
+# measured v5 case where ma97 fails in restoration at iteration 828 while ma57 reaches optimal
+# in 308 and ma27 in 1479, so neither is dead weight.
+_FALLBACK_LINEAR_SOLVERS = ["ma97", "ma57", "ma27"]
 
 
 def _make_solver(linear_solver: str, max_iter: int, tol: float = 1e-8, options=None):

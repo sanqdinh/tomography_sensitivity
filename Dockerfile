@@ -51,7 +51,19 @@ RUN ln -sf /opt/idaes/bin/ipopt    /usr/local/bin/ipopt \
 
 # 5) Fail-fast: confirm the binaries actually run in this image (ABI check).
 RUN /opt/idaes/bin/ipopt --version \
-    && ( /opt/idaes/bin/k_aug --help >/dev/null 2>&1 || true )
+    && ( /opt/idaes/bin/k_aug --help >/dev/null 2>&1 || true ) \
+    # ma97 is not a preference, it is the difference between 0.2 s and 16 s per iteration on the
+    # v6 estimation NLP (99.6% of which is KKT factorisation). If a future `idaes get-extensions`
+    # ships a build without it, the app would silently fall back to ma27 and every reconstruction
+    # would get ~73x slower with nothing in the logs saying why. Fail the build instead.
+    && python3 -c "\
+import pyomo.environ as pyo; \
+m=pyo.ConcreteModel(); m.x=pyo.Var(initialize=1.0); \
+m.c=pyo.Constraint(expr=m.x>=2.0); m.o=pyo.Objective(expr=(m.x-3.0)**2); \
+s=pyo.SolverFactory('ipopt', executable='/opt/idaes/bin/ipopt'); \
+s.options['linear_solver']='ma97'; r=s.solve(m); \
+assert abs(pyo.value(m.x)-3.0) < 1e-6, pyo.value(m.x); \
+print('IPOPT linear solver ma97 present and solving:', r.solver.termination_condition)"
 
 # 6) Application code + vendored senDOE (senDOE/ at /app => importable as top-level `senDOE`).
 COPY senDOE/ ./senDOE/

@@ -212,8 +212,12 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     m.ft = pyo.Var(m.PIX, m.TM, initialize=lambda _m, q, k: float(flat[q]))
 
     def _ftc(mm, q, k):
-        return mm.ft[q, k] == mm.f[q, k] * pyo.exp(
-            -p.a * mm.Ipix[q, k] - p.b * mm.Ipix[q, k] ** 2)
+        # b is 0 by default and Pyomo does not fold -0.0*x**2, so the quadratic term would
+        # otherwise leave a dead node in every one of these rows.
+        expo = -p.a * mm.Ipix[q, k]
+        if p.b:
+            expo = expo - p.b * mm.Ipix[q, k] ** 2
+        return mm.ft[q, k] == mm.f[q, k] * pyo.exp(expo)
     m.c_ft = pyo.Constraint(m.PIX, m.TM, rule=_ftc)
 
     # --- 4. the compaction potential: Pi, sigma, then the elliptic row. All v5's. ----------
@@ -467,7 +471,7 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
     return r
 
 
-def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma27",
+def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma97",
                   max_iter=3000, tol=1e-8, verbose=True, log_callback=None,
                   simultaneous: bool = False):
     """G2: fix ``f[:, 0] = theta`` and let IPOPT FIND the trajectory from the undamaged field.
@@ -563,7 +567,7 @@ def _cli(argv=None):
     ap.add_argument("--gamma", type=float, default=100.0)
     ap.add_argument("--f-ref-frac", type=float, default=0.002)
     ap.add_argument("--eta", type=float, default=1e-3)
-    ap.add_argument("--linear-solver", default="ma27")
+    ap.add_argument("--linear-solver", default="ma97")
     ap.add_argument("--max-iter", type=int, default=3000)
     a = ap.parse_args(argv)
 
@@ -709,7 +713,18 @@ class V6UQParams:
     continuation: bool = True          # seed from the I0 = 0 linear-tomography + TV solve
     gate: bool = True                  # re-run the forward residual gate on THIS geometry
     ipopt_max_iter: int = 3000
-    linear_solver: str = "ma27"
+    # ma97, NOT ma27. Measured on this model, uncontended, single-threaded BLAS: one iteration
+    # of the tab-default problem (grid 32, simultaneous, 5 measurements -- 25,520 vars) costs
+    # 16.06 s on ma27 and 0.219 s on ma97, a factor of 73. On the sequential schedule at grid 32
+    # / K=4 (59,184 vars) it is 159.0 s against 1.069 s, a factor of 149.
+    #
+    # The reason is that this model is ALL linear algebra: IPOPT's own timing split puts
+    # 99.6% of the run in the KKT numeric factorisation and 0.04% in function evaluation. ma27
+    # is a 1981 multifrontal code with no nested-dissection ordering; on this sparsity its
+    # factor reaches ~1 GB and is memory-bandwidth bound. Nothing in the model formulation can
+    # beat that -- three separate reformulations were built, gate-checked and timed, and the
+    # best was +-9%.
+    linear_solver: str = "ma97"
     obj_scaling: float = 0.0           # IPOPT obj_scaling_factor; 0 leaves it alone
 
     # --- UQ ---

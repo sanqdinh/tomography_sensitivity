@@ -596,7 +596,7 @@ for _k, _v in {
     # carrying every bundle, not one exposure each.
     "v6_mode": "Simultaneous",
     # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D tab's scale.
-    "v6_tv_weight": 0.001, "v6_maxiter": 3000, "v6_noise": 0.0,
+    "v6_tv_weight": 0.001, "v6_maxiter": 500, "v6_noise": 0.0,
     "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
     "v6_view_k": 0,
 }.items():
