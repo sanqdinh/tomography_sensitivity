@@ -235,10 +235,28 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
             return mm.Pi[q, k] * fm == mm.dw[q, k] * mm.ft[q, k]
         m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
 
-        # sigma < 1 is structural (1 - exp(-x) < 1); the lower bound is left open because ft can
-        # be marginally negative and a hard 0 would make pinning the trajectory an
-        # out-of-bounds write. Same reasoning as v5.
-        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
+        # NO BOUNDS. sigma < 1 IS structural -- 1 - exp(-x) < 1 for any finite x -- and v5
+        # encodes that as an upper bound, which this module copied. That bound is redundant at
+        # every feasible point and actively harmful at the ones the solver visits.
+        #
+        # With f_ref_frac = 0.002 the bulk has ft/f_ref ~ 170-500, so exp(-ft/f_ref) UNDERFLOWS
+        # to exactly 0 and sigma evaluates to exactly 1.0 -- its upper bound. The row c_sig is
+        # then numerically "sigma = 1" (its only other entry, d/d(ft), is ~1e-74) and the bound
+        # says the same thing. Two constraints, one gradient: LICQ fails, the multiplier pair is
+        # non-unique, and the duals are free to wander while the primal sits still. That is
+        # exactly the reported symptom -- inf_pr ~1e-5 with inf_du swinging 1e3..1e7.
+        #
+        # Measured at grid 16 / K=5 simultaneous, 60 iterations, ma97, changing NOTHING else:
+        #                    sig at ub   reg%   inf_du med   inf_du max   theta err
+        #   bounds=(None,1)        256    77%     1.50e+02     1.66e+07      24.53%
+        #   no bounds                0    44%     3.98e-01     1.72e+02      12.68%
+        # The peak dual infeasibility falls by ~1e5 and the estimate halves its error.
+        #
+        # Nothing downstream needs the bound: sigma enters only c_phi, linearly, and an iterate
+        # with sigma marginally above 1 is no worse behaved than one marginally below it.
+        # degrade_v5_uq carries the same bound and very likely the same pathology; not changed
+        # here because it is a separate model and this was not measured on it.
+        m.sig = pyo.Var(m.PIX, m.TM, initialize=0.0)
 
         def _sigc(mm, q, k):
             if f_ref is None:
