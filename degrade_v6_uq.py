@@ -83,7 +83,8 @@ from degrade_v3_uq import _neighbours
 # hardcodes eps = 1e-4, which swamps a theta peaking near 0.03, and v5 already fixed that.
 from degrade_v5_uq import _tv_expression, _reg_fraction
 from degrade_v6 import (V6Params, simulate, simulate_simultaneous, resolve, softplus,
-                        compaction_potential, shape_diagnostics, _phantom, _demo_sequence)
+                        compaction_potential, shape_diagnostics, select_eta,
+                        ETA_RATIO_LO, ETA_RATIO_HI, _phantom, _demo_sequence)
 
 
 def _measurements(seq, res, simultaneous: bool):
@@ -464,10 +465,17 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
                  pr.c_cp, pr.eta, r, where or "-", "PASS" if r < 1e-10 else "FAIL"))
         for name in sorted(blocks):
             print("      %-12s %.3e" % (name, blocks[name]))
-        # The softplus lifting's only failure mode is underflow of exp(-sp/eta), which costs the
-        # row its derivative in sp. Report the margin rather than assume it.
-        print("      max |dP| = %.4g, eta = %.3g -> max |dP|/eta = %.1f  (exp underflows at 745)"
-              % (dP, pr.eta, dP / pr.eta if pr.eta else float("inf")))
+        # The softplus lifting's failure mode is exp(-sp/eta) losing the row its derivative in
+        # sp. 745 is where exp underflows to zero outright, but that is NOT the limit that
+        # matters: the derivative RATIO within the row is exp(-|dP|/eta), and it stops being
+        # usefully representable around 28. An earlier version of this line quoted 745 and made
+        # a ratio of 183 look like comfortable margin when it was 6.5x past the edge.
+        ratio = dP / pr.eta if pr.eta else float("inf")
+        note = ("ok" if ETA_RATIO_LO <= ratio <= ETA_RATIO_HI else
+                "OUTSIDE the %.0f..%.0f window -- see degrade_v6.select_eta"
+                % (ETA_RATIO_LO, ETA_RATIO_HI))
+        print("      max |dP| = %.4g, eta = %.3g -> max |dP|/eta = %.1f  (%s)"
+              % (dP, pr.eta, ratio, note))
     return r
 
 
@@ -566,13 +574,19 @@ def _cli(argv=None):
     ap.add_argument("--reach", type=float, default=7.0)
     ap.add_argument("--gamma", type=float, default=100.0)
     ap.add_argument("--f-ref-frac", type=float, default=0.002)
-    ap.add_argument("--eta", type=float, default=1e-3)
+    ap.add_argument("--eta", type=float, default=None,
+                    help="softplus smoothing. Omit to CHOOSE it from a forward run "
+                         "(degrade_v6.select_eta); a value here overrides that.")
     ap.add_argument("--linear-solver", default="ma97")
     ap.add_argument("--max-iter", type=int, default=3000)
     a = ap.parse_args(argv)
 
+    # The GATES take a concrete eta -- they are residual/feasibility checks and do not care how
+    # well conditioned it is, so `--eta` omitted just means the historical 1e-3 for them. Only
+    # run_v6_reconstruction interprets None as "choose it", because only it has a solve whose
+    # conditioning depends on the answer.
     kw = dict(I0=a.I0, c=a.c, a=a.a, b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
-              f_ref_frac=a.f_ref_frac, eta=a.eta)
+              f_ref_frac=a.f_ref_frac, eta=(1e-3 if a.eta is None else a.eta))
     print(__doc__.splitlines()[0])
     print()
     check_softplus_lifting()
@@ -704,7 +718,11 @@ class V6UQParams:
     reach: Optional[float] = 7.0
     gamma: float = 100.0
     f_ref_frac: Optional[float] = 0.002
-    eta: float = 1e-3
+    # None = CHOOSE IT from a forward run, via degrade_v6.select_eta. That is the default because
+    # no fixed value works: max|dP| spans 0.15 to 80 across this model's parameter range, and eta
+    # has to track it or the estimation NLP degenerates (at the old fixed 1e-3: 97% of iterations
+    # Hessian-regularised, lg(mu) stuck, inf_du climbing to 6.6e9). A float here overrides it.
+    eta: Optional[float] = None
     dx: float = 1.0
 
     # --- estimation ---
@@ -731,10 +749,12 @@ class V6UQParams:
     run_uq: bool = True
     noise_cov_scale: float = 10.0      # sigma^2 in Sigma = sigma^2 J J^T
 
-    def to_physics(self) -> V6Params:
+    def to_physics(self, eta=None) -> V6Params:
+        """``eta`` overrides the field, which is how the auto-selected value gets in."""
+        use = eta if eta is not None else (self.eta if self.eta else 1e-3)
         return V6Params(I0=self.I0, c=self.c, a=self.a, b=self.b, c_cp=self.c_cp,
                         reach=self.reach, gamma=self.gamma, f_ref_frac=self.f_ref_frac,
-                        eta=self.eta, dx=self.dx)
+                        eta=float(use), dx=self.dx)
 
 
 @dataclass
@@ -769,6 +789,13 @@ class V6UQResults:
     theta_pct_peak: float = float("nan")     # the quotable one
     n_measurements: int = 0
     n_rays: int = 0
+
+    # --- how eta was chosen ---
+    eta_used: float = float("nan")
+    eta_auto: bool = False
+    eta_ratio: float = float("nan")      # max|dP| / eta; healthy window is ~3 to 28
+    eta_rest_total: float = float("nan")  # fraction of a pixel the smoothing alone moves / step
+    eta_warning: str = ""
 
     # --- UQ, non-fatal ---
     log_cov_diag_2D: Optional[np.ndarray] = None
@@ -816,7 +843,23 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     theta = (np.asarray(params.phantom, dtype=float) if params.phantom is not None
              else scale_to_optical_depth(_phantom(res), params.optical_depth, res))
     theta = theta.reshape(res, res)
-    p = resolve(p, theta)
+
+    # --- eta, chosen from the forward model before anything else is built --------------------
+    # Done FIRST so the data, the gate, the initialisation and the NLP all carry one value: eta
+    # is part of the model, not a solver option, so a mismatch between the run that generated the
+    # measurements and the model fitting them would be plant-model mismatch, not tuning.
+    if params.eta is None:
+        eta_used, eta_info = select_eta(theta, seq, p, res, simultaneous=params.simultaneous)
+        say("eta chosen from the forward run: %.4g  (max|dP| %.4g, ratio %.1f)\n"
+            % (eta_used, eta_info["dP_max"], eta_info["ratio"]))
+        if eta_info["warning"]:
+            say("    WARNING: %s\n" % eta_info["warning"])
+    else:
+        eta_used = float(params.eta)
+        eta_info = {"dP_max": float("nan"), "ratio": float("nan"),
+                    "rest_total": float("nan"), "warning": ""}
+        say("eta supplied by the caller: %.4g\n" % eta_used)
+    p = resolve(params.to_physics(eta_used), theta)
     _run = simulate_simultaneous if params.simultaneous else simulate
 
     # --- the drift gate, on THIS geometry -------------------------------------------------
@@ -917,6 +960,10 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
         obs_rms=float(np.sqrt(np.mean(np.square(resid)))),
         theta_rms=theta_rms, theta_pct_peak=100.0 * theta_rms / theta_scale,
         n_measurements=len(seq), n_rays=n_rays,
+        eta_used=eta_used, eta_auto=(params.eta is None),
+        eta_ratio=float(eta_info.get("ratio", float("nan"))),
+        eta_rest_total=float(eta_info.get("rest_total", float("nan"))),
+        eta_warning=str(eta_info.get("warning", "")),
         mass_true=float(f_true.sum()), mass_hat=float(f_hat.sum()),
         half_pct=float(shape_diagnostics(theta, f_true)[1]),
         dP_max=max((i.dP_max for i in infos_true), default=float("nan")))

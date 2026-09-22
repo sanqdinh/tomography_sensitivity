@@ -698,3 +698,113 @@ if __name__ == "__main__":
     _res = int(sys.argv[1]) if len(sys.argv) > 1 else 64
     _steps = int(sys.argv[2]) if len(sys.argv) > 2 else 12
     check_invariants(image_res=_res, n_steps=_steps)
+
+
+# --- choosing eta -----------------------------------------------------------------------------
+# eta is the softplus smoothing of eq:xd_rate_function. It is squeezed from both sides, and the
+# window is narrow enough that a single fixed default cannot serve the parameter range this
+# model offers -- max |dP| spans 0.15 to 80 across it, a factor of 500.
+#
+#   TOO LARGE  -- phi_eta flattens toward a straight line and the rate stops discriminating
+#                 direction, and the resting diffusion c_cp*eta*log2 grows with it. That is what
+#                 breaks the I0 = 0 identity, linearly in eta.
+#   TOO SMALL  -- the estimation NLP degenerates. Its lifted row is
+#                 exp(-u/eta) + exp(-v/eta) = 1, whose two derivatives differ by a factor
+#                 exp(-|dP|/eta); once that underflows the row is numerically rank-1 in a
+#                 two-variable row, thousands of times over, and IPOPT regularises the Hessian
+#                 by delta_w ~ 1e9 to fix the inertia. Measured at the old default eta = 1e-3:
+#                 97% of iterations regularised, lg(mu) never leaving -1.0, alpha_pr ~1e-3 and
+#                 inf_du climbing to 6.6e9. Raising eta one decade took that to 57%, full steps,
+#                 and inf_du down 37x.
+#
+# exp(-28) = 6.9e-13 keeps that derivative ratio representable with room to spare; exp(-3) = 0.05
+# still clearly favours one direction. Hence the window, and a target in the log-middle of it.
+ETA_RATIO_LO = 3.0          # below this, softplus barely discriminates direction
+ETA_RATIO_HI = 28.0         # above this, exp(-|dP|/eta) stops being representable usefully
+
+# The target was first set to 10 as the log-middle of the window, which is geometry rather than
+# evidence. Calibrated instead: grid 16, 8 measurements simultaneous, ma97, 120 iterations, no
+# continuation. "rest/st" is the fraction of a pixel the smoothing alone moves per step.
+#
+#   ratio       eta   rest/st   reg%   inf_du end   theta %peak   obs RMS
+#       3    0.2536     0.211    78%      4.13e+05      13.62     2.57e-02
+#       5    0.1521     0.127    75%      1.07e+03      14.14     2.71e-02
+#      10   0.07607     0.063    83%      2.40e+10      20.76     7.22e-02
+#      20   0.03803     0.032    76%      7.74e+01      18.44     4.73e-02
+#      28   0.02717     0.023    83%      3.13e+01      21.44     4.43e-02
+#      60   0.01268     0.011    84%      4.11e+05      27.06     9.16e-02
+#    1000  0.0007607     0.001   98%      1.83e+05      26.59     1.67e-01   <- the old fixed 1e-3
+#
+# Three things that table says, and one it does not.
+#  * The old fixed default is the worst row on every column. That much is unambiguous.
+#  * theta error improves as eta GROWS (ratio falls) -- but the data is generated at the same
+#    eta, so a large-eta run is recovering a MORE DIFFUSIVE model, not recovering the intended
+#    one better. At ratio 3 the smoothing alone moves 21% of a pixel per step, which is most of
+#    what the transport is supposed to be doing. Low ratio buys accuracy against a model you did
+#    not want.
+#  * inf_du is best at ratio 20-28 but is NOT monotone (2.4e10 at ratio 10, between 1e3 and 77).
+#    It is read at whatever point iteration 120 landed on, so single values are noise.
+# 20 is chosen as the compromise: solidly inside the window, theta error 18.4% against the old
+# default's 26.6%, reg 76% against 98%, and only 3.2% resting diffusion. It is ONE geometry at
+# ONE grid on a truncated run -- re-measure before quoting it as optimal.
+ETA_RATIO_TARGET = 20.0
+
+
+def select_eta(theta, seq, p: V6Params, image_res: int, *, simultaneous: bool = False,
+               target_ratio: float = ETA_RATIO_TARGET, probe_eta: float = 1e-3):
+    """Choose ``eta`` from a forward run.  Returns ``(eta, info)``.
+
+    ``eta = max|dP| / target_ratio``, where ``max|dP|`` is the largest potential difference across
+    any face over the run.  **This is not circular**, because ``max|dP|`` does not depend on
+    ``eta``: the potential is solved in step 4, which never reads it, and ``eta`` enters only at
+    steps 5-6.  Measured across four decades of ``eta``: the simultaneous schedule moves
+    ``max|dP|`` by exactly 1.000x (structural -- with one step, phi is solved before any transport
+    has happened), and the sequential schedule by 1.002x to 1.118x, the wobble appearing only at
+    ``eta = 1e-1``. Against a window spanning a factor of ~9 that is irrelevant, so one probe run
+    is enough and no iteration is needed.
+
+    The probe run is not wasted work: the reconstruction has to run the forward model anyway to
+    produce its data, and the forward model is solver-free.
+
+    ``info`` carries ``dP_max``, the achieved ``ratio``, the resting diffusion rate this ``eta``
+    implies, and ``warning`` -- a string, or "" when there is nothing to say.  **Read the
+    warning.**  At large ``c_omega`` the numerical window can be satisfied while the physics is
+    nonsense: ``max|dP| = 80`` asks for ``eta = 8``, at which softplus is nearly linear and the
+    resting diffusion swamps the transport. Satisfying the conditioning does not make the model
+    meaningful, and this function will not pretend otherwise.
+    """
+    theta = np.asarray(theta, dtype=float)
+    eta_in = float(p.eta)                       # the caller's value, kept for the degenerate path
+    p = resolve(replace(p, eta=float(probe_eta)), theta)
+    run = simulate_simultaneous if simultaneous else simulate
+    _f, infos = run(theta, seq, p, int(image_res))
+    dP = max((i.dP_max for i in infos), default=0.0)
+
+    info = {"dP_max": float(dP), "probe_eta": float(probe_eta), "warning": ""}
+    if not (dP > 0.0) or not np.isfinite(dP):
+        # phi is identically zero -- I0 = 0 (no fluence, so no void source) or an empty sequence.
+        # NOT c_cp = 0: that annihilates the flux but the potential is still solved, so dP is
+        # still positive there and the formula below applies (harmlessly, since every rate is
+        # zero anyway). Keep the CALLER's eta rather than inventing one from a division by zero.
+        info.update(eta=eta_in, ratio=float("nan"), rest_rate=0.0,
+                    warning="max|dP| is 0, so there is no transport to resolve (I0 = 0, or no "
+                            "measurements) and eta is unconstrained. Supplied value kept.")
+        return eta_in, info
+
+    eta = float(dP) / float(target_ratio)
+    rest = float(p.c_cp * eta * np.log(2.0))
+    # Fraction of a pixel's content the SMOOTHING ALONE moves per step, summed over its four
+    # faces. This, not eta itself, is the quantity that says whether the choice is physically
+    # tolerable: at the target ratio the resting rate is always log2/ratio ~ 7% of the peak
+    # advective rate, so eta on its own carries no information about whether the model still
+    # means anything -- only its product with c_cp and the face count does.
+    rest_total = 4.0 * rest
+    info.update(eta=eta, ratio=float(dP / eta), rest_rate=rest, rest_total=rest_total)
+    if rest_total > 0.2:
+        info["warning"] = (
+            "max|dP| = %.3g forces eta = %.3g to stay conditioned, and at that scale the "
+            "smoothing ALONE redistributes %.0f%% of a pixel per step (resting rate %.3g x 4 "
+            "faces) before any damage-driven transport. The NUMERICS are fine and the MODEL is "
+            "questionable -- lower c_omega or c_cp if the answer matters."
+            % (dP, eta, 100.0 * rest_total, rest))
+    return eta, info

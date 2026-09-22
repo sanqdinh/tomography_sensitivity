@@ -82,7 +82,8 @@ from degrade_v5 import V5Params, simulate as simulate_v5_seq, resolve as resolve
 from degrade_v6 import (V6Params, simulate as simulate_v6_seq,
                         simulate_simultaneous as simulate_v6_sim, resolve as resolve_v6,
                         shape_diagnostics as shape_diagnostics_v6,
-                        compaction_potential as _compaction_potential_v6)
+                        compaction_potential as _compaction_potential_v6,
+                        select_eta as _select_eta_v6)
 from degrade_v2 import accumulate_dose as _accumulate_dose
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
@@ -677,6 +678,9 @@ for _k, _v in {
     "v6_depth": 1.1, "v6_I0": 1.0,
     "v6_c_omega": 0.1, "v6_c_cp": 0.3, "v6_a": 0.05, "v6_b": 0.0,
     "v6_reach": 7.0, "v6_gamma": 100.0, "v6_fref": 0.002, "v6_eta": 1e-3,
+    # eta is CHOSEN from the forward run by default -- no fixed value works, because max|dP|
+    # spans 0.15 to 80 across this tab's own slider range. The slider is the override.
+    "v6_eta_auto": True,
     # Measurement schedule. SIMULTANEOUS is the default: the table's rows are one exposure
     # carrying every bundle, not one exposure each.
     "v6_mode": "Simultaneous",
@@ -2481,7 +2485,8 @@ _V6_MODES = ("Simultaneous", "Sequential")
 _V6_TV_WEIGHTS = (0.0, 1e-4, 2e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
                   0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 _V6_RESOLUTIONS = (32, 48, 64, 96)
-_V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1)
+from degrade_v6 import ETA_RATIO_TARGET as _ETA_TARGET_V6
+_V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.2, 0.5)
 _V6_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
 
 
@@ -2505,7 +2510,7 @@ def _cb_sync_live_sim_v6():
 @st.cache_data(show_spinner=False)
 def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
                  c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
-                 eta: float, mode: str = "Simultaneous"):
+                 eta: float, mode: str = "Simultaneous", auto_eta: bool = True):
     """``(theta, f, phi, summary)``.  Radii are about the FIXED initial centroid.
 
     Shape statistics come from ``degrade_v6.shape_diagnostics`` rather than being re-derived
@@ -2513,8 +2518,21 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     disagreeing with the module it is supposed to mirror.
     """
     theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
-    p = V6Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
-                 reach=float(reach), gamma=float(gamma), f_ref_frac=float(fref), eta=float(eta))
+    _mk = lambda e: V6Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b),
+                             c_cp=float(c_cp), reach=float(reach), gamma=float(gamma),
+                             f_ref_frac=float(fref), eta=float(e))
+    p = _mk(eta)
+    # Resolve eta HERE, through the same select_eta the reconstruction uses, so the picture, the
+    # metrics and the solve are one model. A tab whose live view ran one eta while Reconstruct
+    # ran another would be showing physics the solve is not doing.
+    eta_info = {"warning": ""}
+    if auto_eta and seq:
+        try:
+            eta_used, eta_info = _select_eta_v6(theta, seq, p, int(image_res),
+                                                simultaneous=(mode == _V6_MODES[0]))
+            p = _mk(eta_used)
+        except Exception:
+            pass
     # One step carrying every bundle, or one step per bundle. Both come from degrade_v6's
     # single step_bundles body, so the two schedules cannot drift apart.
     _run = simulate_v6_sim if mode == _V6_MODES[0] else simulate_v6_seq
@@ -2567,7 +2585,9 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
         "absorp": max((i.absorption_ratio for i in infos), default=0.0),
         "dP_max": dP_max,
         "rest_rate": max((i.rest_rate for i in infos), default=0.0),
-        "eta_ratio": (float(eta) / dP_max) if dP_max > 0 else float("nan"),
+        "eta_ratio": (float(p.eta) / dP_max) if dP_max > 0 else float("nan"),
+        "eta_used": float(p.eta), "eta_auto": bool(auto_eta),
+        "eta_warning": str(eta_info.get("warning", "")),
     }
     return theta, f, phi_panel, summary
 
@@ -2593,7 +2613,8 @@ def _render_2d_v6_tab():
     theta, f, phi, summary = _simulate_v6(
         seq, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
         float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
-        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]), str(s["v6_mode"]))
+        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]), str(s["v6_mode"]),
+        bool(s["v6_eta_auto"]))
     simultaneous = (str(s["v6_mode"]) == _V6_MODES[0])
 
     view = s["v6_view"]
@@ -2662,8 +2683,17 @@ def _render_2d_v6_tab():
             st.slider("b — quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
                       key="v6_b")
         with st.expander("Transport and potential numerics", expanded=False):
+            st.checkbox(
+                "Auto η from the forward run", key="v6_eta_auto",
+                help="Sets eta = max|dP| / %g from a forward run. No fixed value works: max|dP| "
+                     "spans 0.15 to 80 across this tab's sliders. Too small and the estimation "
+                     "NLP degenerates (at eta = 1e-3, 97%% of IPOPT iterations were "
+                     "Hessian-regularised and inf_du climbed to 6.6e9); too large and the "
+                     "smoothing does the transport's job. Not circular: max|dP| is set in step "
+                     "4, which never reads eta." % _ETA_TARGET_V6)
             st.select_slider(
-                "eta — softplus smoothing", options=_V6_ETAS, key="v6_eta",
+                "eta — softplus smoothing (manual)", options=_V6_ETAS, key="v6_eta",
+                disabled=bool(s["v6_eta_auto"]),
                 format_func=lambda v: "%.0e" % v,
                 help="THE RATE FUNCTION IS NOT ZERO AT ZERO. phi_eta(0) = eta·log2, so at "
                      "rest both directed rates are c_cp·eta·log2 and a motionless "
@@ -2698,6 +2728,8 @@ def _render_2d_v6_tab():
         # nothing to interpret. What is left below fires only when something actually needs the
         # user's attention. The numbers themselves are unchanged and still computed in
         # `_simulate_v6`'s `summary`; `python3 degrade_v6.py` prints the full set.
+        if summary["eta_warning"]:
+            st.warning(summary["eta_warning"])
         if summary["absorp"] > 1.0:
             st.warning(
                 "absorp/vs = %.2g > 1: the vacuum penalty is setting the scale INSIDE the "
@@ -2821,7 +2853,8 @@ def _render_2d_v6_tab():
             I0=float(s["v6_I0"]), c=float(s["v6_c_omega"]), a=float(s["v6_a"]),
             b=float(s["v6_b"]), c_cp=float(s["v6_c_cp"]), reach=float(s["v6_reach"]),
             gamma=float(s["v6_gamma"]), f_ref_frac=float(s["v6_fref"]),
-            eta=float(s["v6_eta"]), tv_weight=float(s["v6_tv_weight"]),
+            eta=(None if bool(s["v6_eta_auto"]) else float(s["v6_eta"])),
+            tv_weight=float(s["v6_tv_weight"]),
             noise_sigma=float(s["v6_noise"]), ipopt_max_iter=int(s["v6_maxiter"]))
         with st.spinner("Solving the v6 estimation NLP, then k_aug…"):
             try:
@@ -2859,9 +2892,10 @@ def _render_2d_v6_tab():
         st.caption(
             "forward gate **%.1e** · start residual **%.1e** (dynamically feasible) · "
             "continuation **%s** · Hessian regularised on **%d of %d** iterations · "
-            "max |dP| **%.3g**"
+            "max |dP| **%.3g** · eta **%.4g** (%s, max|dP|/eta **%.1f**)"
             % (out.forward_residual, out.init_residual, out.continuation_status,
-               out.regularised, out.n_iter_lines, out.dP_max))
+               out.regularised, out.n_iter_lines, out.dP_max,
+               out.eta_used, "auto" if out.eta_auto else "manual", out.eta_ratio))
         if out.uq_error:
             st.info(
                 "**k_aug did not return a covariance** (the reconstruction is kept): %s\n\n"
