@@ -235,28 +235,29 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
             return mm.Pi[q, k] * fm == mm.dw[q, k] * mm.ft[q, k]
         m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
 
-        # NO BOUNDS. sigma < 1 IS structural -- 1 - exp(-x) < 1 for any finite x -- and v5
-        # encodes that as an upper bound, which this module copied. That bound is redundant at
-        # every feasible point and actively harmful at the ones the solver visits.
+        # sigma < 1 is structural (1 - exp(-x) < 1 for any finite x), and the bound encodes it.
         #
-        # With f_ref_frac = 0.002 the bulk has ft/f_ref ~ 170-500, so exp(-ft/f_ref) UNDERFLOWS
-        # to exactly 0 and sigma evaluates to exactly 1.0 -- its upper bound. The row c_sig is
-        # then numerically "sigma = 1" (its only other entry, d/d(ft), is ~1e-74) and the bound
-        # says the same thing. Two constraints, one gradient: LICQ fails, the multiplier pair is
-        # non-unique, and the duals are free to wander while the primal sits still. That is
-        # exactly the reported symptom -- inf_pr ~1e-5 with inf_du swinging 1e3..1e7.
+        # I REMOVED THIS BOUND AND WAS WRONG. The reasoning looked sound: at f_ref_frac = 0.002
+        # the bulk has ft/f_ref ~ 170-500, so exp(-ft/f_ref) underflows to exactly 0, sigma
+        # evaluates to exactly 1.0 = its bound, and the row c_sig is then numerically "sigma = 1"
+        # (its d/d(ft) entry being ~1e-74) saying the same thing the bound says -- an exact LICQ
+        # failure at 256 = npix variables, which is a textbook cause of the wandering duals that
+        # prompted the investigation. A 60-iteration comparison agreed: removing it took inf_du's
+        # median from 1.5e+02 to 3.98e-01 and halved the theta error.
         #
-        # Measured at grid 16 / K=5 simultaneous, 60 iterations, ma97, changing NOTHING else:
-        #                    sig at ub   reg%   inf_du med   inf_du max   theta err
-        #   bounds=(None,1)        256    77%     1.50e+02     1.66e+07      24.53%
-        #   no bounds                0    44%     3.98e-01     1.72e+02      12.68%
-        # The peak dual infeasibility falls by ~1e5 and the estimate halves its error.
+        # AT 900 ITERATIONS THE VERDICT REVERSES COMPLETELY:
+        #     sig ub        status    reg%   inf_du end   theta err
+        #     1.0          optimal     83%     1.73e-13       3.91%
+        #     none    maxIterations    50%     9.50e+04      32.86%
+        # With the bound gone sigma runs to 1.0043, so gamma*(1-sigma) = -0.43 against a
+        # varsigma of 0.0204: the potential operator's diagonal goes negative by 21x the
+        # screening term and stops being an M-matrix. The bound is not redundant -- it is what
+        # keeps eq:xd_potential_solve well posed at infeasible iterates.
         #
-        # Nothing downstream needs the bound: sigma enters only c_phi, linearly, and an iterate
-        # with sigma marginally above 1 is no worse behaved than one marginally below it.
-        # degrade_v5_uq carries the same bound and very likely the same pathology; not changed
-        # here because it is a separate model and this was not measured on it.
-        m.sig = pyo.Var(m.PIX, m.TM, initialize=0.0)
+        # The lesson, which is the same one CLAUDE.md already records about clean residuals: a
+        # 60-iteration prefix of a 900-iteration solve is not evidence about the solve. The
+        # degeneracy is real and measurable, and it is simply not what was hurting.
+        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
 
         def _sigc(mm, q, k):
             if f_ref is None:
