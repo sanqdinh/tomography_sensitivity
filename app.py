@@ -31,6 +31,7 @@ import html as _html
 import io
 import os
 import shutil
+import threading
 import time
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -165,6 +166,52 @@ _LOG_IFRAME = (
     'color:#d6d6d6;padding:8px;border-radius:6px;">{body}</div>'
     "<script>var b=document.getElementById('lb');b.scrollTop=b.scrollHeight;</script>"
 )
+
+def _current_script_ctx():
+    """This session's ScriptRunContext, or None.  Must be called from the script thread.
+
+    Deliberately NOT cached in a module global: app.py is the Streamlit entry script, so its
+    module body re-executes on every rerun of every session, and a shared global would hold
+    whichever session ran last. Handing that context to a worker thread serving a DIFFERENT
+    session would write one user's solver log into another user's page.
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx()
+    except Exception:
+        return None
+
+
+def _attach_script_ctx(ctx) -> bool:
+    """Give the CURRENT thread this session's Streamlit context, if it has none.
+
+    Pyomo streams the solver log from its own reader thread ("Thread-N (_mergedReader)"), and a
+    thread without a ScriptRunContext cannot touch ``st``: every call logs
+    "missing ScriptRunContext!" and then raises NoSessionContext, which Pyomo reports as
+    "Error writing to output stream ... The following was left in the output buffer:" followed by
+    the IPOPT line it just dropped. So the terminal fills with noise AND the iteration lines
+    never reach the UI -- the log box is not merely ugly, it is incomplete.
+
+    Attaching the context is the documented way to make a background thread Streamlit-aware, and
+    it is safe in this particular shape: the main thread is BLOCKED inside ``solve()`` for the
+    whole life of the reader thread, so there is no concurrent script run to race against.
+
+    Never raises. On a Streamlit that has moved these symbols the caller just buffers instead,
+    and ``degrade_v2_uq._solve_streaming`` keeps the complete log either way.
+    """
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    except Exception:
+        return False
+    try:
+        if get_script_run_ctx() is not None:
+            return True
+        if ctx is None:
+            return False
+        add_script_run_ctx(threading.current_thread(), ctx)
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
 
 
 def _empty_beam_table() -> pd.DataFrame:
@@ -2715,6 +2762,8 @@ def _render_2d_v6_tab():
         log_box = st.empty()
         log_lines: list[str] = []
         _last = [0.0]
+        # Captured HERE, on the script thread, for THIS session -- see _current_script_ctx.
+        _ctx = _current_script_ctx()
 
         def _render_v6_log() -> None:
             body = _html.escape("".join(log_lines)[-8000:])
@@ -2723,11 +2772,18 @@ def _render_2d_v6_tab():
                 components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
 
         def _v6_log(chunk: str) -> None:
+            # Runs on Pyomo's reader thread. Buffer FIRST, so the log stays complete even when
+            # the render cannot happen, then render at most every 0.2 s.
             log_lines.append(chunk)
             now = time.time()
-            if now - _last[0] >= 0.2:
-                _last[0] = now
-                _render_v6_log()
+            if now - _last[0] < 0.2:
+                return
+            _last[0] = now
+            if _attach_script_ctx(_ctx):
+                try:
+                    _render_v6_log()
+                except Exception:
+                    pass        # a dropped frame is fine; the buffer still holds every line
 
         params_v6 = V6UQParams(
             image_res=res, optical_depth=float(s["v6_depth"]), beam_steps=seq_all,

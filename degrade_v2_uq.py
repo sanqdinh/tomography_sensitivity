@@ -789,16 +789,42 @@ def _solve_streaming(solver, model, tee, log_callback):
 
     buf = []
 
+    # A FAILING log_callback MUST NOT BREAK THE SOLVE OR EAT THE LOG.
+    #
+    # Pyomo forwards the solver's stdout on its own reader thread ("Thread-N (_mergedReader)").
+    # If the callback raises there -- which a Streamlit callback does, with NoSessionContext,
+    # because a background thread has no ScriptRunContext -- the exception propagates out of
+    # write(), and Pyomo's TeeStream responds by printing
+    #     Error writing to output stream <_W @ 0x...>: NoSessionContext:
+    #     Is this a writeable TextIOBase object?
+    #     The following was left in the output buffer: '  21  4.7560765e-02 ...'
+    # per chunk. So the terminal fills with noise AND the IPOPT iteration lines are DROPPED
+    # rather than displayed. Swallowing the callback's exception fixes both: `buf` is appended
+    # before the callback is tried, so the log is complete regardless.
+    #
+    # Latched off after the first failure: a callback that raises once raises 3000 times, and
+    # the exception handling is not free.
+    broken = [False]
+
     class _W:
         def write(self, chunk):
             if chunk:
                 buf.append(chunk)
-                if log_callback is not None:
-                    log_callback(chunk)
+                if log_callback is not None and not broken[0]:
+                    try:
+                        log_callback(chunk)
+                    except Exception:
+                        broken[0] = True     # keep buffering; stop forwarding
             return len(chunk)
 
         def flush(self):
             pass
+
+        def writable(self):
+            return True
+
+        def isatty(self):
+            return False
 
     try:
         with capture_output(_W()):

@@ -796,7 +796,17 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     geometry and **refuses to reconstruct** if it has drifted: a reconstruction against a model
     that no longer matches the simulator would read as a physics result.
     """
-    say = (lambda t: log_callback(t)) if log_callback else (lambda t: None)
+    def say(t):
+        # A broken log sink must cost you the log, never the reconstruction. The Streamlit
+        # callback raises NoSessionContext when it runs without a ScriptRunContext, and before
+        # this guard that exception propagated out of run_v6_reconstruction and killed the solve
+        # before it started.
+        if log_callback is None:
+            return
+        try:
+            log_callback(t)
+        except Exception:
+            pass
     res = int(params.image_res)
     seq = tuple(tuple(x) for x in params.beam_steps)
     if not seq:
@@ -871,10 +881,18 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     if params.obj_scaling > 0.0:
         opts["obj_scaling_factor"] = float(params.obj_scaling)
     buf = []
+
     def _tee(t):
+        # Must NOT raise. _solve_streaming latches its forwarding off after one exception, so a
+        # caller's callback blowing up here would stop `buf` filling too -- and `buf` is what
+        # _reg_fraction counts, so the Hessian-regularisation figure would silently be computed
+        # from a truncated log rather than reported as unavailable.
         buf.append(t)
         if log_callback:
-            log_callback(t)
+            try:
+                log_callback(t)
+            except Exception:
+                pass
     t0 = time.perf_counter()
     r, ls = solve_with_fallback(m, linear_solver=params.linear_solver,
                                 max_iter=params.ipopt_max_iter, log_callback=_tee,
