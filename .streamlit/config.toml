@@ -11,12 +11,3 @@ maxUploadSize = 5
 
 [browser]
 gatherUsageStats = false
-
-[global]
-# The solver-log box re-renders every 0.2 s while IPOPT runs, and each render is one
-# components.html call. On Streamlit versions that have deprecated it in favour of st.iframe
-# that is one deprecation warning per render, which buries the actual IPOPT log in the terminal
-# at a rate of five per second. The call itself is still correct and still required: the log box
-# needs its trailing <script> to auto-scroll, and st.html strips scripts. Silence the notice
-# rather than break the box; revisit when the pinned Streamlit actually gains st.iframe.
-suppressDeprecationWarnings = true

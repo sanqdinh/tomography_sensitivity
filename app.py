@@ -27,7 +27,6 @@ backend: it imports the vendored geometry primitives and the shared numpy helper
 """
 
 import base64
-import html as _html
 import io
 import os
 import shutil
@@ -158,15 +157,31 @@ def _live_background_uri(img, vmin, vmax) -> str:
     mpimg.imsave(buf, np.asarray(img), cmap="gray", vmin=vmin, vmax=vmax, format="png")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-# Solver-log box: a scrollable monospace div force-scrolled to the bottom on every update. Rendered
-# via components.html (sandboxed iframe) so the trailing <script> actually runs — st.html strips
-# scripts, so it cannot auto-follow. ``{body}`` is the HTML-escaped rolling log tail.
-_LOG_IFRAME = (
-    '<div id="lb" style="height:300px;overflow-y:auto;white-space:pre-wrap;'
-    'font-family:monospace;font-size:12px;line-height:1.3;background:#0e1117;'
-    'color:#d6d6d6;padding:8px;border-radius:6px;">{body}</div>'
-    "<script>var b=document.getElementById('lb');b.scrollTop=b.scrollHeight;</script>"
-)
+# Solver-log box. A fixed-height st.container plus st.code -- deliberately NOT components.html.
+#
+# It used to be an iframe carrying a trailing <script> that force-scrolled to the bottom, because
+# st.html strips scripts and so cannot auto-follow. That worked, but the box re-renders every
+# 0.2 s for the whole solve, and on Streamlit versions that have deprecated components.v1.html
+# in favour of st.iframe each render logged a deprecation notice -- five a second, interleaved
+# line-for-line with the IPOPT output in the terminal, which is exactly the output it was burying.
+# `global.suppressDeprecationWarnings` does NOT gate that particular notice (tried; it still
+# printed), and filtering it out of `logging` is unreliable because Streamlit attaches its
+# handlers after import and a logger-level filter does not catch records from child loggers.
+#
+# So: stop making the deprecated call. st.container(height=...) is a scrollable box with no
+# script and no iframe, on every version from 1.31. Auto-follow is then unnecessary rather than
+# unavailable -- showing the TAIL means the newest lines are already the visible ones.
+_LOG_TAIL_LINES = 400
+_LOG_BOX_HEIGHT = 300
+
+
+def _render_log_box(slot, text: str) -> None:
+    """Draw the rolling solver-log tail into ``slot`` (an ``st.empty()`` placeholder)."""
+    tail = "".join(text).splitlines()[-_LOG_TAIL_LINES:]
+    slot.empty()                     # drop the previous box so they do not stack
+    with slot.container():
+        with st.container(height=_LOG_BOX_HEIGHT):
+            st.code("\n".join(tail), language=None)
 
 def _term_echo(text: str) -> None:
     """Echo the solver log to the terminal Streamlit was started from.
@@ -1697,11 +1712,7 @@ def _render_3d_tab():
                 _last = [0.0]
 
                 def _render_log() -> None:
-                    body = _html.escape("".join(log_lines)[-8000:])
-                    log_box.empty()
-                    with log_box.container():
-                        components.html(_LOG_IFRAME.format(body=body), height=312,
-                                        scrolling=False)
+                    _render_log_box(log_box, "".join(log_lines))
 
                 def _log_cb(chunk: str) -> None:
                     # Append ONLY -- never render from in here. This callback runs inside the
@@ -2369,10 +2380,7 @@ def _render_2d_v5_tab():
         _last = [0.0]
 
         def _render_v5_log() -> None:
-            body = _html.escape("".join(log_lines)[-8000:])
-            log_box.empty()
-            with log_box.container():
-                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+            _render_log_box(log_box, "".join(log_lines))
 
         def _v5_log(chunk: str) -> None:
             log_lines.append(chunk)
@@ -2789,10 +2797,7 @@ def _render_2d_v6_tab():
         _ctx = _current_script_ctx()
 
         def _render_v6_log() -> None:
-            body = _html.escape("".join(log_lines)[-8000:])
-            log_box.empty()
-            with log_box.container():
-                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+            _render_log_box(log_box, "".join(log_lines))
 
         def _v6_log(chunk: str) -> None:
             # Runs on Pyomo's reader thread. Terminal first and unthrottled -- that is the raw
@@ -3326,10 +3331,7 @@ def _render_2d_v2_tab():
         _last = [0.0]
 
         def _render_v2_log() -> None:
-            body = _html.escape("".join(log_lines)[-8000:])
-            log_box.empty()
-            with log_box.container():
-                components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+            _render_log_box(log_box, "".join(log_lines))
 
         def _v2_log(chunk: str) -> None:
             log_lines.append(chunk)
@@ -3593,17 +3595,14 @@ with tab_2d:
                     "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
                 )
             st.subheader("Solver log (inverse solve)")
-            # Fixed-height box that auto-follows the newest line (see _LOG_IFRAME).
+            # Fixed-height scrolling box showing the newest lines (see _render_log_box).
             log_box = st.empty()
             log_lines: list[str] = []
             _last_render = [0.0]
 
             def _render_log() -> None:
                 # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
-                body = _html.escape("".join(log_lines)[-8000:])
-                log_box.empty()  # drop the prior iframe so they don't stack
-                with log_box.container():
-                    components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
+                _render_log_box(log_box, "".join(log_lines))
 
             def log_callback(chunk: str) -> None:
                 log_lines.append(chunk)
