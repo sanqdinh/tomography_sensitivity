@@ -235,29 +235,40 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
             return mm.Pi[q, k] * fm == mm.dw[q, k] * mm.ft[q, k]
         m.c_Pi = pyo.Constraint(m.PIX, m.TM, rule=_pic)
 
-        # sigma < 1 is structural (1 - exp(-x) < 1 for any finite x), and the bound encodes it.
+        # sigma < 1 is structural (1 - exp(-x) < 1 for any finite x). The bound is placed just
+        # ABOVE 1 rather than AT it, and both halves of that matter.
         #
-        # I REMOVED THIS BOUND AND WAS WRONG. The reasoning looked sound: at f_ref_frac = 0.002
-        # the bulk has ft/f_ref ~ 170-500, so exp(-ft/f_ref) underflows to exactly 0, sigma
-        # evaluates to exactly 1.0 = its bound, and the row c_sig is then numerically "sigma = 1"
-        # (its d/d(ft) entry being ~1e-74) saying the same thing the bound says -- an exact LICQ
-        # failure at 256 = npix variables, which is a textbook cause of the wandering duals that
-        # prompted the investigation. A 60-iteration comparison agreed: removing it took inf_du's
-        # median from 1.5e+02 to 3.98e-01 and halved the theta error.
+        # AT 1.0 it is degenerate. With f_ref_frac = 0.002 the bulk has ft/f_ref ~ 170-500, so
+        # exp(-ft/f_ref) underflows to exactly 0 and sigma evaluates to exactly 1.0 -- its bound.
+        # The row c_sig is then numerically "sigma = 1" (its d/d(ft) entry is ~1e-74) saying what
+        # the bound says: an exact LICQ failure at npix variables, so that multiplier pair is
+        # non-unique and the duals wander while the primal sits still. Invisible to the usual
+        # tests -- structural rank is full because 1e-74 is nonzero, and the row is not a
+        # single-variable row because it structurally has two entries.
         #
-        # AT 900 ITERATIONS THE VERDICT REVERSES COMPLETELY:
-        #     sig ub        status    reg%   inf_du end   theta err
-        #     1.0          optimal     83%     1.73e-13       3.91%
-        #     none    maxIterations    50%     9.50e+04      32.86%
-        # With the bound gone sigma runs to 1.0043, so gamma*(1-sigma) = -0.43 against a
-        # varsigma of 0.0204: the potential operator's diagonal goes negative by 21x the
-        # screening term and stops being an M-matrix. The bound is not redundant -- it is what
-        # keeps eq:xd_potential_solve well posed at infeasible iterates.
+        # REMOVED ENTIRELY it is far worse, which is the other half. sigma then runs to 1.0043,
+        # gamma*(1-sigma) = -0.43 against a varsigma of 0.0204, and the potential operator's
+        # diagonal goes negative by 21x the screening term -- eq:xd_potential_solve stops being
+        # an M-matrix at exactly the infeasible iterates the bound exists to police.
         #
-        # The lesson, which is the same one CLAUDE.md already records about clean residuals: a
-        # 60-iteration prefix of a 900-iteration solve is not evidence about the solve. The
-        # degeneracy is real and measurable, and it is simply not what was hurting.
-        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, 1.0), initialize=0.0)
+        # So: above the attainable value, inside the operator's tolerance. sigma < 1 +
+        # varsigma/gamma is what keeps varsigma + gamma(1-sigma) positive; a tenth of that keeps
+        # 90% of the screening term while putting 1.0 strictly interior. Measured at 900
+        # iterations, ma97, auto-eta, three configurations:
+        #
+        #   grid  K  sched   sig ub        status   reg%   inf_du end   theta err   iters
+        #     16  5  sim     1.0          optimal    80%     2.51e-14       7.54%     653
+        #     16  5  sim     1+2.0e-05    optimal    62%     2.62e-13       7.37%     520
+        #     32  5  sim     1.0        maxIterat    95%     3.12e+02      23.13%     901
+        #     32  5  sim     1+2.0e-05  maxIterat    78%     1.63e-04      11.08%     901
+        #     16  8  seq     1.0        maxIterat    75%     1.64e-05       8.82%     901
+        #     16  8  seq     1+2.0e-05    optimal    55%     2.66e-14       3.71%     642
+        #
+        # Better on every column of every row, and the last pair flips maxIterations to optimal.
+        # The earlier attempt at this shipped "remove the bound" off a 60-ITERATION comparison,
+        # where the ordering is the reverse of the truth; hence three configurations at 900 here.
+        sig_ub = (1.0 + 0.1 * vsig / gam) if gam > 0 else None
+        m.sig = pyo.Var(m.PIX, m.TM, bounds=(None, sig_ub), initialize=0.0)
 
         def _sigc(mm, q, k):
             if f_ref is None:
