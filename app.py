@@ -76,6 +76,11 @@ from degrade_v4 import (
     support_radius as support_radius_v4,
 )
 from degrade_v5 import V5Params, simulate as simulate_v5_seq, resolve as resolve_v5
+# v6 is forward-only: nothing from a *_uq module, so this tab never imports pyomo.
+from degrade_v6 import (V6Params, simulate as simulate_v6_seq, resolve as resolve_v6,
+                        shape_diagnostics as shape_diagnostics_v6,
+                        compaction_potential as _compaction_potential_v6)
+from degrade_v2 import accumulate_dose as _accumulate_dose
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -571,6 +576,22 @@ for _k, _v in {
     # tab's scale; maxiter is what keeps a browser run bounded, since the
     # monolithic v5 NLP is not reliably convergent.
     "v5_tv_weight": 0.001, "v5_maxiter": 300,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+# 2D implicit-transport shrinkage (v6). v5 with steps 5 and 6 changed: a softplus directed
+# rate and one global sparse solve, so positivity and conservation are unconditional and the
+# compaction number is gone. Forward only -- no tv_weight, no maxiter, no results_v6.
+if "beam_table_v6" not in st.session_state:
+    st.session_state["beam_table_v6"] = _empty_beam_table()
+for _k, _v in {
+    "v6_angle": 45.0, "v6_offset": 0.0, "v6_nbeams": 0, "v6_res": 32,
+    "v6_view": "Attenuation f", "v6_showbeams": True,
+    "v6_depth": 1.1, "v6_I0": 1.0,
+    "v6_c_omega": 0.1, "v6_c_cp": 0.3, "v6_a": 0.05, "v6_b": 0.0,
+    "v6_reach": 7.0, "v6_gamma": 100.0, "v6_fref": 0.002, "v6_eta": 1e-3,
+    "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
+    "v6_view_k": 0,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -2352,6 +2373,257 @@ def _render_2d_v5_tab():
 
 
 
+# --- 2D implicit-transport shrinkage (v6) tab: forward simulation only --------------------
+# v5 with steps 5 and 6 changed. The explicit upwind flux and its compaction number are gone;
+# eq:xd_implicit_transport is one sparse solve whose matrix is an M-matrix with unit column
+# sums, so positivity and exact conservation hold with no step-size condition. What replaces
+# C_k on the readout is the pair that CAN go wrong here: eta against the max |dP| it has to
+# discriminate, and gamma(1-sigma)/varsigma inside the bulk.
+_V6_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
+_V6_RESOLUTIONS = (32, 48, 64, 96)
+_V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1)
+_V6_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
+
+
+def _cb_v6_step():
+    s = st.session_state
+    s["beam_table_v6"] = pd.concat(
+        [s["beam_table_v6"], pd.DataFrame([{
+            "angle_deg": float(s["v6_angle"]), "offset": float(s["v6_offset"]),
+            "n_beams": int(s["v6_nbeams"])}])], ignore_index=True)
+    s["v6_view_k"] = len(s["beam_table_v6"])
+
+
+def _cb_v6_reset():
+    st.session_state["beam_table_v6"] = _empty_beam_table()
+
+
+def _cb_sync_live_sim_v6():
+    _sync_live_sim("v6", "live_sim_v6")
+
+
+@st.cache_data(show_spinner=False)
+def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
+                 c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
+                 eta: float):
+    """``(theta, f, phi, summary)``.  Radii are about the FIXED initial centroid.
+
+    Shape statistics come from ``degrade_v6.shape_diagnostics`` rather than being re-derived
+    here: ``_simulate_v5`` keeps a hand copy of that block, which is one edit away from
+    disagreeing with the module it is supposed to mirror.
+    """
+    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
+    p = V6Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
+                 reach=float(reach), gamma=float(gamma), f_ref_frac=float(fref), eta=float(eta))
+    try:
+        f, infos = simulate_v6_seq(theta, seq, p, int(image_res))
+        err = None
+    except Exception as exc:                 # the potential's guards raise rather than return junk
+        f, infos, err = theta.copy(), [], str(exc).split(":")[0]
+
+    sup_pct, half_pct, flips = shape_diagnostics_v6(theta, f)
+    nr, nc = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m0 = float(theta.sum())
+    cx0, cy0 = ((xx * theta).sum() / m0, (yy * theta).sum() / m0) if m0 > 0 else (0.0, 0.0)
+    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2)
+    d = f - theta
+
+    phi_panel = np.zeros_like(theta)
+    if infos and seq:
+        pr = resolve_v6(p, theta)
+        ang, off, nb = seq[-1]
+        cid, I_p = _accumulate_dose(f, _bundle_r_values(float(off), int(nb), int(image_res)),
+                                    float(np.deg2rad(float(ang))), pr.I0, pr.c)
+        try:
+            phi_panel, _Pi, _sg = _compaction_potential_v6(f * pr.decay_factor(I_p),
+                                                           1.0 - np.exp(-cid), pr)
+        except Exception:
+            pass
+
+    dP_max = max((i.dP_max for i in infos), default=0.0)
+    summary = {
+        "err": err, "mass0": m0, "mass1": float(f.sum()),
+        "sup_pct": sup_pct, "half_pct": half_pct, "flips": flips,
+        "inner": float(d[rad < 0.25 * nr].sum()), "outer": float(d[rad > 0.30 * nr].sum()),
+        "f_min": min((i.state_min for i in infos), default=float(f.min())),
+        "phi_cr": (infos[-1].phi_core_rim if infos else float("nan")),
+        "dw_max": max((i.dw_max for i in infos), default=0.0),
+        # What replaces C_k. colsum is conservation, mass_resid is prop:xd_mass measured per
+        # step, absorp is the condition subsec:system does not state, eta_ratio is whether the
+        # softplus is still resolving direction.
+        "colsum": max((i.colsum_err for i in infos), default=0.0),
+        "mass_resid": max((i.mass_residual for i in infos), default=0.0),
+        "absorp": max((i.absorption_ratio for i in infos), default=0.0),
+        "dP_max": dP_max,
+        "rest_rate": max((i.rest_rate for i in infos), default=0.0),
+        "eta_ratio": (float(eta) / dP_max) if dP_max > 0 else float("nan"),
+    }
+    return theta, f, phi_panel, summary
+
+
+def _render_2d_v6_tab():
+    """Implicit-transport shrinkage: unconditionally positive and conservative. Forward only."""
+    s = st.session_state
+    st.caption(
+        "**Implicit-transport shrinkage model (v6).** v5 with steps 5 and 6 changed and nothing "
+        "else moved. The flux is now a nonnegative **softplus rate** applied to the *unknown* "
+        "post-transport field, so `eq:xd_mass_transport` becomes one global sparse solve whose "
+        "matrix is an M-matrix with **unit column sums**. Positivity and exact conservation "
+        "therefore hold with no step-size condition — which is why v5's compaction number "
+        "`C_k` is gone rather than merely satisfied. Steps 1–4 are v5's, imported rather "
+        "than copied. Forward simulation only; run `python3 degrade_v6.py` for the invariants."
+    )
+    left, mid, right = st.columns([3, 2, 2])
+    res = int(s["v6_res"])
+    seq_all = _table_to_seq(s["beam_table_v6"])
+    n_all = len(seq_all)
+    seq = seq_all[:max(0, min(int(s["v6_view_k"]), n_all))]
+    n_meas = len(seq)
+    theta, f, phi, summary = _simulate_v6(
+        seq, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
+        float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
+        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]))
+
+    view = s["v6_view"]
+    if view == _V6_VIEWS[1]:
+        panel, vlo, vhi = phi, 0.0, max(float(phi.max()), 1e-12)
+    elif view == _V6_VIEWS[2]:
+        panel = f - theta
+        span = max(float(np.abs(panel).max()), 1e-12); vlo, vhi = -span, span
+    else:
+        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
+
+    with left:
+        _nav_block("v6_view_k", n_all)
+        _live_sim(
+            image_uri=_live_background_uri(panel, vlo, vhi), image_res=res, k=n_meas,
+            angle=float(s["v6_angle"]), offset=float(s["v6_offset"]),
+            nbeams=int(s["v6_nbeams"]),
+            committed=(list(seq[-1]) if n_meas else None),
+            beams_visible=bool(s["v6_showbeams"]),
+            angle_range=[0, 360, 1], offset_range=[-float(res)/2, float(res)/2, 0.5],
+            nbeams_range=[0, res, 1],
+            title="%s   ·   %d measurement%s   ·   %d×%d"
+                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
+            hint='<b style="color:#ff2b2b">Red</b> = next-measurement preview; '
+                 '<b style="color:#1f77ff">blue</b> = last measurement taken.',
+            legend="%.3g" % vhi,
+            default={"angle": float(s["v6_angle"]), "offset": float(s["v6_offset"]),
+                     "nbeams": int(s["v6_nbeams"])},
+            key="live_sim_v6", on_change=_cb_sync_live_sim_v6)
+        st.radio("View", _V6_VIEWS, key="v6_view", horizontal=True)
+
+    with mid:
+        act = st.columns(2)
+        act[0].button("➕ Take measurement", on_click=_cb_v6_step,
+                      use_container_width=True, key="v6_take")
+        act[1].button("Reset", on_click=_cb_v6_reset, use_container_width=True, key="v6_clear")
+        st.checkbox("Show beams", key="v6_showbeams")
+        with st.expander("Compaction reach and amplitude", expanded=True):
+            st.slider("l — compaction reach (px)", 0.5, 32.0, step=0.5, key="v6_reach",
+                      help="A PHYSICAL length, so unlike c_cp it transfers across grids. As "
+                           "l → 0 the potential approaches the pointwise driver "
+                           "(l/Δ)²·Pi and you are back in v4's regime; l of order "
+                           "the specimen radius (~15 px here) gives whole-body contraction. "
+                           "Below about R/2 the potential is still rim-peaked.")
+            st.slider("c_cp — compaction amplitude", 0.0, 3.0, step=0.05, key="v6_c_cp",
+                      help="0 annihilates every flux and the dynamics collapse exactly to the "
+                           "v1 decay. There is no upper positivity bound any more — that "
+                           "was C_k, and the implicit form does not need it.")
+        with st.expander("Beam, conversion and decay", expanded=True):
+            st.slider("I0 — incident intensity", 0.0, 5.0, step=0.1, key="v6_I0")
+            st.slider("c_omega — conversion", 0.0, 3.0, step=0.05, key="v6_c_omega")
+            st.slider("a — decay", 0.0, 0.5, step=0.005, format="%.3f", key="v6_a",
+                      help="a = b = 0 conserves mass EXACTLY, whatever c_cp does. That is the "
+                           "clean shrinkage test: any change in support is then transport alone.")
+            st.slider("b — quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
+                      key="v6_b")
+        with st.expander("Transport and potential numerics", expanded=False):
+            st.select_slider(
+                "eta — softplus smoothing", options=_V6_ETAS, key="v6_eta",
+                format_func=lambda v: "%.0e" % v,
+                help="THE RATE FUNCTION IS NOT ZERO AT ZERO. phi_eta(0) = eta·log2, so at "
+                     "rest both directed rates are c_cp·eta·log2 and a motionless "
+                     "field still diffuses. Set I0 = 0 and raise eta to watch it: the spec says "
+                     "that case must be an exact identity, and it is not. Keep eta well under "
+                     "max |dP| below, or the rate stops discriminating direction.")
+            st.select_slider("f_ref / f_max", options=_V6_FREFS, key="v6_fref",
+                             help="Density at which material starts conducting. The stated rule "
+                                  "— at most a fifth of the smallest interior value — "
+                                  "is NOT sufficient: what must be small is "
+                                  "gamma·exp(-f_int/f_ref)/varsigma, shown as absorp/vs "
+                                  "below. At 0.2 that ratio is ~33 and the specimen does not "
+                                  "move at all, silently.")
+            st.select_slider("gamma — vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
+                             key="v6_gamma", help="Sets how fast the potential decays into "
+                                                  "vacuum. Needs gamma >> 1, but raising it also "
+                                                  "raises absorp/vs.")
+            st.select_slider("Grid", options=_V6_RESOLUTIONS, key="v6_res")
+
+    with right:
+        _preset_block("v6", "beam_table_v6", "v6_view_k")
+        st.markdown("**Measurement sequence**")
+        st.dataframe(s["beam_table_v6"], use_container_width=True, height=180)
+        if summary["err"]:
+            st.error("Potential solve refused: %s. The guards raise rather than return a wrong "
+                     "answer — raise the reach or lower f_ref." % summary["err"])
+        # Half-mass first: subsec:assumptions asks for shrinkage to be reported as a
+        # fixed-centroid half-mass radius, because loss contaminates moments and coarse grids
+        # quantize the support radius. The 99% radius is kept as secondary for that reason.
+        m = st.columns(2)
+        m[0].metric("Half-mass radius (50%)", "%+.3f%%" % summary["half_pct"],
+                    help="**The reported statistic**, per subsec:assumptions: fixed-centroid, so "
+                         "translation does not read as contraction. Negative is contraction.")
+        m[1].metric("Support radius (99%)", "%+.3f%%" % summary["sup_pct"],
+                    help="Secondary: a coarse grid quantizes this one, so it can jump a whole "
+                         "band on a body that barely moved.")
+        m2 = st.columns(2)
+        m2[0].metric("Radial sign changes", "%d" % summary["flips"],
+                     help="ONE sign change is coherent condensation: mass leaves the outside and "
+                          "arrives inside. Several means mass is shuffling between neighbours, "
+                          "which is what a pointwise driver does.")
+        m2[1].metric("Total attenuation", "%.4g" % summary["mass1"],
+                     delta="%+.3g" % (summary["mass1"] - summary["mass0"]))
+        st.caption(
+            "net mass inside **%+.3g** · outside **%+.3g** · min f **%.2e** · "
+            "|colsum−1| **%.1e** · transport residual **%.1e** · "
+            "phi centre/rim **%.2f**"
+            % (summary["inner"], summary["outer"], summary["f_min"], summary["colsum"],
+               summary["mass_resid"], summary["phi_cr"]))
+        st.caption(
+            "max |dP| **%.3g** · eta/max|dP| **%.1e** · resting rate "
+            "c_cp·eta·log2 **%.2e** · absorp/vs **%.2e**"
+            % (summary["dP_max"], summary["eta_ratio"], summary["rest_rate"],
+               summary["absorp"]))
+        if summary["absorp"] > 1.0:
+            st.warning(
+                "absorp/vs = %.2g > 1: the vacuum penalty is setting the scale INSIDE the "
+                "specimen, so the potential is suppressed by about that factor and the body "
+                "will barely move — with nothing raised and the M-matrix bound still "
+                "satisfied. Lower f_ref, lower gamma, or raise the reach."
+                % summary["absorp"])
+        if summary["eta_ratio"] == summary["eta_ratio"] and summary["eta_ratio"] > 0.1:
+            st.warning(
+                "eta is %.0f%% of max |dP|: the softplus is no longer discriminating direction, "
+                "and the transport is mostly the resting diffusion. Lower eta."
+                % (100.0 * summary["eta_ratio"]))
+        if float(s["v6_a"]) == 0.0 and float(s["v6_b"]) == 0.0:
+            st.success("a = b = 0: mass exactly conserved, so any support change is transport "
+                       "alone — the clean shrinkage test.")
+        if float(s["v6_I0"]) == 0.0 and float(s["v6_c_cp"]) > 0.0:
+            st.info(
+                "I0 = 0 with c_cp > 0. subsec:system says this must return **bitwise** what "
+                "c_cp = 0 returns. It does not: phi is exactly zero, but phi_eta(0) = "
+                "eta·log2 > 0, so every face still carries a rate of %.2e and the field "
+                "diffuses. Change-view shows it. This is reported, not worked around — "
+                "see degrade_v6's docstring." % summary["rest_rate"])
+        if summary["phi_cr"] == summary["phi_cr"] and summary["phi_cr"] < 1.0:
+            st.info("phi is still rim-peaked (centre/rim %.2f < 1): raise the reach above about "
+                    "half the specimen radius to get whole-body contraction."
+                    % summary["phi_cr"])
+
+
 def _render_2d_v4_tab():
     """The reduced damage model: one state field, no dose. Forward simulation only."""
     s = st.session_state
@@ -2882,9 +3154,9 @@ def _render_2d_v2_tab():
 
 
 # --- three modes, three tabs ----------------------------------------------------------
-tab_2d, tab_3d, tab_v5 = st.tabs(
+tab_2d, tab_3d, tab_v6 = st.tabs(
     ["2D dose-response + reconstruction", "3D degradation",
-     "2D shrinkage dose-response (v5)"]
+     "2D implicit-transport shrinkage (v6)"]
 )
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
@@ -2893,8 +3165,8 @@ tab_2d, tab_3d, tab_v5 = st.tabs(
 with tab_3d:
     _render_3d_tab()
 
-with tab_v5:
-    _render_2d_v5_tab()
+with tab_v6:
+    _render_2d_v6_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----
