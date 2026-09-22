@@ -31,6 +31,7 @@ import html as _html
 import io
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -166,6 +167,28 @@ _LOG_IFRAME = (
     'color:#d6d6d6;padding:8px;border-radius:6px;">{body}</div>'
     "<script>var b=document.getElementById('lb');b.scrollTop=b.scrollHeight;</script>"
 )
+
+def _term_echo(text: str) -> None:
+    """Echo the solver log to the terminal Streamlit was started from.
+
+    Writes to ``sys.__stdout__``, NOT ``sys.stdout``, and the distinction is the whole point:
+    while the solve runs, Pyomo's ``capture_output`` has replaced ``sys.stdout`` with the very
+    sink that calls this function, so a plain ``print`` would feed the log straight back into
+    itself. ``sys.__stdout__`` is the process's original stdout and is untouched by that
+    redirection.
+
+    Flushed per chunk so the log appears live rather than in a lump when the solve ends, and
+    wrapped because stdout can legitimately be closed or replaced (``streamlit run`` under a
+    daemoniser, pytest capture, a detached process).
+    """
+    try:
+        out = sys.__stdout__
+        if out is not None and not out.closed:
+            out.write(text)
+            out.flush()
+    except Exception:
+        pass
+
 
 def _current_script_ctx():
     """This session's ScriptRunContext, or None.  Must be called from the script thread.
@@ -2772,8 +2795,10 @@ def _render_2d_v6_tab():
                 components.html(_LOG_IFRAME.format(body=body), height=312, scrolling=False)
 
         def _v6_log(chunk: str) -> None:
-            # Runs on Pyomo's reader thread. Buffer FIRST, so the log stays complete even when
-            # the render cannot happen, then render at most every 0.2 s.
+            # Runs on Pyomo's reader thread. Terminal first and unthrottled -- that is the raw
+            # IPOPT log and it should appear as it is produced. Then buffer, so the box stays
+            # complete even when the render cannot happen. Then render, at most every 0.2 s.
+            _term_echo(chunk)
             log_lines.append(chunk)
             now = time.time()
             if now - _last[0] < 0.2:
