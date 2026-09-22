@@ -261,19 +261,27 @@ def face_fluxes(f_next, phi, c_cp: float, eta: float):
     return Fh, Fv
 
 
-def absorption_ratio(sigma, ft, p: V6Params, bulk_frac: float = 0.05) -> float:
-    """``max gamma(1 - sigma_p)/varsigma`` over the bulk.  Must be ``<< 1``; see the docstring.
+def absorption_ratio(sigma, ft, p: V6Params, bulk_frac: float = 0.5) -> float:
+    """``gamma(1 - sigma)/varsigma`` in the bulk.  Must be ``<< 1``; see the module docstring.
 
-    "Bulk" is read off the field rather than assumed: pixels carrying at least ``bulk_frac`` of
-    ``f_max``.  Above 1 the vacuum penalty, which exists to represent the free surface, is also
-    setting the scale inside the specimen, and the compaction is being suppressed everywhere.
+    Above 1 the vacuum penalty, which exists only to represent the free surface, is also setting
+    the scale *inside* the specimen: the potential is suppressed by that ratio everywhere and the
+    body does not move, with nothing raised and eq:xd_potential_bound still comfortably satisfied.
+
+    Two choices here, both learned from the sweep this feeds.  "Bulk" means at least **half** of
+    ``f_max``, not a token 5%: the quantity the condition is about is the *interior* value, and a
+    low threshold admits rim pixels that are on their way to vacuum.  And the statistic is the
+    **median** over that set rather than the max, because a max is set by whichever pixel happens
+    to sit just inside the threshold and is therefore an artefact of where the threshold was put.
+    With those two, the ratio is monotone in ``f_ref`` and crosses 1 exactly where the measured
+    contraction switches on -- which is what makes it a usable warning rather than a number.
     """
     ft = np.asarray(ft, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     bulk = ft >= bulk_frac * float(p.f_max)
     if not bulk.any():
         return 0.0
-    return float((p.gamma * (1.0 - sigma[bulk])).max() / p.varsigma())
+    return float(p.gamma * np.median(1.0 - sigma[bulk]) / p.varsigma())
 
 
 # --- the step ------------------------------------------------------------------------------
