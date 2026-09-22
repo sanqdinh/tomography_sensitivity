@@ -53,43 +53,13 @@ matplotlib.use("Agg")                      # headless, like every other figure p
 import matplotlib.pyplot as plt
 
 from degrade_v2 import accumulate_dose, scale_to_optical_depth
-from degrade_v6 import (V6Params, _phantom, compaction_potential, implicit_transport,
-                        absorption_ratio, resolve, shape_diagnostics, simulate, step,
-                        half_mass_radius, centroid_of)
+# step_simultaneous lives in degrade_v6 now, not here: app.py needs it too, and two copies
+# of the step map is exactly the drift this repo keeps warning about.
+from degrade_v6 import (V6Params, _phantom, resolve, shape_diagnostics, simulate, step,
+                        step_simultaneous, half_mass_radius, centroid_of)
 from dose_response import bundle_r_values
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def step_simultaneous(f, bundles, p: V6Params):
-    """One step carrying several ``(r_values, angle_rad)`` bundles at once.
-
-    Mirrors :func:`degrade_v6.step` line for line; the only change is that steps 1-2 accumulate
-    over every bundle against the SAME ``f`` before step 3 decays it, step 4 solves one potential
-    and steps 5-6 do one implicit solve.  Returns ``(f_next, info)`` with ``info`` a plain dict.
-    """
-    f = np.asarray(f, dtype=float)
-    cIdelta = np.zeros_like(f)
-    I_p = np.zeros_like(f)
-    for r_values, angle_rad in bundles:                                  # 1
-        da, db = accumulate_dose(f, r_values, angle_rad, p.I0, p.c)
-        cIdelta = cIdelta + da
-        I_p = I_p + db
-    dw = 1.0 - np.exp(-cIdelta)                                          # 2
-    ft = f * p.decay_factor(I_p)                                         # 3
-    lost = float(f.sum() - ft.sum())
-
-    phi, Pi, sigma = compaction_potential(ft, dw, p)                     # 4
-    f_next, colsum = implicit_transport(ft, phi, p.c_cp, p.eta)          # 5 and 6
-
-    info = dict(mass=float(f_next.sum()), lost=lost, dw_max=float(dw.max()),
-                void=float(Pi.sum()),
-                dw_mean=float(dw[ft > 0.05 * p.f_max].mean()) if (ft > 0.05 * p.f_max).any() else 0.0,
-                I_max=float(I_p.max()), state_min=float(f_next.min()),
-                colsum=colsum, phi_max=float(phi.max()),
-                absorp=absorption_ratio(sigma, ft, p),
-                mass_residual=abs(float(f_next.sum()) - float(ft.sum())))
-    return f_next, info
 
 
 def check_equivalence(image_res: int = 24, verbose: bool = True) -> float:
@@ -132,19 +102,13 @@ def run(image_res=32, n_angles=10, optical_depth=1.1, **over):
 
     # A -- ten steps, one angle each. The stock path, untouched.
     seq = tuple((a, 0.0, 0) for a in angles)
-    fA, infosA, histA = simulate(theta, seq, p, image_res, record_trajectory=True)
-    # Total void created over the run. This is what separates the two candidate causes of any
-    # difference -- dw saturating, versus the transport simply being applied ten times -- so it
-    # is measured rather than assumed. Recomputed from the trajectory with the same step-4 call
-    # the simulator made, against the field as it stood at the start of each step.
-    voidA = 0.0
-    for (ang_deg, off, nb), f_before in zip(seq, histA[:-1]):
-        dq_k, I_k = accumulate_dose(f_before, bundle_r_values(float(off), int(nb), image_res),
-                                    float(np.deg2rad(float(ang_deg))), p.I0, p.c)
-        _phi_k, Pi_k, _s_k = compaction_potential(f_before * p.decay_factor(I_k),
-                                                  1.0 - np.exp(-dq_k), p)
-        voidA += float(Pi_k.sum())
-    A = dict(f=fA, steps=len(infosA), void=voidA, dw=max(i.dw_max for i in infosA),
+    fA, infosA = simulate(theta, seq, p, image_res)
+    # Total void created over the run, sum_k Pi_k. This is what separates the two candidate
+    # causes of any difference -- dw saturating, versus the transport simply being applied ten
+    # times. StepInfo6 carries it per step, so it comes straight off the run rather than from a
+    # second pass over the trajectory that could disagree with the first.
+    A = dict(f=fA, steps=len(infosA), void=sum(i.void for i in infosA),
+             dw=max(i.dw_max for i in infosA),
              fmin=min(i.state_min for i in infosA), phi=max(i.phi_max for i in infosA),
              lost=sum(i.lost for i in infosA), colsum=max(i.colsum_err for i in infosA),
              absorp=max(i.absorption_ratio for i in infosA),
@@ -152,9 +116,9 @@ def run(image_res=32, n_angles=10, optical_depth=1.1, **over):
 
     # B -- one step, all ten angles.
     fB, infoB = step_simultaneous(theta, [(rv, np.deg2rad(a)) for a in angles], p)
-    B = dict(f=fB, steps=1, void=infoB["void"], dw=infoB["dw_max"], fmin=infoB["state_min"],
-             phi=infoB["phi_max"], lost=infoB["lost"], colsum=infoB["colsum"],
-             absorp=infoB["absorp"], mass_residual=infoB["mass_residual"])
+    B = dict(f=fB, steps=1, void=infoB.void, dw=infoB.dw_max, fmin=infoB.state_min,
+             phi=infoB.phi_max, lost=infoB.lost, colsum=infoB.colsum_err,
+             absorp=infoB.absorption_ratio, mass_residual=infoB.mass_residual)
 
     ctr = centroid_of(theta)
     for d in (A, B):

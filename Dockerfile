@@ -101,9 +101,11 @@ print('v6 invariants OK: mass drift %.1e, collapse %.1e, |colsum-1| %.1e, step4-
       % (r['mass_drift'], r['collapse'], r['colsum_err'], r['step4_vs_v5'], r['I0_leak']))" \
     && python3 -c "import degrade_v6_uq; \
 degrade_v6_uq.check_softplus_lifting(verbose=False); \
-r=degrade_v6_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
-assert r < 1e-10, r; \
-print('v6 Pyomo model == numpy model: residual %.1e (softplus lifting exact)' % r)" \
+rq=degrade_v6_uq.check_forward(image_res=16, n_steps=2, verbose=False, simultaneous=False); \
+rs=degrade_v6_uq.check_forward(image_res=16, n_steps=2, verbose=False, simultaneous=True); \
+assert max(rq, rs) < 1e-10, (rq, rs); \
+print('v6 Pyomo model == numpy model: residual %.1e sequential / %.1e simultaneous ' \
+      '(softplus lifting exact)' % (rq, rs))" \
     && python3 -m py_compile app.py && echo 'app.py compiles' \
     && python3 -c "import degrade_v5_uq; \
 r=degrade_v5_uq.check_forward(image_res=16, n_steps=2, verbose=False); \

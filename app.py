@@ -77,7 +77,8 @@ from degrade_v4 import (
 )
 from degrade_v5 import V5Params, simulate as simulate_v5_seq, resolve as resolve_v5
 # v6 is forward-only: nothing from a *_uq module, so this tab never imports pyomo.
-from degrade_v6 import (V6Params, simulate as simulate_v6_seq, resolve as resolve_v6,
+from degrade_v6 import (V6Params, simulate as simulate_v6_seq,
+                        simulate_simultaneous as simulate_v6_sim, resolve as resolve_v6,
                         shape_diagnostics as shape_diagnostics_v6,
                         compaction_potential as _compaction_potential_v6)
 from degrade_v2 import accumulate_dose as _accumulate_dose
@@ -590,6 +591,9 @@ for _k, _v in {
     "v6_depth": 1.1, "v6_I0": 1.0,
     "v6_c_omega": 0.1, "v6_c_cp": 0.3, "v6_a": 0.05, "v6_b": 0.0,
     "v6_reach": 7.0, "v6_gamma": 100.0, "v6_fref": 0.002, "v6_eta": 1e-3,
+    # Measurement schedule. SIMULTANEOUS is the default: the table's rows are one exposure
+    # carrying every bundle, not one exposure each.
+    "v6_mode": "Simultaneous",
     "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
     "v6_view_k": 0,
 }.items():
@@ -2380,6 +2384,10 @@ def _render_2d_v5_tab():
 # C_k on the readout is the pair that CAN go wrong here: eta against the max |dP| it has to
 # discriminate, and gamma(1-sigma)/varsigma inside the bulk.
 _V6_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
+# The measurement schedule. Same total exposure either way -- every row's bundle is fired with
+# the same I0 -- and the two differ only in how it is split in time, which is the fractionation
+# question experiment_v6_fractionation.py measures (3.46x at c_omega = 0.4).
+_V6_MODES = ("Simultaneous", "Sequential")
 _V6_RESOLUTIONS = (32, 48, 64, 96)
 _V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1)
 _V6_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
@@ -2405,7 +2413,7 @@ def _cb_sync_live_sim_v6():
 @st.cache_data(show_spinner=False)
 def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
                  c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
-                 eta: float):
+                 eta: float, mode: str = "Simultaneous"):
     """``(theta, f, phi, summary)``.  Radii are about the FIXED initial centroid.
 
     Shape statistics come from ``degrade_v6.shape_diagnostics`` rather than being re-derived
@@ -2415,8 +2423,11 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
     p = V6Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
                  reach=float(reach), gamma=float(gamma), f_ref_frac=float(fref), eta=float(eta))
+    # One step carrying every bundle, or one step per bundle. Both come from degrade_v6's
+    # single step_bundles body, so the two schedules cannot drift apart.
+    _run = simulate_v6_sim if mode == _V6_MODES[0] else simulate_v6_seq
     try:
-        f, infos = simulate_v6_seq(theta, seq, p, int(image_res))
+        f, infos = _run(theta, seq, p, int(image_res))
         err = None
     except Exception as exc:                 # the potential's guards raise rather than return junk
         f, infos, err = theta.copy(), [], str(exc).split(":")[0]
@@ -2432,9 +2443,16 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     phi_panel = np.zeros_like(theta)
     if infos and seq:
         pr = resolve_v6(p, theta)
-        ang, off, nb = seq[-1]
-        cid, I_p = _accumulate_dose(f, _bundle_r_values(float(off), int(nb), int(image_res)),
-                                    float(np.deg2rad(float(ang))), pr.I0, pr.c)
+        # Match the schedule: simultaneous accumulates EVERY bundle against the same field, so a
+        # panel built from the last row alone would show a potential the run never solved.
+        rows = seq if mode == _V6_MODES[0] else seq[-1:]
+        cid = np.zeros_like(theta)
+        I_p = np.zeros_like(theta)
+        for ang, off, nb in rows:
+            dq, ip = _accumulate_dose(f, _bundle_r_values(float(off), int(nb), int(image_res)),
+                                      float(np.deg2rad(float(ang))), pr.I0, pr.c)
+            cid = cid + dq
+            I_p = I_p + ip
         try:
             phi_panel, _Pi, _sg = _compaction_potential_v6(f * pr.decay_factor(I_p),
                                                            1.0 - np.exp(-cid), pr)
@@ -2483,7 +2501,8 @@ def _render_2d_v6_tab():
     theta, f, phi, summary = _simulate_v6(
         seq, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
         float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
-        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]))
+        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]), str(s["v6_mode"]))
+    simultaneous = (str(s["v6_mode"]) == _V6_MODES[0])
 
     view = s["v6_view"]
     if view == _V6_VIEWS[1]:
@@ -2504,8 +2523,9 @@ def _render_2d_v6_tab():
             beams_visible=bool(s["v6_showbeams"]),
             angle_range=[0, 360, 1], offset_range=[-float(res)/2, float(res)/2, 0.5],
             nbeams_range=[0, res, 1],
-            title="%s   ·   %d measurement%s   ·   %d×%d"
-                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
+            title="%s   ·   %d bundle%s %s   ·   %d×%d"
+                  % (view, n_meas, "" if n_meas == 1 else "s",
+                     "fired together" if simultaneous else "fired in sequence", res, res),
             hint='<b style="color:#ff2b2b">Red</b> = next-measurement preview; '
                  '<b style="color:#1f77ff">blue</b> = last measurement taken.',
             legend="%.3g" % vhi,
@@ -2515,6 +2535,16 @@ def _render_2d_v6_tab():
         st.radio("View", _V6_VIEWS, key="v6_view", horizontal=True)
 
     with mid:
+        st.radio(
+            "Measurement schedule", _V6_MODES, key="v6_mode", horizontal=True,
+            help="**Simultaneous** fires every row of the table in ONE exposure: the dose fields "
+                 "are summed against the same starting field, then one decay, one potential "
+                 "solve and one transport solve. **Sequential** fires one exposure per row, each "
+                 "seeing the damage the previous ones did.\n\nSame total exposure either way, so "
+                 "the difference is fractionation, not dose — and it is large, because "
+                 "`dw = 1 - exp(-sum c I delta)` saturates. Measured at c_omega = 0.4, 10 angles: "
+                 "sequential contracts **3.46x** as much. Run "
+                 "`experiment_v6_fractionation.py` for the full comparison.")
         act = st.columns(2)
         act[0].button("➕ Take measurement", on_click=_cb_v6_step,
                       use_container_width=True, key="v6_take")

@@ -77,14 +77,30 @@ import pyomo.environ as pyo
 from degrade_v2 import scale_to_optical_depth
 from degrade_v2_uq import measurement_rays, solve_with_fallback
 from degrade_v3_uq import _neighbours
-from degrade_v6 import (V6Params, simulate, resolve, softplus, compaction_potential,
-                        _phantom, _demo_sequence)
+from degrade_v6 import (V6Params, simulate, simulate_simultaneous, resolve, softplus,
+                        compaction_potential, _phantom, _demo_sequence)
+
+
+def _measurements(seq, res, simultaneous: bool):
+    """``measurement_rays``, optionally collapsed to ONE measurement carrying every ray.
+
+    That collapse *is* the simultaneous schedule as far as this model is concerned: the blocks
+    below accumulate ``I_terms``/``Id_terms`` per ``(pixel, k)`` over all rays of measurement
+    ``k``, so putting every angle's rays in one entry sums their dose fields before the single
+    decay, potential solve and transport solve -- which is what
+    :func:`degrade_v6.step_simultaneous` does.  The merged entry's angle is unused downstream.
+    """
+    meas = measurement_rays(seq, res)
+    if not simultaneous or len(meas) <= 1:
+        return meas
+    rays = [r for _ang, rs in meas for r in rs]
+    return [(meas[0][0], rays)]
 
 
 # --- model ---------------------------------------------------------------------------------
 
 def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None,
-                   potential: bool = True):
+                   potential: bool = True, simultaneous: bool = False):
     """Steps 1-7 of section 3.2 as a Pyomo model.  ``theta_ref`` seeds every variable.
 
     ``potential=False`` omits the ``Pi``/``sig``/``phi``/``sp`` blocks entirely and is legal ONLY
@@ -96,7 +112,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     p = resolve(p, theta_ref)
     res = int(image_res)
     npix = res * res
-    meas = measurement_rays(seq, res)
+    meas = _measurements(seq, res, simultaneous)
     K = len(meas)
     if K == 0:
         raise ValueError("no measurements: the sequence is empty")
@@ -112,6 +128,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
     m.seq, m.theta_ref = tuple(tuple(x) for x in seq), np.array(theta_ref, dtype=float)
     m.has_potential = bool(potential)
+    m.simultaneous = bool(simultaneous)
 
     m.PIX = pyo.RangeSet(0, npix - 1)
     m.T = pyo.RangeSet(0, K)
@@ -265,14 +282,19 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
 
 # --- pinning and the gate ---------------------------------------------------------------
 
-def numpy_trajectory(theta, seq, p: V6Params, image_res: int):
-    """Every variable of the model, taken off a :func:`degrade_v6.simulate` run."""
+def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool = False):
+    """Every variable of the model, taken off a :mod:`degrade_v6` run.
+
+    ``simultaneous`` picks :func:`degrade_v6.simulate_simultaneous` and the collapsed ray list,
+    so the trajectory and the model it is pinned into describe the same schedule.
+    """
     p = resolve(p, theta)
     res = int(image_res)
     npix = res * res
-    meas = measurement_rays(seq, res)
+    meas = _measurements(seq, res, simultaneous)
     K = len(meas)
-    _f, _infos, hist = simulate(theta, seq, p, res, record_trajectory=True)
+    _run = simulate_simultaneous if simultaneous else simulate
+    _f, _infos, hist = _run(theta, seq, p, res, record_trajectory=True)
     f = np.stack([h.ravel() for h in hist], axis=1)
 
     S, Ipix, cIdelta = {}, np.zeros((npix, K)), np.zeros((npix, K))
@@ -377,26 +399,29 @@ def max_residual(m, by_block: bool = False):
     return (worst, where, blocks) if by_block else (worst, where)
 
 
-def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True, **kw):
-    """G1, the residual gate: does the Pyomo model reproduce :func:`degrade_v6.simulate`?
+def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
+                  simultaneous: bool = False, **kw):
+    """G1, the residual gate: does the Pyomo model reproduce the numpy model?
 
     Pins every variable to the numpy trajectory and evaluates every constraint.  No solver, so
-    this runs in the Docker build.  Returns the worst residual.
+    this runs in the Docker build.  ``simultaneous`` gates the other schedule, which the tab
+    now defaults to -- both must hold, and they are different models: K = 1 with every ray in
+    one measurement, against K = n_steps with one each.  Returns the worst residual.
     """
     p = V6Params(**kw)
     seq = _demo_sequence(n_steps)
     theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
-    traj = numpy_trajectory(theta, seq, p, image_res)
-    m = build_v6_model(theta, seq, p, image_res)
+    traj = numpy_trajectory(theta, seq, p, image_res, simultaneous=simultaneous)
+    m = build_v6_model(theta, seq, p, image_res, simultaneous=simultaneous)
     pin_model(m, traj)
     r, where, blocks = max_residual(m, by_block=True)
     if verbose:
         pr = resolve(p, theta)
         dP = max(abs(traj["phi"][b, k] - traj["phi"][a, k])
                  for (a, b, k) in traj["sp"]) if traj["sp"] else 0.0
-        print("  v6 Pyomo vs numpy: grid %d, %d steps, c_cp=%g, eta=%g -> %.3e (%s)  %s"
-              % (image_res, n_steps, pr.c_cp, pr.eta, r, where or "-",
-                 "PASS" if r < 1e-10 else "FAIL"))
+        print("  v6 Pyomo vs numpy: grid %d, %d rows, %s, c_cp=%g, eta=%g -> %.3e (%s)  %s"
+              % (image_res, n_steps, "SIMULTANEOUS (K=1)" if simultaneous else "sequential",
+                 pr.c_cp, pr.eta, r, where or "-", "PASS" if r < 1e-10 else "FAIL"))
         for name in sorted(blocks):
             print("      %-12s %.3e" % (name, blocks[name]))
         # The softplus lifting's only failure mode is underflow of exp(-sp/eta), which costs the
@@ -407,7 +432,8 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True, *
 
 
 def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma27",
-                  max_iter=3000, tol=1e-8, verbose=True, log_callback=None):
+                  max_iter=3000, tol=1e-8, verbose=True, log_callback=None,
+                  simultaneous: bool = False):
     """G2: fix ``f[:, 0] = theta`` and let IPOPT FIND the trajectory from the undamaged field.
 
     Strictly more than the residual gate.  That one says the rows are satisfied by the numpy
@@ -417,7 +443,7 @@ def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma2
     theta = np.asarray(theta, dtype=float)
     p = resolve(p, theta)
     res = int(image_res)
-    m = build_v6_model(theta, seq, p, res)
+    m = build_v6_model(theta, seq, p, res, simultaneous=simultaneous)
     flat = theta.ravel()
     for q in m.PIX:
         m.f[q, 0].set_value(float(flat[q]))
@@ -437,7 +463,7 @@ def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma2
     wall = time.perf_counter() - t0
 
     got = np.array([[pyo.value(m.f[q, k]) for k in m.T] for q in m.PIX])
-    traj = numpy_trajectory(theta, seq, p, res)
+    traj = numpy_trajectory(theta, seq, p, res, simultaneous=simultaneous)
     err = float(np.abs(got - traj["f"]).max())
     rel = err / max(float(np.abs(traj["f"]).max()), 1e-300)
     if verbose:
@@ -446,10 +472,10 @@ def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma2
         # solved to `tol` cannot be expected to reproduce the numpy trajectory to better than
         # roughly that, and demanding 1e-8 at tol=1e-8 fails a model that is in fact correct.
         bar = max(20.0 * tol, 1e-12)
-        print("  forward SOLVE: grid %d, %d steps, %s -> %s in %.1f s, f error %.3e abs / "
+        print("  forward SOLVE: grid %d, %d rows, %s, %s -> %s in %.1f s, f error %.3e abs / "
               "%.3e rel  %s (bar %.0e = 20*tol)"
-              % (res, len(seq), solver_used, tc, wall, err, rel,
-                 "PASS" if rel < bar else "FAIL", bar))
+              % (res, len(seq), "SIMULTANEOUS" if simultaneous else "sequential", solver_used,
+                 tc, wall, err, rel, "PASS" if rel < bar else "FAIL", bar))
     return rel
 
 
@@ -499,14 +525,17 @@ def _cli(argv=None):
     print()
     check_softplus_lifting()
     print()
-    r = check_forward(image_res=a.image_res, n_steps=a.n_steps, **kw)
-    ok = r < 1e-10
+    r = check_forward(image_res=a.image_res, n_steps=a.n_steps, simultaneous=False, **kw)
+    r_sim = check_forward(image_res=a.image_res, n_steps=a.n_steps, simultaneous=True, **kw)
+    ok = max(r, r_sim) < 1e-10
     if a.solve:
         print()
         theta = scale_to_optical_depth(_phantom(a.image_res), 1.1, a.image_res)
-        rel = forward_solve(theta, _demo_sequence(a.n_steps), V6Params(**kw), a.image_res,
-                            linear_solver=a.linear_solver, max_iter=a.max_iter)
-        ok = ok and rel < 1e-8
+        for sim in (False, True):
+            rel = forward_solve(theta, _demo_sequence(a.n_steps), V6Params(**kw), a.image_res,
+                                linear_solver=a.linear_solver, max_iter=a.max_iter,
+                                simultaneous=sim)
+            ok = ok and rel < 20 * 1e-8
     return 0 if ok else 1
 
 

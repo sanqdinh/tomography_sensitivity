@@ -172,6 +172,9 @@ class StepInfo6:
     rest_rate: float           # c_cp*eta*log2, the directed rate a MOTIONLESS face still carries
     colsum_err: float          # max |column sum - 1| of the transport matrix; conservation
     absorption_ratio: float    # max gamma(1-sigma)/varsigma over the bulk; must be << 1
+    void: float                # sum_p Pi_p, the void created this step. Summed over a run it is
+                               # what separates dw SATURATING from the transport merely compounding
+                               # -- see experiment_v6_fractionation.py.
 
 
 # --- steps 5 and 6: the implicit transport -------------------------------------------------
@@ -287,10 +290,43 @@ def absorption_ratio(sigma, ft, p: V6Params, bulk_frac: float = 0.5) -> float:
 # --- the step ------------------------------------------------------------------------------
 
 def step(f, r_values, angle_rad: float, p: V6Params, _decay_last: bool = False):
-    """One measurement step.  Steps 1 to 4 are v5's verbatim; only 5 and 6 changed."""
+    """One measurement step carrying ONE bundle.  The sequential path.
+
+    A thin call into :func:`step_bundles`, so the sequential and simultaneous schedules are one
+    body rather than two that agree today.  Signature unchanged, and bit-identical to the
+    hand-written version it replaced -- ``accumulate_dose`` called once is the same float
+    arithmetic as summing over a one-element list.
+    """
+    return step_bundles(f, [(r_values, angle_rad)], p, _decay_last=_decay_last)
+
+
+def step_simultaneous(f, bundles, p: V6Params):
+    """One step carrying SEVERAL ``(r_values, angle_rad)`` bundles at once.
+
+    Every ray integrates the field as it stood at the START of the step, so rays do not shield
+    one another's damage.  That is not a convention invented for simultaneous exposure -- it is
+    what the model already does within a single bundle, and what CLAUDE.md records for the 3D
+    sinogram.  Firing several angles at once therefore just sums their dose fields before the
+    one decay, the one potential solve and the one transport solve.
+    """
+    return step_bundles(f, bundles, p)
+
+
+def step_bundles(f, bundles, p: V6Params, _decay_last: bool = False):
+    """The step map.  Steps 1 to 4 are v5's verbatim; only 5 and 6 changed.
+
+    ``bundles`` is a list of ``(r_values, angle_rad)``.  One entry is a sequential measurement;
+    several is a simultaneous one.  The ONLY difference is that steps 1-2 accumulate over every
+    bundle against the same ``f`` before step 3 decays it.
+    """
     f = np.asarray(f, dtype=float)
 
-    cIdelta, I_p = accumulate_dose(f, r_values, angle_rad, p.I0, p.c)   # 1
+    cIdelta = np.zeros_like(f)
+    I_p = np.zeros_like(f)
+    for r_values, angle_rad in bundles:                                  # 1
+        dq, ip = accumulate_dose(f, r_values, float(angle_rad), p.I0, p.c)
+        cIdelta = cIdelta + dq
+        I_p = I_p + ip
     dw = 1.0 - np.exp(-cIdelta)                                          # 2
     ft = f * p.decay_factor(I_p)                                         # 3
     lost = float(f.sum() - ft.sum())
@@ -325,13 +361,48 @@ def step(f, r_values, angle_rad: float, p: V6Params, _decay_last: bool = False):
                      phi_max=float(phi.max()), phi_core_rim=pr,
                      dP_max=gmax, rest_rate=float(p.c_cp * p.eta * np.log(2.0)),
                      colsum_err=colsum_err,
-                     absorption_ratio=absorption_ratio(sigma, ft, p))
+                     absorption_ratio=absorption_ratio(sigma, ft, p),
+                     void=float(Pi.sum()))
     return f_next, info
+
+
+def simulate_simultaneous(theta, seq, p: V6Params, image_res: int,
+                          record_observations: bool = False, record_trajectory: bool = False):
+    """The whole sequence as ONE exposure.  Same return shape as :func:`simulate`.
+
+    Every row of ``seq`` contributes its bundle to a single step, so there is exactly one
+    ``StepInfo6`` however many rows there are, and ``hist`` has length 2.  Observations are taken
+    after that step, at the one angle-set fired -- one ray list, concatenated in row order.
+
+    The two schedules deliver the SAME total exposure and differ only in how it is split in time,
+    which is the fractionation question ``experiment_v6_fractionation.py`` measures.
+    """
+    theta = np.asarray(theta, dtype=float)
+    p = resolve(p, theta)
+    f = theta.copy()
+    hist = [f.copy()]
+    bundles = [(bundle_r_values(float(off), int(nb), int(image_res)),
+                float(np.deg2rad(float(ang)))) for ang, off, nb in seq]
+    infos, obs = [], []
+    if bundles:
+        f, info = step_simultaneous(f, bundles, p)
+        infos.append(info)
+        if record_observations:
+            obs.append(np.array([ray_line_integral(f, r, ang)
+                                 for rv, ang in bundles for r in rv]))
+        if record_trajectory:
+            hist.append(f.copy())
+    out = [f, infos]
+    if record_observations:
+        out.append(obs)
+    if record_trajectory:
+        out.append(hist)
+    return tuple(out)
 
 
 def simulate(theta, seq, p: V6Params, image_res: int,
              record_observations: bool = False, record_trajectory: bool = False):
-    """Run a measurement sequence.  Observations are index-shifted: ``y_{k+1} = C f_{k+1}``."""
+    """Run a measurement sequence, one step per row.  ``y_{k+1} = C f_{k+1}``, index-shifted."""
     theta = np.asarray(theta, dtype=float)
     p = resolve(p, theta)
     f = theta.copy()
