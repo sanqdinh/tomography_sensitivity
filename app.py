@@ -2391,6 +2391,17 @@ _V6_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
 # the same I0 -- and the two differ only in how it is split in time, which is the fractionation
 # question experiment_v6_fractionation.py measures (3.46x at c_omega = 0.4).
 _V6_MODES = ("Simultaneous", "Sequential")
+# TV weight ladder for the v6 Reconstruct. WIDER than the v2/v5 tabs' _V2_TV_WEIGHTS, which tops
+# out at 0.5: 1-2-5 per decade from 1e-4 to 100, so the range runs 200x higher and 5x lower.
+# A separate tuple rather than widening _V2_TV_WEIGHTS, which v2 and v5 share and which was
+# calibrated against v2's measured behaviour (0.01 -> 3.5% theta error, 0.2 -> 19%).
+#
+# The top of this range is not decoration. v6's estimation NLP does not converge at grid 32 --
+# 100 iterations leave inf_du at 1.2e+06 with 62% of iterations Hessian-regularised -- and a
+# heavy TV term is one of the few levers that makes the objective more strongly convex, so the
+# region above 1 is worth being able to reach even though it will visibly over-smooth.
+_V6_TV_WEIGHTS = (0.0, 1e-4, 2e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+                  0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 _V6_RESOLUTIONS = (32, 48, 64, 96)
 _V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1)
 _V6_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
@@ -2654,10 +2665,16 @@ def _render_2d_v6_tab():
     )
     rc = st.columns([1, 1, 1, 2])
     with rc[0]:
-        st.select_slider("TV weight", options=_V2_TV_WEIGHTS, key="v6_tv_weight",
+        st.select_slider("TV weight", options=_V6_TV_WEIGHTS, key="v6_tv_weight",
                          format_func=lambda v: "%g" % v,
                          help="Both objective terms are normalised to O(1) first, so this is a "
-                              "trade-off RATIO and not the 2D tab's scale.")
+                              "trade-off **ratio**, not the 2D tab's scale \u2014 a value of 1 "
+                              "means TV and the data fit carry equal weight.\n\nRange runs to "
+                              "100, well past the point of visible over-smoothing. That is "
+                              "deliberate: the v6 NLP does not converge at grid 32, and a heavy "
+                              "TV term is one of the few levers that makes the objective more "
+                              "strongly convex. Expect a smoothed-out theta up there \u2014 on "
+                              "v2 the error was already 19% at 0.2.")
     with rc[1]:
         st.number_input("Max IPOPT iterations", min_value=50, max_value=5000, step=50,
                         key="v6_maxiter")
