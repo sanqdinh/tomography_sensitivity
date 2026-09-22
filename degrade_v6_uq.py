@@ -823,6 +823,8 @@ class V6UQResults:
     # --- how eta was chosen ---
     eta_used: float = float("nan")
     eta_auto: bool = False
+    min_chord: float = float("nan")      # = 1/c_chain's within-row Jacobian spread
+    n_chord_tiny: int = 0                # duplicated vertex crossings; see _chord_stats
     eta_ratio: float = float("nan")      # max|dP| / eta; healthy window is ~3 to 28
     eta_rest_total: float = float("nan")  # fraction of a pixel the smoothing alone moves / step
     eta_warning: str = ""
@@ -947,6 +949,13 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     add_estimation_objective(m, y_true, params.tv_weight, theta_scale)
     init_resid = initialize_from_numpy(m, theta_seed)
     say("    start residual %.3e (dynamically feasible; only the fit is wrong)\n" % init_resid)
+    # The chord report earns its keep HERE, on the caller's real geometry: the Docker gate runs
+    # K=2 (angles 0/90), where min_chord is exactly 1.0 and the defect cannot be seen at all.
+    min_chord, n_chord_tiny, bad_ang = _chord_stats(seq, res)
+    if n_chord_tiny:
+        say("    WARNING: %d chords below 1e-9 (min %.4e) at angles %s. line_grid_intersections "
+            "emits an exact-vertex crossing twice there, which inflates Ipix on those pixels.\n"
+            % (n_chord_tiny, min_chord, bad_ang))
     n_v = int(m.nvariables())
     n_c = int(m.nconstraints())
 
@@ -991,6 +1000,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
         theta_rms=theta_rms, theta_pct_peak=100.0 * theta_rms / theta_scale,
         n_measurements=len(seq), n_rays=n_rays,
         eta_used=eta_used, eta_auto=(params.eta is None),
+        min_chord=min_chord, n_chord_tiny=n_chord_tiny,
         eta_ratio=float(eta_info.get("ratio", float("nan"))),
         eta_rest_total=float(eta_info.get("rest_total", float("nan"))),
         eta_warning=str(eta_info.get("warning", "")),
@@ -1030,3 +1040,200 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
             say("    UQ failed (reconstruction kept): %s\n" % out.uq_error)
         out.t_uq = time.perf_counter() - t1
     return out
+
+
+# --- G3: the scaling gate ---------------------------------------------------------------------
+
+def _sp_and_chord_extra(m, p):
+    """v6-specific rows for :func:`degrade_v2_uq.scaling_report`, as an ``extra`` callback."""
+    def _extra(nlp, J, cons, varz):
+        eta = float(p.eta)
+        d = {"eta": eta, "f_max": float(p.f_max),
+             "f_ref": (None if p.f_ref_frac is None else float(p.f_ref_frac) * float(p.f_max))}
+        if not getattr(m, "has_potential", False):
+            return d
+        # c_sp_pair is exp(-u/eta) + exp(-v/eta) = 1, so its two derivative MAGNITUDES are
+        # exp(-u/eta)/eta and exp(-v/eta)/eta and they sum to exactly 1/eta. Two exact
+        # consequences follow, and they are what S7 and S8 assert:
+        #   the larger lies in [1/(2 eta), 1/eta];
+        #   their ratio is exp(|u - v|/eta), and |u - v| is |dP| across that face, by c_sp_diff.
+        idx = [i for i, c in enumerate(cons) if c.parent_component().name == "c_sp_pair"]
+        lo_b, hi_b = 1.0 / (2.0 * eta), 1.0 / eta
+        mx, mn, zero, denorm, ident, dP = [], [], 0, 0, 0.0, 0.0
+        for i in idx:
+            v = np.abs(J.data[J.indptr[i]:J.indptr[i + 1]])
+            if v.size < 2:
+                continue
+            a, b = float(v.max()), float(v.min())
+            mx.append(a); mn.append(b)
+            if b == 0.0:
+                zero += 1
+                continue
+            if b < 2.2250738585072014e-308:      # subnormal: the identity degrades to ~1e-6 there
+                denorm += 1
+                continue
+            # log(a) - log(b), NOT log(a/b): the ratio overflows to inf past exp(709) and the
+            # check then reports inf on a perfectly healthy identity.
+            gap = (np.log(a) - np.log(b)) * eta
+            dP = max(dP, gap)
+            ident = max(ident, abs(gap - gap))   # placeholder; exactness checked against c_sp_diff
+        d.update(sp_row_min=(min(mx) if mx else float("nan")),
+                 sp_row_max=(max(mx) if mx else float("nan")),
+                 sp_row_lo=lo_b, sp_row_hi=hi_b,
+                 sp_zero_deriv_rows=zero, sp_denormal_rows=denorm,
+                 dP_max_eval=dP, eta_ratio_eval=(dP / eta if eta else float("nan")))
+        # The c_sp_diff identity, measured directly rather than inferred: |u - v| must equal |dP|.
+        err = 0.0
+        for (a_, b_) in m.UFACE:
+            for k in m.TM:
+                u, v2 = pyo.value(m.sp[a_, b_, k]), pyo.value(m.sp[b_, a_, k])
+                z = pyo.value(m.phi[b_, k]) - pyo.value(m.phi[a_, k])
+                err = max(err, abs((u - v2) - z))
+        d["sp_identity_err"] = float(err)
+        return d
+    return _extra
+
+
+def _chord_stats(seq, image_res: int, simultaneous: bool = False):
+    """Smallest chord in the geometry, and the count of degenerate ones.
+
+    ``c_chain``'s within-row spread is exactly ``1/min_chord``, so this is a scaling number as
+    well as a geometry one.  Measured: ``min_chord`` is ``2.5640e-16`` -- identically, to every
+    printed digit, at grid 12, 16 AND 32 -- for the angle sets containing 60 and 120 degrees
+    (K = 3 and K = 9), and 1.0 / 14.1 / 160-263 at K = 2 / 4 / 5. A grazing ray's chord scales
+    with the grid; a fixed round-off does not, so this is ``line_grid_intersections`` emitting an
+    exact-vertex crossing TWICE, not a ray clipping a corner. 13 decades separate it from the
+    smallest legitimate chord found (3.80e-3), so the two are not confusable.
+
+    NOT fixed here. The fix belongs in ``dose_response.ray_geometry``, which v1's Pyomo path does
+    not use, so correcting it would widen the convention split CLAUDE.md already records for
+    chord attribution. Reported so it is visible instead of silent.
+    """
+    # ALWAYS the uncollapsed list, whatever the schedule. The rays are identical either way --
+    # only the grouping differs -- but the simultaneous form merges every angle into one entry
+    # whose nominal angle is the first row's, so attributing a degenerate chord to an angle off
+    # that list reports 0.0 for all of them. Measured: the true culprits are 60 and 120 degrees.
+    meas = _measurements(seq, int(image_res), False)
+    ch = np.concatenate([np.asarray([c for _pix, c, _o in walk], dtype=float)
+                         for _ang, rays in meas for _r, walk in rays if walk]) \
+        if any(walk for _a, rays in meas for _r, walk in rays) else np.array([1.0])
+    bad = ch < 1e-9
+    ang = sorted({round(float(np.rad2deg(a)), 6) for a, rays in meas
+                  for _r, walk in rays if any(c < 1e-9 for _p, c, _o in walk)})
+    return float(ch.min()), int(bad.sum()), ang
+
+
+def check_scaling(m=None, *, image_res: int = 16, n_steps: int = 2, simultaneous: bool = True,
+                  seed: str = "flat", verbose: bool = True, **kw) -> dict:
+    """G3: is the estimation NLP sanely scaled?  Returns the report; never raises.
+
+    Ten assertions, each with a bound justified by a measured range -- see the table in the
+    source.  Everything that legitimately varies is REPORTED instead, because a checker that
+    asserts an unmeasured threshold fires spuriously, gets muted, and then misses the real thing.
+
+    Deliberately NOT asserted: ``max|dP|/eta`` inside ``[ETA_RATIO_LO, ETA_RATIO_HI]``. That
+    window governs the forward run ``select_eta`` probes, where the ratio is the target BY
+    CONSTRUCTION. At the evaluation point it is a different number and legitimately below the
+    window -- measured 1.54 (grid 16, K=5, simultaneous) and 2.09 (grid 16, K=2, sequential) on
+    healthy models. Both numbers are reported; neither is a gate.
+
+    Only ONE of these has ever fired on real code: S9, which counts exactly-zero derivatives in
+    ``c_sp_pair`` and saw 0..43 of them at the old fixed ``eta = 1e-3``. S7 and S8 are exact by
+    construction. S1-S6 are tripwires of unmeasured sensitivity -- they have never been observed
+    to fail, which is a reason to keep their bounds loose, not a reason to trust them.
+    """
+    from degrade_v2_uq import scaling_report
+    p_used = None
+    if m is None:
+        p0 = V6Params(**kw) if kw else V6Params()
+        theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
+        seq = _demo_sequence(n_steps)
+        eta, _info = select_eta(theta, seq, p0, image_res, simultaneous=simultaneous)
+        p_used = resolve(replace(p0, eta=eta), theta)
+        run = simulate_simultaneous if simultaneous else simulate
+        _f, _i, y = run(theta, seq, p_used, image_res, record_observations=True)
+        m = build_v6_model(theta, seq, p_used, image_res, f_bounds=(0.0, None),
+                           simultaneous=simultaneous)
+        add_estimation_objective(m, y, 0.001, float(np.abs(theta).max()))
+        start = theta if seed == "truth" else np.full_like(theta, float(theta.mean()))
+        resid = initialize_from_numpy(m, start)
+    else:
+        p_used, seq, resid, seed = m.p, m.seq, max_residual(m)[0], "given"
+        simultaneous = bool(getattr(m, "simultaneous", False))
+
+    rep = scaling_report(m, extra=_sp_and_chord_extra(m, p_used))
+    if rep.get("skipped"):
+        if verbose:
+            print("  v6 scaling: SKIPPED (%s)" % rep["skipped"])
+        return rep
+    rep["residual"], rep["seed"] = float(resid), seed
+    mc, nct, bad_ang = _chord_stats(seq, m.res)
+    rep.update(min_chord=mc, n_chord_tiny=nct, degenerate_angles=bad_ang)
+
+    f = []
+    fm = float(p_used.f_max)
+    #  #   what                                    measured range                      bound
+    #  S1  structurally empty rows                 0 in 143 configs                    == 0
+    #  S2  numerically zero rows                   0 in 143                            == 0
+    #  S3  dead variable columns                   0 in 143                            == 0
+    #  S4  objective gradient non-empty            nnz 24..972                         > 0
+    #  S5  median row inf-norm                     EXACTLY 1.0 in 143, and at iters
+    #                                              0/5/20/60 of a real solve; 62-72%
+    #                                              of rows are identically 1, so the
+    #                                              median is 1 by majority            0.5..2
+    #  S6  min row inf-norm / min(1, f_max)        1.000000 in 11/11, block always
+    #                                              c_Pi. Half structural (fm is a
+    #                                              constant entry in c_Pi, so that
+    #                                              block is >= fm by construction) and
+    #                                              half empirical (that NO other block
+    #                                              goes lower)                        >= 0.9
+    #  S7  c_sp_pair row norm in [1/(2eta),1/eta]  violation 0.0 in 6/6      exact by construction
+    #  S8  c_sp_diff identity |u-v| == |dP|        5.1e-16..8.9e-16 over 9 configs     < 1e-9
+    #  S9  c_sp_pair exactly-zero derivatives      0 at auto-eta; 0..43 at eta=1e-3    == 0
+    #  S10 start residual                          1.6e-15..1.4e-14                    < 1e-10
+    if rep["empty_rows"]:       f.append("S1 %d structurally empty rows" % rep["empty_rows"])
+    if rep["zero_rows"]:        f.append("S2 %d numerically zero rows" % rep["zero_rows"])
+    if rep["dead_cols"]:        f.append("S3 %d dead variable columns" % rep["dead_cols"])
+    if rep["grad_nnz"] == 0:    f.append("S4 objective gradient is structurally empty")
+    if not (0.5 <= rep["row_med"] <= 2.0):
+        f.append("S5 median row norm %.3g outside [0.5, 2]" % rep["row_med"])
+    if rep["row_min"] < 0.9 * min(1.0, fm):
+        f.append("S6 min row norm %.3g below 0.9*min(1,f_max) = %.3g (%s)"
+                 % (rep["row_min"], 0.9 * min(1.0, fm), rep["row_min_block"]))
+    if getattr(m, "has_potential", False):
+        if not (rep["sp_row_lo"] * (1 - 1e-9) <= rep["sp_row_min"]
+                and rep["sp_row_max"] <= rep["sp_row_hi"] * (1 + 1e-9)):
+            f.append("S7 c_sp_pair row norms %.4g..%.4g outside [1/(2eta), 1/eta] = %.4g..%.4g"
+                     % (rep["sp_row_min"], rep["sp_row_max"], rep["sp_row_lo"], rep["sp_row_hi"]))
+        if rep["sp_identity_err"] > 1e-9:
+            f.append("S8 c_sp_diff identity off by %.3e" % rep["sp_identity_err"])
+        if rep["sp_zero_deriv_rows"]:
+            f.append("S9 %d c_sp_pair rows have an exactly-zero derivative (eta too small for "
+                     "this geometry -- see degrade_v6.select_eta)" % rep["sp_zero_deriv_rows"])
+    if rep["residual"] >= 1e-10:
+        f.append("S10 start residual %.3e" % rep["residual"])
+    rep["failures"], rep["ok"] = f, not f
+
+    if verbose:
+        print("  v6 scaling (grid %d, %s, seed %s): %s"
+              % (m.res, "simultaneous" if simultaneous else "sequential", rep["seed"],
+                 "PASS" if rep["ok"] else "FAIL " + "; ".join(f)))
+        print("      rows med %.3g  min %.3g (%s)  max %.3g (%s)  |  %.0f%% are exactly 1"
+              % (rep["row_med"], rep["row_min"], rep["row_min_block"],
+                 rep["row_max"], rep["row_max_block"], 100 * rep["frac_row_one"]))
+        print("      |grad f| %.3g -> %.2e x row_max;  IPOPT's own factor min(1,100/|g|) = %.3g"
+              % (rep["grad_inf"], rep["grad_over_row_max"], rep["ipopt_df"]))
+        if getattr(m, "has_potential", False):
+            print("      c_sp_pair rows %.4g..%.4g in [%.4g, %.4g] | zero-deriv %d | denormal %d"
+                  " | identity %.1e" % (rep["sp_row_min"], rep["sp_row_max"], rep["sp_row_lo"],
+                                        rep["sp_row_hi"], rep["sp_zero_deriv_rows"],
+                                        rep["sp_denormal_rows"], rep["sp_identity_err"]))
+            print("      eta %.4g | max|dP| at the EVAL point %.4g -> ratio %.2f (the %g..%g "
+                  "window governs select_eta's forward run, NOT this point)"
+                  % (rep["eta"], rep["dP_max_eval"], rep["eta_ratio_eval"],
+                     ETA_RATIO_LO, ETA_RATIO_HI))
+        if rep["n_chord_tiny"]:
+            print("      WARNING %d chords below 1e-9 (min %.4e) at angles %s -- duplicated "
+                  "vertex crossings, see _chord_stats" % (rep["n_chord_tiny"], rep["min_chord"],
+                                                          rep["degenerate_angles"]))
+    return rep

@@ -118,6 +118,15 @@ rs=degrade_v6_uq.check_forward(image_res=16, n_steps=2, verbose=False, simultane
 assert max(rq, rs) < 1e-10, (rq, rs); \
 print('v6 Pyomo model == numpy model: residual %.1e sequential / %.1e simultaneous ' \
       '(softplus lifting exact)' % (rq, rs))" \
+    && python3 -c "from pyomo.contrib.pynumero.asl import AmplInterface; \
+assert AmplInterface.available(), 'libpynumero_ASL.so missing -- check_scaling would silently skip'; \
+print('pynumero ASL OK')" \
+    && python3 -c "import degrade_v6_uq; \
+r=degrade_v6_uq.check_scaling(image_res=16, n_steps=2, simultaneous=False, verbose=False); \
+s=degrade_v6_uq.check_scaling(image_res=16, n_steps=2, simultaneous=True,  verbose=False); \
+assert r['ok'] and s['ok'], (r['failures'], s['failures']); \
+print('v6 NLP scaling OK: median row %.3g, min %.3g (%s), max %.3g (%s), |grad f| %.3g' \
+      % (s['row_med'], s['row_min'], s['row_min_block'], s['row_max'], s['row_max_block'], s['grad_inf']))" \
     && python3 -m py_compile app.py && echo 'app.py compiles' \
     && python3 -c "import degrade_v5_uq; \
 r=degrade_v5_uq.check_forward(image_res=16, n_steps=2, verbose=False); \
