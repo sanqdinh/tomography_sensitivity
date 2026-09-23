@@ -927,6 +927,15 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     n_rays = int(sum(len(y) for y in y_true))
     theta_scale = max(float(np.abs(theta).max()), 1e-30)
 
+    # Keep the dynamically feasible trajectory intact when IPOPT initializes. Its default bound
+    # push moves the many zero-density background pixels into the interior and raises inf_pr from
+    # round-off to O(1) before iteration 0.
+    solve_options = {
+        "bound_push": 1e-10,
+        "bound_frac": 1e-10,
+        "bound_relax_factor": 0.0,
+    }
+
     # --- continuation: the I0 = 0 problem is linear tomography + TV ------------------------
     theta_seed = np.full_like(theta, float(theta.mean()))
     cont_status = "skipped"
@@ -941,7 +950,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
             initialize_from_numpy(m0, theta_seed)
             r0, ls0 = solve_with_fallback(m0, linear_solver=params.linear_solver,
                                           max_iter=params.ipopt_max_iter,
-                                          log_callback=log_callback)
+                                          log_callback=log_callback, options=solve_options)
             cont_status = str(r0.solver.termination_condition)
             theta_seed = np.array([pyo.value(m0.f[q, 0]) for q in m0.PIX]).reshape(res, res)
             theta_rms_cont = float(np.sqrt(np.mean((theta_seed - theta) ** 2)))
@@ -969,7 +978,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     n_v = int(m.nvariables())
     n_c = int(m.nconstraints())
 
-    opts = {}
+    opts = dict(solve_options)
     if params.obj_scaling > 0.0:
         opts["obj_scaling_factor"] = float(params.obj_scaling)
     buf = []
@@ -988,7 +997,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     t0 = time.perf_counter()
     r, ls = solve_with_fallback(m, linear_solver=params.linear_solver,
                                 max_iter=params.ipopt_max_iter, log_callback=_tee,
-                                options=(opts or None))
+                                options=opts)
     t_solve = time.perf_counter() - t0
     reg, nlines = _reg_fraction("".join(buf))
 
