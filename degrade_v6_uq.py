@@ -1,9 +1,25 @@
-"""Pyomo transcription of v6, the implicit-transport damage model.  Forward direction only.
+"""Pyomo transcription of v6, the implicit-transport damage model: forward gates and estimation.
 
-The v6 counterpart of :mod:`degrade_v5_uq`, and deliberately narrower: this module builds the
-model and validates it against :func:`degrade_v6.simulate`.  **There is no estimation NLP, no
-objective, no k_aug.**  Those come after the forward direction is trusted; the seam is
-:func:`add_estimation_objective` in ``degrade_v5_uq``, which this module does not yet mirror.
+The v6 counterpart of :mod:`degrade_v5_uq`.  Two halves, split by the ``--- estimation ---``
+banner partway down the file:
+
+* **forward** -- :func:`build_v6_model`, and the gates that check it against
+  :func:`degrade_v6.simulate`: :func:`check_forward` (residual, solver-free, in the Docker
+  build), :func:`forward_solve` (IPOPT, not in the build) and :func:`check_softplus_lifting`.
+  :func:`_cli` runs these.
+* **estimation** -- :func:`add_estimation_objective`, :func:`initialize_from_numpy`,
+  :class:`V6UQParams` / :class:`V6UQResults`, :func:`run_v6_reconstruction` -- which ends in
+  k_aug for the pixel covariance and D-optimality, non-fatal exactly as in ``degrade_v2_uq`` --
+  and :func:`check_scaling`.
+
+An earlier version of this docstring said "forward direction only ... no estimation NLP, no
+objective, no k_aug".  That was true until the second half was written; it is kept here only so
+the claim is not mistaken for current if it resurfaces in an old copy.
+
+The forward gates must pass before anything in the second half means a thing, which is why
+:func:`run_v6_reconstruction` re-runs the residual gate on the caller's OWN geometry rather than
+trusting the one baked into the Docker build.  There is no ``--reconstruct`` CLI: :func:`_cli`
+covers only the gates, so a long reconstruction needs the Streamlit tab or a driver script.
 
 Same checking discipline as v2 and v5: the reference trajectory comes from
 :func:`degrade_v6.simulate`, which is numpy and scipy, so the model and the thing it is checked
