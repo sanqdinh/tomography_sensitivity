@@ -690,7 +690,7 @@ for _k, _v in {
     # the sigma-bound fix: grid 32 / K=5 simultaneous now reaches `optimal` at iteration 1253
     # (219 s, inf_du 2.5e-14, theta 9.16%), so a cap of 500 does not reveal a failure, it CAUSES
     # one. IPOPT stops at convergence, so the cap costs nothing when the solve succeeds.
-    "v6_tv_weight": 0.1, "v6_maxiter": 3000, "v6_noise": 0.0,
+    "v6_tv_weight": 0.01, "v6_maxiter": 3000, "v6_noise": 0.0,
     "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
     "v6_view_k": 0,
 }.items():
