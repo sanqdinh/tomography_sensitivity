@@ -45,8 +45,9 @@ and ``v = sp(-z)``, and pins them with two rows::
     u - v = z                            (LINEAR, and exact -- sp(z) - sp(-z) = z identically)
     exp(-u/eta) + exp(-v/eta) = 1
 
-Both are smooth, and because ``u, v >= 0`` the exponents are never positive, so **neither
-exponential can overflow at any field whatsoever**.  The pair is also unique: substituting
+Both are smooth. The equations uniquely imply ``u, v >= 0`` at every feasible point; the
+variable floor ``-eta`` also limits either exponent to at most 1 at infeasible iterates, so
+**neither exponential can overflow at any field whatsoever**. The pair is also unique: substituting
 ``v = u - z`` reduces the second row to ``exp(-u/eta)(1 + exp(z/eta)) = 1``, whose only root is
 ``u = eta log(1 + exp(z/eta))``.  Verified against ``logaddexp`` to 7.1e-15 on the first row and
 2.2e-16 on the second, over ``eta`` in 1e-1..1e-5 and ``z`` in -50..50.
@@ -183,7 +184,9 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     # argument v5 makes for lifting Pi, sigma and phi rather than inlining them.
     m.LX = pyo.Set(initialize=sorted({i for ts in I_terms.values() for i in ts}),
                    dimen=3, ordered=True)
-    m.L = pyo.Var(m.LX, bounds=(0.0, None), initialize=float(p.I0))
+    # c_L uniquely makes L positive. A redundant L >= 0 bound violates LICQ at I0 = 0, where
+    # c_L is exactly L = 0 for every crossing (the continuation model).
+    m.L = pyo.Var(m.LX, initialize=float(p.I0))
 
     def _lc(mm, k, j, t):
         return mm.L[k, j, t] == p.I0 * pyo.exp(-mm.S[k, j, t])
@@ -197,7 +200,10 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
 
     # --- 2. converted fraction. The chord-weighted dose sum is lifted too, so this is one
     # exp of one variable instead of an exp of a sum of exps.
-    m.Z = pyo.Var(m.PIX, m.TM, bounds=(0.0, None), initialize=0.0)
+    # The equation makes Z nonnegative at every feasible point. Keep a finite safety floor for
+    # exp(-Z), but put the physical zero strictly inside it so an unilluminated pixel does not
+    # duplicate c_Z with an active lower bound.
+    m.Z = pyo.Var(m.PIX, m.TM, bounds=(-1.0, None), initialize=0.0)
 
     def _zc(mm, q, k):                                   # LINEAR
         return mm.Z[q, k] == sum(p.c * ch * mm.L[i] for i, ch in Id_terms[(q, k)])
@@ -295,7 +301,11 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
         ufaces = [(a, b) for (a, b) in faces if a < b]
         m.FACE = pyo.Set(initialize=faces, dimen=2, ordered=True)
         m.UFACE = pyo.Set(initialize=ufaces, dimen=2, ordered=True)
-        m.sp = pyo.Var(m.FACE, m.TM, bounds=(0.0, None), initialize=eta * float(np.log(2.0)))
+        # The two equations uniquely make sp nonnegative. A zero lower bound duplicates
+        # c_sp_pair when the reverse softplus rate rounds to zero; -eta keeps that valid limit
+        # interior while still bounding every exponent in c_sp_pair by exp(1).
+        m.sp = pyo.Var(m.FACE, m.TM, bounds=(-eta, None),
+                       initialize=eta * float(np.log(2.0)))
 
         def _sp_diff(mm, a, b, k):
             # sp(z) - sp(-z) = z, exactly, for every eta. Linear.
