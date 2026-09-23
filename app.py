@@ -685,7 +685,12 @@ for _k, _v in {
     # carrying every bundle, not one exposure each.
     "v6_mode": "Simultaneous",
     # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D tab's scale.
-    "v6_tv_weight": 0.001, "v6_maxiter": 500, "v6_noise": 0.0,
+    # maxiter 3000, NOT 500. It was cut to 500 on the belief that this solve never converges and
+    # the cap only decided how fast you found that out. That belief predated ma97 + select_eta +
+    # the sigma-bound fix: grid 32 / K=5 simultaneous now reaches `optimal` at iteration 1253
+    # (219 s, inf_du 2.5e-14, theta 9.16%), so a cap of 500 does not reveal a failure, it CAUSES
+    # one. IPOPT stops at convergence, so the cap costs nothing when the solve succeeds.
+    "v6_tv_weight": 0.001, "v6_maxiter": 3000, "v6_noise": 0.0,
     "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
     "v6_view_k": 0,
 }.items():
@@ -2786,8 +2791,13 @@ def _render_2d_v6_tab():
                               "strongly convex. Expect a smoothed-out theta up there \u2014 on "
                               "v2 the error was already 19% at 0.2.")
     with rc[1]:
-        st.number_input("Max IPOPT iterations", min_value=50, max_value=5000, step=50,
-                        key="v6_maxiter")
+        st.number_input("Max IPOPT iterations", min_value=50, max_value=8000, step=50,
+                        key="v6_maxiter",
+                        help="Measured at grid 32 / K=5 simultaneous: `optimal` at iteration "
+                             "**1253**, 219 s (~0.175 s/iter on ma97). Grid 16 converges in "
+                             "520-642. A cap below ~1500 will cut grid 32 off before it gets "
+                             "there and report maxIterations, which reads as a failed solve "
+                             "rather than a truncated one.")
     with rc[2]:
         st.number_input("Noise sigma", min_value=0.0, max_value=1.0, step=0.001,
                         format="%.3f", key="v6_noise",
