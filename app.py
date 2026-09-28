@@ -66,7 +66,8 @@ from senDOE.models.tomography_3d import shepp_logan_3d, simulate_3d, detector_gr
 from senDOE.helpers.dose import accumulate_dose as _accumulate_dose, scale_to_optical_depth
 from senDOE.models.tomography_pyomo_2d_shrinkage_decay import (
     ShrinkageDecayUQParams as ShrinkageDecayUQParams,
-    run_shrinkage_decay_reconstruction as run_shrinkage_decay_reconstruction)
+    run_shrinkage_decay_reconstruction as run_shrinkage_decay_reconstruction,
+    run_naive_shrinkage_reconstruction as run_naive_shrinkage_reconstruction)
 # The shrinkage-decay tab's model is senDOE's shrinkage-decay model, imported under the tab's shrinkage-decay names.
 from senDOE.models.tomography_2d_shrinkage_decay import (
     ShrinkageDecayParams as ShrinkageDecayParams, simulate as simulate_shrinkage_seq,
@@ -79,12 +80,12 @@ from skimage.transform import resize
 
 st.set_page_config(page_title="Tomography Sensitivity UQ", layout="wide")
 
-st.title("Tomographic reconstruction + sensitivity-based UQ")
+st.title("Tomographic reconstruction and uncertainty")
 st.caption(
-    "Take X-ray measurements with the live simulator (each is logged to the sequence table on "
-    "the right) → **Reconstruct** solves that exact sequence — a forward solve simulates the "
-    "measurements, an inverse solve recovers the image, and a sensitivity analysis gives the "
-    "per-pixel posterior covariance (uncertainty) and a scalar D-optimality information score."
+    "Use the simulator to take X-ray measurements. Each measurement is added to the sequence "
+    "table on the right. Click **Reconstruct** to estimate the image from that sequence, then "
+    "see the uncertainty for each pixel and a D-optimality score that summarizes how informative "
+    "the measurements are."
 )
 
 # Fixed sim/reconstruction resolution (was the sidebar slider; equals the UQParams default).
@@ -396,7 +397,7 @@ def _style_covariance_fig(fig):
     axes = fig.axes
     if not axes:
         return fig
-    axes[0].set_title("Posterior covariance — per-pixel uncertainty")
+    axes[0].set_title("Posterior covariance: per-pixel uncertainty")
     imgs = axes[0].get_images()
     if imgs and imgs[0].colorbar is not None:   # relabel the colorbar with words, not values
         im = imgs[0]
@@ -446,12 +447,12 @@ def _render_results(slot, results):
         row1[0].pyplot(results.fig_phantom, use_container_width=True, bbox_inches=None)
         row1[0].caption("Original phantom")
         row1[1].pyplot(results.fig_beams, use_container_width=True, bbox_inches=None)
-        row1[1].caption("Beam / measurement view — the chosen projection geometry over the phantom")
+        row1[1].caption("Beam / measurement view: the chosen projection geometry over the phantom")
         row2 = st.columns([1.0, _CBAR_COL_RATIO])
         row2[0].pyplot(results.fig_nlp, use_container_width=True, bbox_inches=None)
         row2[0].caption("Reconstruction (NLP)")
         row2[1].pyplot(results.fig_covariance, use_container_width=True, bbox_inches=None)
-        row2[1].caption("Posterior covariance — per-pixel uncertainty")
+        row2[1].caption("Posterior covariance: per-pixel uncertainty")
 
 
 @st.cache_data(show_spinner=False)
@@ -619,7 +620,9 @@ for _k, _v in {
     # the sigma-bound fix: grid 32 / K=5 simultaneous now reaches `optimal` at iteration 1253
     # (219 s, inf_du 2.5e-14, theta 9.16%), so a cap of 500 does not reveal a failure, it CAUSES
     # one. IPOPT stops at convergence, so the cap costs nothing when the solve succeeds.
-    "shrinkage_tv_weight": 0.01, "shrinkage_maxiter": 3000, "shrinkage_noise": 0.0,
+    "shrinkage_tv_weight": 0.01, "shrinkage_maxiter": 3000,
+    "shrinkage_linear_solver": "ma97",
+    "shrinkage_naive_method": "FBP",
     "shrinkage_preset_lo": 0.0, "shrinkage_preset_hi": 180.0, "shrinkage_preset_n": 10,
     "shrinkage_view_k": 0,
 }.items():
@@ -712,33 +715,72 @@ def _recon_slice_figure(original, recon, logcov, k: int, status: str):
     return fig
 
 
-def _v2_recon_figure(res):
-    """theta | reconstruction | error | log-variance, drawn from the stored arrays.
+def _shrinkage_recon_figure(regular, naive):
+    """Render independent naïve and regular results in the requested 2×3 layout."""
+    truth = (naive.theta_true if naive is not None else
+             regular.theta_true if regular is not None else None)
+    if truth is None:
+        return None
+    shape = truth.shape
+    nan_image = np.full(shape, np.nan, dtype=float)
 
-    Four panels rather than the 2D tab's four *figures*: the v2 backend returns arrays, not
-    matplotlib Figures (the same choice _recon_slice_3d makes), so the layout is built here.
-    """
-    theta, hat = res.theta_true, res.theta_hat
-    err = hat - theta
-    span = max(float(np.abs(err).max()), 1e-12)
-    vmax = max(float(theta.max()), 1e-12)
+    naive_truth = (getattr(naive, "theta_true", None) if naive is not None else
+                   getattr(regular, "theta_true", None) if regular is not None else None)
+    naive_truth = naive_truth if naive_truth is not None else nan_image
+    naive_image = (getattr(naive, "theta_naive", None)
+                   if naive is not None else None)
+    naive_image = (naive_image if naive_image is not None
+                   else nan_image)
+    naive_error = (naive_image - naive_truth if np.any(np.isfinite(naive_image))
+                   else nan_image)
+    naive_method = getattr(naive, "method", "FBP") if naive is not None else "FBP"
+    naive_titles = {
+        "FBP": "Naïvely reconstructed sample (FBP)",
+        "SART": "Naïvely reconstructed sample (SART, 1 pass)",
+        "SART (1 pass)": "Naïvely reconstructed sample (SART, 1 pass)",
+        "SART (5 passes)": "Naïvely reconstructed sample (SART, 5 passes)",
+        "SART (10 passes)": "Naïvely reconstructed sample (SART, 10 passes)",
+        "Pyomo": "Naïvely reconstructed sample (static Pyomo)",
+    }
+    naive_title = naive_titles.get(naive_method, "naive reconstruction (%s)" % naive_method)
+
+    regular_truth = regular.theta_true if regular is not None else nan_image
+    regular_image = regular.theta_hat if regular is not None else nan_image
+    regular_error = (regular_image - regular_truth if regular is not None else nan_image)
+    covariance = (np.where(np.isfinite(regular.log_cov_diag_2D), regular.log_cov_diag_2D, np.nan)
+                  if regular is not None and regular.log_cov_diag_2D is not None else nan_image)
+
+    def _vmax(image):
+        finite = np.isfinite(image)
+        return max(float(image[finite].max()), 1e-12) if np.any(finite) else 1.0
+
+    def _span(image):
+        finite = np.isfinite(image)
+        return max(float(np.abs(image[finite]).max()), 1e-12) if np.any(finite) else 1.0
+
+    error_span = max(_span(naive_error), _span(regular_error))
     panels = [
-        (theta, "theta (truth)", "gray", dict(vmin=0.0, vmax=vmax)),
-        (hat, "theta reconstructed", "gray", dict(vmin=0.0, vmax=vmax)),
-        (err, "error (hat - truth)", "coolwarm", dict(vmin=-span, vmax=span)),
+        (naive_truth, "Original sample (undamaged)", "gray",
+         dict(vmin=0.0, vmax=_vmax(naive_truth))),
+        (naive_image, naive_title, "gray",
+         dict(vmin=0.0, vmax=_vmax(naive_truth))),
+        (naive_error, "Naïve reconstruction error (reconstructed − original)", "coolwarm",
+         dict(vmin=-error_span, vmax=error_span)),
+        (covariance, "Reconstruction uncertainty (log10 posterior covariance diagonal)",
+         "viridis", {}),
+        (regular_image, "Reconstructed sample", "gray",
+         dict(vmin=0.0, vmax=_vmax(regular_truth))),
+        (regular_error, "Reconstruction error (reconstructed − original)", "coolwarm",
+         dict(vmin=-error_span, vmax=error_span)),
     ]
-    if res.log_cov_diag_2D is not None:
-        lc = np.where(np.isfinite(res.log_cov_diag_2D), res.log_cov_diag_2D, np.nan)
-        panels.append((lc, "log10 posterior variance", "viridis", {}))
-    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
-    axes = np.atleast_1d(axes)
-    for ax, (img, ttl, cmap, kw) in zip(axes, panels):
-        if not np.any(np.isfinite(img)):
+    fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.8))
+    for ax, (image, title, cmap, kwargs) in zip(axes.flat, panels):
+        if not np.any(np.isfinite(image)):
             ax.text(0.5, 0.5, "unavailable", ha="center", va="center", transform=ax.transAxes)
         else:
-            im = ax.imshow(img, cmap=cmap, interpolation="nearest", **kw)
+            im = ax.imshow(image, cmap=cmap, interpolation="nearest", **kwargs)
             fig.colorbar(im, ax=ax, fraction=0.046)
-        ax.set_title(ttl, fontsize=10)
+        ax.set_title(title, fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout()
     return fig
@@ -1222,7 +1264,7 @@ def _volume_figure(vol, opacity, isomin, isomax, title, colorscale, cmax,
             )
         )
     else:
-        title += "  —  no voxels in this intensity band"
+        title += " (no voxels in this intensity band)"
 
     for trace in beams:
         fig.add_trace(trace)
@@ -1280,7 +1322,7 @@ def _render_3d_tab():
     s = st.session_state
     st.caption(
         "**2.5D forward simulation.** The phantom is a true 3D Shepp-Logan volume, but each "
-        "measurement fires the *same* beam bundle through every slice — rays never cross "
+        "measurement fires the *same* beam bundle through every slice. Rays never cross "
         "slices. Dose still varies with depth because each slice attenuates the beam "
         "differently. **Reconstruct** solves each slice as an independent 2D problem and "
         "stacks the results."
@@ -1379,10 +1421,10 @@ def _render_3d_tab():
                 data = vol0 * np.nan if _r3 is None else _r3["recon"]
                 cmap_name = "Gray"
                 title = ("Stacked reconstruction" if _r3 is not None
-                         else "No reconstruction yet — see the Reconstruct sub-tab")
+                         else "No reconstruction yet. See the Reconstruct sub-tab.")
             elif src == "Dose removed":
                 data, cmap_name = vol0 - vol, "Inferno"
-                title = "Dose removed (original − degraded) — where the beams landed"
+                title = "Dose removed (original − degraded): where the beams landed"
             else:
                 data, cmap_name = vol, "Gray"
                 title = "Degraded volume · %d measurement%s" % (
@@ -1481,10 +1523,10 @@ def _render_3d_tab():
                                    "can never admit air (which is exactly 0)."
                                    % _ISOMIN_FLOOR)
                     st.slider("Hide above", 0.0, 1.0, step=0.01, key="live3d_isomax",
-                              help="Drop voxels brighter than this — just under the crust "
+                              help="Drop voxels brighter than this, just under the crust "
                                    "value peels the outer shell.")
                 else:
-                    st.caption("window %.2f – %.2f" % (band_lo, band_hi))
+                    st.caption("window %.2f to %.2f" % (band_lo, band_hi))
             with vc4:
                 st.selectbox("Cut away", tuple(_CUT_AXES), key="live3d_cutaxis",
                              help="Slice the volume open along an axis to expose the interior "
@@ -1495,16 +1537,16 @@ def _render_3d_tab():
                                "and blobs are; below ~0.35 it stays outboard of them and the "
                                "exposed face is solid brain.")
             st.caption(
-                "Every voxel is a solid cube — no interpolation. Faces between two drawn voxels "
+                "Every voxel is a solid cube. There is no interpolation. Faces between two drawn voxels "
                 "are culled, so you see surfaces rather than a fog of stacked quads. "
-                "**To see the structures floating inside, use Layers → Structures only.** "
+                "**To see the structures floating inside, use Layers, then Structures only.** "
                 "Removing the crust alone will not do it: the brain underneath is a closed mass "
-                "wrapping them, so it has to go too. The cut-away is the other route — but a "
+                "wrapping them, so it has to go too. The cut-away is the other route, but a "
                 "cavity is only visible where the cut plane actually passes through it. "
                 "The **red curtains** are the next measurement's bundle and the blue ones the "
                 "last one taken: in 2.5D a ray fires through every slice, so each one is a "
                 "vertical plane, not a line. They follow the sliders on release, not mid-drag "
-                "(this view is rendered server-side) — the Slice view is the live one. "
+                "(this view is rendered server-side). The Slice view is the live one. "
                 "Drag to rotate · scroll to zoom · double-click to reset."
             )
 
@@ -1512,7 +1554,7 @@ def _render_3d_tab():
             st.radio("View", ("Per-slice sinogram", "Per-measurement projection"),
                      key="live3d_sinoview", horizontal=True,
                      help="A sinogram is one slice's readings across every measurement. A "
-                          "projection is one measurement's readings across every slice — what "
+                          "projection is one measurement's readings across every slice. It is "
                           "a 2D detector panel behind the volume would record.")
             if n_meas == 0:
                 st.pyplot(_sinogram_figure(np.full((IMAGE_RES, 1), np.nan), IMAGE_RES,
@@ -1530,7 +1572,7 @@ def _render_3d_tab():
                 )
                 st.slider("Slice (z)", 0, max(n_slices - 1, 0), key="live3d_z_sino",
                           on_change=_cb3d_sync_z, args=("live3d_z_sino",),
-                          help="Shared with the Slice view — both track the same slice.")
+                          help="Shared with the Slice view. Both track the same slice.")
             else:
                 m = int(s["live3d_meas"])
                 ang, off, nb = seq3d[m]
@@ -1545,7 +1587,7 @@ def _render_3d_tab():
                 if n_meas > 1:
                     st.slider("Measurement", 0, n_meas - 1, key="live3d_meas")
                 st.caption(
-                    "Every slice's reading for this one measurement, stacked — the image a 2D "
+                    "Every slice's reading for this one measurement, stacked into a 2D "
                     "detector panel behind the volume would record."
                 )
 
@@ -1585,7 +1627,7 @@ def _render_3d_tab():
                     # so no estimate is offered here -- it would be off by two orders.
                     st.warning(
                         "**I0 = %.3g, so degradation is modelled in the solve and each slice "
-                        "gets dramatically more expensive** — measured at 5.7 s per slice "
+                "gets dramatically more expensive**. It was measured at 5.7 s per slice "
                         "with I0 = 0 against over 8 minutes at I0 = 5, for the same geometry. "
                         "%d slices at that rate is hours. Reconstruct with a large stride "
                         "first, or set I0 = 0 to reconstruct the undamaged phantom."
@@ -1611,7 +1653,7 @@ def _render_3d_tab():
                          float(s["live3d_beta"]), float(s["live3d_tv_weight"]))
 
             if go:
-                prog = st.progress(0.0, text="Starting…")
+                prog = st.progress(0.0, text="Starting...")
                 log_box = st.empty()
                 log_lines: list[str] = []
                 _last = [0.0]
@@ -1671,13 +1713,13 @@ def _render_3d_tab():
             else:
                 if res3["key"] != recon_key:
                     st.warning("Parameters or the sequence changed since this stack was "
-                               "solved — press **Reconstruct slices** again to refresh it.")
+                               "solved. Press **Reconstruct slices** again to refresh it.")
                 solved = [k2 for k2 in res3["targets"]
                           if not str(res3["status"][k2]).startswith(("failed", "not solved"))]
                 failed = [k2 for k2 in res3["targets"]
                           if str(res3["status"][k2]).startswith("failed")]
                 if not solved:
-                    st.error("Every slice failed — nothing to stack. See the status table "
+                        st.error("Every slice failed. There is nothing to stack. See the status table "
                              "below; a geometry with too few rays starves the sensitivity step.")
                 else:
                     if failed:
@@ -1690,7 +1732,7 @@ def _render_3d_tab():
                     # reconstruction against its variance leaves the view exactly as set.
                     st.radio("Show", ("Reconstruction", "Variance"), key="live3d_recsrc",
                              horizontal=True,
-                             help="'Variance' is the posterior log10 variance from k_aug — "
+                             help="'Variance' is the posterior log10 variance from k_aug. "
                                   "where this geometry leaves the image uncertain.")
 
                     if s["live3d_recsrc"] == "Variance":
@@ -1716,14 +1758,14 @@ def _render_3d_tab():
                         st.plotly_chart(
                             _volume_figure(
                                 vdata, float(s["live3d_opacity"]), _isomin, _isomax,
-                                "%s — %d of %d slices" % (vlabel, len(solved), n_slices),
+                                "%s: %d of %d slices" % (vlabel, len(solved), n_slices),
                                 vcmap, _hi,
                                 cut_axis=s["live3d_cutaxis"], cut_frac=float(s["live3d_cut"]),
                                 cmin=_lo,
                             ),
                             use_container_width=True,
                         )
-                        st.caption("Range %.4g – %.4g; drawing %.4g – %.4g."
+                        st.caption("Range %.4g to %.4g; drawing %.4g to %.4g."
                                    % (_lo, _hi, _isomin, _isomax))
                     with rv2:
                         finite = [(z, res3["dopt"][z]) for z in solved
@@ -1757,7 +1799,7 @@ def _render_3d_tab():
                     with qc1:
                         st.slider("Opacity", 0.02, 1.0, step=0.01, key="live3d_opacity_rec",
                                   on_change=_cb3d_sync_recview,
-                                  help="Shared with the Volume view — both track one value.")
+                          help="Shared with the Volume view. Both track one value.")
                     with qc2:
                         st.slider("Visible range (%)", 0, 100, step=1,
                                   key="live3d_recband_pct",
@@ -1813,7 +1855,7 @@ def _render_3d_tab():
                        "0 leaves a uniform 0.1 interior; 1 gives ventricles/blobs 0.3 and the "
                        "two floating spheres 0.4; above 1 exaggerates. Brain and skull are not "
                        "scaled, so the crust stays at 1.0 and the Volume colour scale never "
-                       "moves. Nothing inside the skull is ever 0 — that value means air.")
+                       "moves. Nothing inside the skull is ever 0; that value means air.")
         st.number_input("I0 (0 = no degradation)", min_value=0.0, step=0.5,
                         key="live3d_I0")
         st.number_input("alpha", min_value=0.0, step=0.05, format="%.3f", key="live3d_alpha")
@@ -1851,6 +1893,10 @@ _SHRINKAGE_MODES = ("Simultaneous", "Sequential")
 _SHRINKAGE_TV_WEIGHTS = (0.0, 1e-4, 2e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
                   0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 _SHRINKAGE_RESOLUTIONS = (32, 48, 64, 96)
+_SHRINKAGE_NAIVE_METHODS = (
+    "FBP", "SART", "SART (5 passes)", "SART (10 passes)",
+    "Pyomo (1 simultaneous step)",
+)
 from senDOE.models.tomography_2d_shrinkage_decay import ETA_RATIO_TARGET as _ETA_TARGET_SHRINKAGE
 _SHRINKAGE_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.2, 0.5)
 _SHRINKAGE_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
@@ -2009,8 +2055,8 @@ def _render_2d_shrinkage_tab():
                  "are summed against the same starting field, then one decay, one potential "
                  "solve and one transport solve. **Sequential** fires one exposure per row, each "
                  "seeing the damage the previous ones did.\n\nSame total exposure either way, so "
-                 "the difference is fractionation, not dose — and it is large, because "
-                 "`dw = 1 - exp(-sum c I delta)` saturates. Measured at c_omega = 0.4, 10 angles: "
+                 "the difference is fractionation, not dose, and it is large because "
+                 "the converted fraction saturates. Measured at c_omega = 0.4, 10 angles: "
                  "sequential contracts **3.46x** as much. Run the fractionation experiment "
                  "script for the full comparison.")
         act = st.columns(2)
@@ -2019,58 +2065,105 @@ def _render_2d_shrinkage_tab():
         act[1].button("Reset", on_click=_cb_shrinkage_reset, use_container_width=True, key="shrinkage_clear")
         st.checkbox("Show beams", key="shrinkage_showbeams")
         with st.expander("Compaction reach and amplitude", expanded=True):
-            st.slider("l — compaction reach (px)", 0.5, 32.0, step=0.5, key="shrinkage_reach",
+            st.slider("l: compaction reach (px)", 0.5, 32.0, step=0.5, key="shrinkage_reach",
                       help="A PHYSICAL length, so unlike c_cp it transfers across grids. As "
-                           "l → 0 the potential approaches the pointwise driver "
-                           "(l/Δ)²·Pi; l of order "
+                           "as l approaches 0, the potential approaches the pointwise driver "
+                           "the local potential driver; a reach comparable to "
                            "the specimen radius (~15 px here) gives whole-body contraction. "
                            "Below about R/2 the potential is still rim-peaked.")
-            st.slider("c_cp — compaction amplitude", 0.0, 3.0, step=0.05, key="shrinkage_c_cp",
+            st.slider("c_cp: compaction amplitude", 0.0, 3.0, step=0.05, key="shrinkage_c_cp",
                       help="0 turns transport off. Higher values increase transport while the "
                            "implicit solve preserves positivity.")
         with st.expander("Beam, conversion and decay", expanded=True):
-            st.slider("I0 — incident intensity", 0.0, 5.0, step=0.1, key="shrinkage_I0")
-            st.slider("c_omega — conversion", 0.0, 3.0, step=0.05, key="shrinkage_c_omega")
-            st.slider("a — decay", 0.0, 0.5, step=0.005, format="%.3f", key="shrinkage_a",
+            st.slider("I0: incident intensity", 0.0, 5.0, step=0.1, key="shrinkage_I0")
+            st.slider("c_omega: conversion", 0.0, 3.0, step=0.05, key="shrinkage_c_omega")
+            st.slider("a: decay", 0.0, 0.5, step=0.005, format="%.3f", key="shrinkage_a",
                       help="a = b = 0 conserves mass EXACTLY, whatever c_cp does. That is the "
                            "clean shrinkage test: any change in support is then transport alone.")
-            st.slider("b — quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
+            st.slider("b: quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
                       key="shrinkage_b")
-        with st.expander("Transport and potential numerics", expanded=False):
-            st.checkbox(
-                "Auto η from the forward run", key="shrinkage_eta_auto",
-                help="Sets eta = max|dP| / %g from a forward run. No fixed value works: max|dP| "
-                     "spans 0.15 to 80 across this tab's sliders. Too small and the estimation "
-                     "NLP degenerates (at eta = 1e-3, 97%% of IPOPT iterations were "
-                     "Hessian-regularised and inf_du climbed to 6.6e9); too large and the "
-                     "smoothing does the transport's job. Not circular: max|dP| is set in step "
-                     "4, which never reads eta." % _ETA_TARGET_SHRINKAGE)
-            st.select_slider(
-                "eta — softplus smoothing (manual)", options=_SHRINKAGE_ETAS, key="shrinkage_eta",
-                disabled=bool(s["shrinkage_eta_auto"]),
-                format_func=lambda v: "%.0e" % v,
-                help="THE RATE FUNCTION IS NOT ZERO AT ZERO. phi_eta(0) = eta·log2, so at "
-                     "rest both directed rates are c_cp·eta·log2 and a motionless "
-                     "field still diffuses. Set I0 = 0 and raise eta to watch it: the spec says "
-                     "that case must be an exact identity, and it is not. Keep eta well under "
-                     "max |dP| below, or the rate stops discriminating direction.")
-            st.select_slider("f_ref / f_max", options=_SHRINKAGE_FREFS, key="shrinkage_fref",
-                             help="Density at which material starts conducting. The stated rule "
-                                  "— at most a fifth of the smallest interior value — "
-                                  "is NOT sufficient: what must be small is "
-                                  "gamma·exp(-f_int/f_ref)/varsigma, shown as absorp/vs "
-                                  "below. At 0.2 that ratio is ~33 and the specimen does not "
-                                  "move at all, silently.")
-            st.select_slider("gamma — vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
-                             key="shrinkage_gamma", help="Sets how fast the potential decays into "
-                                                  "vacuum. Needs gamma >> 1, but raising it also "
-                                                  "raises absorp/vs.")
-            st.select_slider("Grid", options=_SHRINKAGE_RESOLUTIONS, key="shrinkage_res")
+        # Transport and potential numerics is intentionally hidden from the UI.
+        # with st.expander("Transport and potential numerics", expanded=False):
+        #     st.checkbox(
+        #         "Auto η from the forward run", key="shrinkage_eta_auto",
+        #         help="Sets eta = max|dP| / %g from a forward run. No fixed value works: max|dP| "
+        #              "spans 0.15 to 80 across this tab's sliders. Too small and the estimation "
+        #              "NLP degenerates (at eta = 1e-3, 97%% of IPOPT iterations were "
+        #              "Hessian-regularised and inf_du climbed to 6.6e9); too large and the "
+        #              "smoothing does the transport's job. Not circular: max|dP| is set in step "
+        #              "4, which never reads eta." % _ETA_TARGET_SHRINKAGE)
+        #     st.select_slider(
+        #         "eta — softplus smoothing (manual)", options=_SHRINKAGE_ETAS, key="shrinkage_eta",
+        #         disabled=bool(s["shrinkage_eta_auto"]),
+        #         format_func=lambda v: "%.0e" % v,
+        #         help="THE RATE FUNCTION IS NOT ZERO AT ZERO. phi_eta(0) = eta·log2, so at "
+        #              "rest both directed rates are c_cp·eta·log2 and a motionless "
+        #              "field still diffuses. Set I0 = 0 and raise eta to watch it: the spec says "
+        #              "that case must be an exact identity, and it is not. Keep eta well under "
+        #              "max |dP| below, or the rate stops discriminating direction.")
+        #     st.select_slider("f_ref / f_max", options=_SHRINKAGE_FREFS, key="shrinkage_fref",
+        #                      help="Density at which material starts conducting. The stated rule "
+        #                           "— at most a fifth of the smallest interior value — "
+        #                           "is NOT sufficient: what must be small is "
+        #                           "gamma·exp(-f_int/f_ref)/varsigma, shown as absorp/vs "
+        #                           "below. At 0.2 that ratio is ~33 and the specimen does not "
+        #                           "move at all, silently.")
+        #     st.select_slider("gamma — vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
+        #                      key="shrinkage_gamma", help="Sets how fast the potential decays into "
+        #                                           "vacuum. Needs gamma >> 1, but raising it also "
+        #                                           "raises absorp/vs.")
+        #     st.select_slider("Grid", options=_SHRINKAGE_RESOLUTIONS, key="shrinkage_res")
 
     with right:
         _preset_block("shrinkage", "beam_table_shrinkage", "shrinkage_view_k")
         st.markdown("**Measurement sequence**")
-        st.dataframe(s["beam_table_shrinkage"], use_container_width=True, height=180)
+        st.dataframe(
+            s["beam_table_shrinkage"].rename(columns={
+                "angle_deg": "Angle (degrees)",
+                "offset": "Bundle offset",
+                "n_beams": "Number of beams",
+            }),
+            use_container_width=True, height=180)
+        st.subheader("Solver Tuning")
+        rc = st.columns(4)
+        with rc[0]:
+            st.select_slider("TV regularization weight", options=_SHRINKAGE_TV_WEIGHTS,
+                             key="shrinkage_tv_weight",
+                             format_func=lambda v: "%g" % v,
+                             help="Both objective terms are normalised to O(1) first, so this is a "
+                                  "trade-off **ratio**, not the 2D tab's scale: a value of 1 "
+                                  "means TV and the data fit carry equal weight.\n\nRange runs to "
+                                  "100, well past the point of visible over-smoothing. That is "
+                                  "deliberate: the estimation NLP does not converge at grid 32, and a heavy "
+                                  "TV term is one of the few levers that makes the objective more "
+                                  "strongly convex. Expect a smoother reconstructed sample at high values.")
+        with rc[1]:
+            st.number_input("Max IPOPT iterations", min_value=1500, max_value=8000, step=50,
+                            key="shrinkage_maxiter",
+                            help="Measured at grid 32 / K=5 simultaneous: `optimal` at iteration "
+                                 "**1253**, 219 s (~0.175 s/iter on ma97). Grid 16 converges in "
+                                 "520-642. A cap below ~1500 will cut grid 32 off before it gets "
+                                 "there and report maxIterations, which reads as a failed solve "
+                                 "rather than a truncated one.")
+        with rc[2]:
+            st.selectbox("Linear Solver", options=("ma97", "ma57", "ma27"),
+                         key="shrinkage_linear_solver",
+                         help="The selected solver is tried first. If it fails numerically or is "
+                              "unavailable, reconstruction tries the other supported MA solvers.")
+        with rc[3]:
+            st.selectbox(
+                "Naive reconstruction", options=_SHRINKAGE_NAIVE_METHODS,
+                key="shrinkage_naive_method",
+                help="Comparison panel only. FBP and the selected-pass SART option use the "
+                     "direct damaged sinogram. Pyomo fits all measurements in one simultaneous step with "
+                     "zero incident intensity and no degradation or transport.")
+        actions = st.columns(2)
+        go_shrinkage = actions[0].button(
+            "Reconstruct", type="primary", key="btn_shrinkage_recon",
+            disabled=(n_all == 0), use_container_width=True)
+        go_shrinkage_naive = actions[1].button(
+            "Reconstruct Naive", key="btn_shrinkage_naive_recon",
+            disabled=(n_all == 0), use_container_width=True)
         # NO STANDING DIAGNOSTIC BLOCK. The metrics and the two numeric captions that used to sit
         # here (half-mass / support radius / sign changes / total attenuation, then min f,
         # |colsum-1|, transport residual, phi centre/rim, max |dP|, eta/max|dP|, resting rate,
@@ -2087,75 +2180,19 @@ def _render_2d_shrinkage_tab():
         # conservation are structural here and hold at every setting. The ratio is still in
         # StepInfo6.phi_core_rim for anyone who wants it.
 
-    # --- Reconstruct ------------------------------------------------------------------------
-    # Appended below the live layout rather than given a sub-tab, mirroring the 2D, v2 and v5
-    # tabs. The solve runs the WHOLE table however far the view is scrubbed back, and at the
-    # schedule the toggle selects -- data taken simultaneously must be fitted by the
-    # simultaneous model, or the estimator is inverting dynamics the experiment never ran.
-    st.divider()
-    st.subheader("Reconstruct")
-    st.caption(
-        "Estimate the undamaged field `theta = f_0` from the projections, inverting the "
-        "shrinkage-decay dynamics, then differentiate the estimate with **k_aug** for the per-pixel posterior "
-        "variance. The forward residual gate re-runs on *this* geometry first and the solve is "
-        "**refused** if the Pyomo model has drifted from the simulator — a reconstruction "
-        "against a model that no longer matches would read as a physics result. "
-        "`I0 = 0` is the **control**: it makes the dynamics the identity, so the run is plain "
-        "linear tomography and the number it returns is the estimator alone."
-    )
-    rc = st.columns([1, 1, 1, 2])
-    with rc[0]:
-        st.select_slider("TV weight", options=_SHRINKAGE_TV_WEIGHTS, key="shrinkage_tv_weight",
-                         format_func=lambda v: "%g" % v,
-                         help="Both objective terms are normalised to O(1) first, so this is a "
-                              "trade-off **ratio**, not the 2D tab's scale \u2014 a value of 1 "
-                              "means TV and the data fit carry equal weight.\n\nRange runs to "
-                              "100, well past the point of visible over-smoothing. That is "
-                              "deliberate: the estimation NLP does not converge at grid 32, and a heavy "
-                              "TV term is one of the few levers that makes the objective more "
-                              "strongly convex. Expect a smoothed-out theta at high values.")
-    with rc[1]:
-        st.number_input("Max IPOPT iterations", min_value=1500, max_value=8000, step=50,
-                        key="shrinkage_maxiter",
-                        help="Measured at grid 32 / K=5 simultaneous: `optimal` at iteration "
-                             "**1253**, 219 s (~0.175 s/iter on ma97). Grid 16 converges in "
-                             "520-642. A cap below ~1500 will cut grid 32 off before it gets "
-                             "there and report maxIterations, which reads as a failed solve "
-                             "rather than a truncated one.")
-    with rc[2]:
-        st.number_input("Noise sigma", min_value=0.0, max_value=1.0, step=0.001,
-                        format="%.3f", key="shrinkage_noise",
-                        help="Gaussian noise added to the synthetic projections. 0 is the "
-                             "noiseless case the other tabs use.")
-    with rc[3]:
-        n_rays_shrinkage = sum(len(_bundle_r_values(o, n, res)) for _a, o, n in seq_all)
-        n_obs_shrinkage = n_rays_shrinkage
-        st.caption(
-            "%d measurement%s · %d rays · **%d observations for %d pixels** "
-            "(%.2fx %s) · schedule **%s**"
-            % (n_all, "" if n_all == 1 else "s", n_rays_shrinkage, n_obs_shrinkage, res * res,
-               (n_obs_shrinkage / max(res * res, 1)) if n_obs_shrinkage >= res * res
-               else (res * res / max(n_obs_shrinkage, 1)),
-               "over-determined" if n_obs_shrinkage >= res * res else "UNDER-determined",
-               s["shrinkage_mode"]))
-        if n_obs_shrinkage < res * res:
-            st.caption(
-                ":orange[Under-determined: TV rather than the data chooses among the fields "
-                "that fit, so the optimum is not unique enough to pin theta and individual "
-                "digits should not be quoted. Add measurements or drop the grid.]")
-
-    go_shrinkage = st.button("Reconstruct", type="primary", key="btn_shrinkage_recon",
-                      disabled=(n_all == 0))
-
     # Signature of everything the answer depends on, stored with it: a stale result is reported
     # rather than silently shown. Same guard the v2, v5 and 3D surfaces use.
     shrinkage_key = (seq_all, res, float(s["shrinkage_depth"]), float(s["shrinkage_I0"]), float(s["shrinkage_c_omega"]),
               float(s["shrinkage_c_cp"]), float(s["shrinkage_a"]), float(s["shrinkage_b"]), float(s["shrinkage_reach"]),
               float(s["shrinkage_gamma"]), float(s["shrinkage_fref"]), float(s["shrinkage_eta"]),
               str(s["shrinkage_mode"]), float(s["shrinkage_tv_weight"]), int(s["shrinkage_maxiter"]),
-              float(s["shrinkage_noise"]))
+              str(s["shrinkage_linear_solver"]))
+    naive_key = shrinkage_key + (str(s["shrinkage_naive_method"]),)
 
-    if go_shrinkage:
+    # A full reconstruction refreshes the naïve result too, so Naive fit RMSE always refers to
+    # the same current sequence and physics settings. The dedicated button still runs naïve only.
+    run_naive = bool(go_shrinkage_naive or go_shrinkage)
+    if go_shrinkage or run_naive:
         log_box = st.empty()
         log_lines: list[str] = []
         _last = [0.0]
@@ -2189,68 +2226,101 @@ def _render_2d_shrinkage_tab():
             gamma=float(s["shrinkage_gamma"]), f_ref_frac=float(s["shrinkage_fref"]),
             eta=(None if bool(s["shrinkage_eta_auto"]) else float(s["shrinkage_eta"])),
             tv_weight=float(s["shrinkage_tv_weight"]),
-            noise_sigma=float(s["shrinkage_noise"]), ipopt_max_iter=int(s["shrinkage_maxiter"]))
-        with st.spinner("Solving the estimation NLP, then k_aug…"):
-            try:
-                out = run_shrinkage_decay_reconstruction(params_shrinkage, log_callback=_shrinkage_log)
-                st.session_state["results_shrinkage"] = {"res": out, "key": shrinkage_key}
-            except Exception as exc:
-                st.session_state.pop("results_shrinkage", None)
-                st.error("Reconstruction failed: %s" % exc)
-            finally:
-                _render_shrinkage_log()
+            naive_method=str(s["shrinkage_naive_method"]),
+            noise_sigma=0.0, ipopt_max_iter=int(s["shrinkage_maxiter"]),
+            linear_solver=str(s["shrinkage_linear_solver"]))
+        if go_shrinkage:
+            with st.spinner("Solving the estimation NLP, then k_aug..."):
+                try:
+                    out = run_shrinkage_decay_reconstruction(
+                        params_shrinkage, log_callback=_shrinkage_log)
+                    st.session_state["results_shrinkage"] = {"res": out, "key": shrinkage_key}
+                except Exception as exc:
+                    st.session_state.pop("results_shrinkage", None)
+                    st.error("Reconstruction failed: %s" % exc)
+                finally:
+                    _render_shrinkage_log()
+        if run_naive:
+            with st.spinner("Computing the selected naive reconstruction..."):
+                try:
+                    out = run_naive_shrinkage_reconstruction(
+                        params_shrinkage, log_callback=_shrinkage_log)
+                    st.session_state["results_shrinkage_naive"] = {
+                        "res": out, "key": naive_key}
+                except Exception as exc:
+                    st.session_state.pop("results_shrinkage_naive", None)
+                    st.error("Naive reconstruction failed: %s" % exc)
+                finally:
+                    _render_shrinkage_log()
 
     stash_shrinkage = st.session_state.get("results_shrinkage")
+    regular = stash_shrinkage["res"] if stash_shrinkage else None
+    stash_naive = st.session_state.get("results_shrinkage_naive")
+    naive = stash_naive["res"] if stash_naive else None
+    naive_error_pct = "n/a"
+    naive_fit_rms = "n/a"
+    if naive is not None and getattr(naive, "theta_naive", None) is not None:
+        naive_truth = np.asarray(naive.theta_true, dtype=float)
+        naive_image = np.asarray(naive.theta_naive, dtype=float)
+        if np.isfinite(naive_truth).all() and np.isfinite(naive_image).all():
+            naive_scale = max(float(np.abs(naive_truth).max()), 1e-30)
+            naive_error_pct = "%.3f%%" % (
+                100.0 * float(np.sqrt(np.mean((naive_image - naive_truth) ** 2))) /
+                naive_scale)
+        if np.isfinite(getattr(naive, "fit_rms", np.nan)):
+            naive_fit_rms = "%.3e" % naive.fit_rms
     if stash_shrinkage:
-        out = stash_shrinkage["res"]
+        out = regular
         if stash_shrinkage["key"] != shrinkage_key:
-            st.warning("These results are STALE — a setting changed since they were "
+            st.warning("These results are STALE. A setting changed since they were "
                        "computed. Press Reconstruct again.")
         ok = out.status == "optimal"
         (st.success if ok else st.warning)(
             "%s in %.1f s on %s · %d variables, %d constraints · %s iterations"
             % (out.status, out.t_solve, out.linear_solver, out.n_vars, out.n_cons, out.iters))
-        mm = st.columns(4)
-        mm[0].metric("theta error", "%.3f%%" % out.theta_pct_peak,
-                     help="RMS of (estimate - truth) as a percent of peak theta. **The number "
-                          "to quote**, and only when the geometry is over-determined.")
-        mm[1].metric("Fit RMS", "%.3e" % out.obs_rms,
+        mm = st.columns(6)
+        mm[0].metric("Reconstruction error", "%.3f%%" % out.theta_pct_peak,
+                     help="RMS difference between the reconstructed sample and the original "
+                          "sample, as a percent of the original sample peak.")
+        mm[1].metric("Naïve reconstruction error", naive_error_pct,
+                     help="RMS difference between the naïve reconstructed sample and the original "
+                          "sample, as a percent of the original sample peak.")
+        mm[2].metric("Fit RMSE", "%.3e" % out.obs_rms,
                      help="Residual of the projections the NLP actually minimised.")
-        mm[2].metric("D-optimality",
+        mm[3].metric("Naive fit RMSE", naive_fit_rms,
+                     help="RMS projection residual after re-integrating the naïve image along "
+                          "the measured rays.")
+        mm[4].metric("D-optimality",
                      "%.4g" % out.d_optimality if out.d_optimality == out.d_optimality else "n/a",
-                     help="log-det of the posterior covariance J·σ²·Jᵀ. "
+                     help="Log-determinant of the posterior covariance derived from reconstruction "
+                          "sensitivity to the measured projections. "
                           "Lower is a more informative design.")
-        mm[3].metric("Half-mass change", "%+.3f%%" % out.half_pct,
+        mm[5].metric("Half-mass change", "%+.3f%%" % out.half_pct,
                      help="What the damage did to the TRUE field. If this is ~0 the dynamics "
                           "barely moved anything and inverting them proved little.")
-        st.caption(
-            "forward gate **%.1e** · start residual **%.1e** (dynamically feasible) · "
-            "continuation **%s** · Hessian regularised on **%d of %d** iterations · "
-            "max |dP| **%.3g** · eta **%.4g** (%s, max|dP|/eta **%.1f**)"
-            % (out.forward_residual, out.init_residual, out.continuation_status,
-               out.regularised, out.n_iter_lines, out.dP_max,
-               out.eta_used, "auto" if out.eta_auto else "manual", out.eta_ratio))
         if out.uq_error:
             st.info(
                 "**k_aug did not return a covariance** (the reconstruction is kept): %s\n\n"
                 "This is non-fatal by design. The covariance is intentionally rank deficient "
-                "— a starved geometry leaves pixels that no ray constrains — so a "
+                ". A starved geometry leaves pixels that no ray constrains, so a "
                 "singular KKT system is a statement about the *design*, not a bug. Add "
                 "measurements or angles to condition it." % out.uq_error)
-        elif out.log_cov_diag_2D is not None:
-            lv = out.log_cov_diag_2D
-            st.caption(
-                "posterior variance: log10 range **%.2f to %.2f** · condition number "
-                "**%.2e** · k_aug took **%.1f s**"
-                % (np.nanmin(lv), np.nanmax(lv), out.uq_conditioning, out.t_uq))
-        # Same figure the 2D reconstruction surface draws -- its result object carries the same
-        # implementation rather than a fourth copy of the same four panels.
-        st.pyplot(_v2_recon_figure(out), use_container_width=True)
+    if stash_naive:
+        if stash_naive["key"] != naive_key:
+            st.warning("Naive results are STALE. A setting changed since they were "
+                       "computed. Press Reconstruct Naive again.")
+        if getattr(naive, "error", ""):
+            st.warning("Naive comparison (%s) was unavailable: %s" %
+                       (getattr(naive, "method", "selected method"), naive.error))
+
+    if regular is not None or naive is not None:
+        st.pyplot(_shrinkage_recon_figure(regular, naive), use_container_width=True)
         st.caption(
-            "**theta** is the undamaged field the estimator is after; the damage is what the "
-            "measurements caused on the way. **log10 posterior variance** is the per-pixel "
-            "diagonal of J·σ²·Jᵀ with J = d(theta)/d(y) from k_aug: "
-            "bright pixels are the ones this geometry constrains worst."
+            "**Reconstruct** refreshes both rows; **Reconstruct Naive** refreshes only the "
+            "first row. The naïve result treats post-damage measurements as a static "
+            "reconstruction problem and ignores the shrinkage-decay physics. "
+            "The uncertainty panel shows the diagonal of the sensitivity-derived posterior "
+            "covariance from k_aug."
         )
 
 
@@ -2341,7 +2411,7 @@ with tab_2d:
                    "sequence.")
         cc = st.columns(3)
         cc[0].number_input("I0", min_value=0.0, step=0.5, key="live_I0",
-                           help="Beam intensity (≥ 0). 0 → no dose degradation (the image is not "
+                    help="Beam intensity (≥ 0). At 0, there is no dose degradation (the image is not "
                                 "darkened by measurements).")
         cc[1].number_input("alpha", step=0.05, format="%.3f", key="live_alpha")
         cc[2].number_input("beta", step=0.01, format="%.4f", key="live_beta")
@@ -2351,14 +2421,14 @@ with tab_2d:
                     help="Apply a measurement at the current angle/offset/#beams and append it to "
                          "the sequence table.")
         b[1].button("Reset", on_click=_cb_reset, use_container_width=True,
-                    help="Clear the sequence — back to the clean phantom.")
+                    help="Clear the sequence and return to the clean phantom.")
         b[2].button("Toggle beams", on_click=_cb_toggle, use_container_width=True)
 
         st.subheader("Solver Tuning")
         st.slider("TV regularization weight", 0.0, 1.0, step=0.01, key="live_tv_weight",
                   help="Total-variation penalty in the reconstruction objective (higher = smoother; "
                        "0 disables it). Used only by Reconstruct. Very low values with few or clustered "
-                       "angles can make the UQ/sensitivity step fail (singular system) — raise this or "
+                       "angles can make the UQ/sensitivity step fail (singular system). Raise this or "
                        "add more evenly-spaced angles if Reconstruct reports a UQ failure.")
 
         reconstruct_clicked = st.button("Reconstruct", type="primary",
@@ -2371,7 +2441,7 @@ with tab_2d:
 
         st.subheader("Measurement sequence")
         st.caption(
-            "Each measurement you take is recorded here — angle (°), offset (bundle center), #beams "
+            "Each measurement you take is recorded here: angle (°), offset (bundle center), #beams "
             "(0 = full fan). The **highlighted** row is the one currently shown on the left."
         )
         # Read-only view (st.dataframe, not st.data_editor) so the sequence can't be edited by an
@@ -2432,7 +2502,7 @@ with tab_2d:
         with _log_slot.container():
             if param_cols > 5000 or total_rays > 2000:
                 st.warning(
-                    f"⚠️ ~{param_cols:,} sensitivity parameter columns / {total_rays:,} rays — the "
+                    f"⚠️ ~{param_cols:,} sensitivity parameter columns / {total_rays:,} rays. The "
                     "sensitivity + covariance step may take many minutes or run out of memory. "
                     "Tip: integer or 0.5-grid offsets reuse the detector grid and stay cheaper."
                 )
@@ -2453,7 +2523,7 @@ with tab_2d:
                     _last_render[0] = now
                     _render_log()
 
-            with st.spinner("Solving forward + inverse problem and extracting sensitivity…"):
+            with st.spinner("Solving forward + inverse problem and extracting sensitivity..."):
                 try:
                     results = run_simple_uq(params, log_callback=log_callback)
                     st.session_state["results"] = results
