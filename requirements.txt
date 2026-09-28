@@ -4,6 +4,10 @@
 idaes-pse==2.10.0
 pyomo==6.10.0
 
+# Canonical tomography and sensitivity library. Pin an immutable source revision so Docker/Fly
+# builds do not silently change when the upstream branch advances.
+senDOE @ git+https://github.com/sanqdinh/sDOE_senNLP.git@64d86c32199f324b46b06ed67f0227548a0dd801
+
 # Scientific stack
 numpy==1.26.4
 scipy==1.13.1

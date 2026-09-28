@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Base = the exact platform the IDAES prebuilt solver binaries target
 # (idaes get-extensions resolves ubuntu2204-x86_64 here). IPOPT/k_aug link only against
 # standard Ubuntu 22.04 shared libs and statically embed HSL (incl. ma86), so this is the
@@ -24,16 +25,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgcc-s1 \
         libquadmath0 \
         libbz2-1.0 \
+        git \
         wget \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 2) Python dependencies (all wheels; no compilation).
+# 2) Python dependencies. senDOE is fetched from a private Git repository; the BuildKit secret
+# is read only by git's askpass helper and is removed before the layer is committed.
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
-    && python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip
+RUN --mount=type=secret,id=sendoe_read_token \
+    set -eu; \
+    askpass=/tmp/sendoe-git-askpass; \
+    printf '%s\n' '#!/bin/sh' \
+        'case "$$1" in' \
+        '*Username*) echo x-access-token ;;' \
+        '*Password*) cat /run/secrets/sendoe_read_token ;;' \
+        '*) exit 1 ;;' \
+        'esac' > "$$askpass"; \
+    chmod 700 "$$askpass"; \
+    GIT_ASKPASS="$$askpass" GIT_TERMINAL_PROMPT=0 \
+        python3 -m pip install --no-cache-dir -r requirements.txt; \
+    rm -f "$$askpass"
 
 # 3) Install the native solver binaries to a FIXED, user-independent location.
 #    IDAES_DATA (set above) makes get-extensions install to /opt/idaes/bin regardless of
@@ -65,13 +80,11 @@ s.options['linear_solver']='ma97'; r=s.solve(m); \
 assert abs(pyo.value(m.x)-3.0) < 1e-6, pyo.value(m.x); \
 print('IPOPT linear solver ma97 present and solving:', r.solver.termination_condition)"
 
-# 6) Application code + vendored senDOE (senDOE/ at /app => importable as top-level `senDOE`).
-COPY senDOE/ ./senDOE/
+# 6) Application code. senDOE is installed from its pinned Git revision in requirements.txt.
 COPY .streamlit/ ./.streamlit/
 COPY frontend/ ./frontend/
-# The live shrinkage-decay model (the v6 tab) is in senDOE/models, copied above with the rest of
-# senDOE. archives/ (the failed v2 prototypes) is deliberately NOT copied: nothing imports it,
-# and the image must build without it. A module missing here is simply absent from the image.
+# archives/ contains historical prototypes and is deliberately not copied: nothing imports it,
+# and the image must build without it.
 COPY app.py ./
 
 # 6b) Materialize plotly.min.js for the 3D Volume component from THIS image's plotly, so the
@@ -84,7 +97,7 @@ src=os.path.join(os.path.dirname(plotly.__file__),'package_data','plotly.min.js'
 shutil.copyfile(src, '/app/frontend/volume_sim_component/plotly.min.js'); \
 print('plotly.min.js staged: %.1f MB' % (os.path.getsize(src)/1e6))"
 
-# 7) Build-time make-or-break checks: vendored package imports, and IPOPT solves end-to-end.
+# 7) Build-time make-or-break checks: installed package imports, and IPOPT solves end-to-end.
 RUN python3 -c "import senDOE; print('senDOE import OK')" \
     && python3 -c "import plotly.graph_objects as go; go.Volume(); print('plotly OK')" \
     && test -s /app/frontend/volume_sim_component/plotly.min.js \
