@@ -1,38 +1,36 @@
-"""Pyomo transcription of v6, the implicit-transport damage model: forward gates and estimation.
+"""Pyomo transcription of the shrinkage-decay damage model: forward gates and estimation.
 
-The v6 counterpart of :mod:`degrade_v5_uq`.  Two halves, split by the ``--- estimation ---``
-banner partway down the file:
+The NLP counterpart of :mod:`senDOE.models.tomography_2d_shrinkage_decay`.  Two halves, split by the
+``--- estimation ---`` banner partway down the file:
 
-* **forward** -- :func:`build_v6_model`, and the gates that check it against
-  :func:`degrade_v6.simulate`: :func:`check_forward` (residual, solver-free, in the Docker
-  build), :func:`forward_solve` (IPOPT, not in the build) and :func:`check_softplus_lifting`.
+* **forward** -- :func:`build_shrinkage_decay_model`, and the gates that check it against
+  :func:`senDOE.models.tomography_2d_shrinkage_decay.simulate`: :func:`check_forward` (residual,
+  solver-free, in the Docker build), :func:`forward_solve` (IPOPT, not in the build) and
+  :func:`check_softplus_lifting`.
   :func:`_cli` runs these.
 * **estimation** -- :func:`add_estimation_objective`, :func:`initialize_from_numpy`,
-  :class:`V6UQParams` / :class:`V6UQResults`, :func:`run_v6_reconstruction` -- which ends in
-  k_aug for the pixel covariance and D-optimality, non-fatal exactly as in ``degrade_v2_uq`` --
-  and :func:`check_scaling`.
-
-An earlier version of this docstring said "forward direction only ... no estimation NLP, no
-objective, no k_aug".  That was true until the second half was written; it is kept here only so
-the claim is not mistaken for current if it resurfaces in an old copy.
+  :class:`ShrinkageDecayUQParams` / :class:`ShrinkageDecayUQResults`,
+  :func:`run_shrinkage_decay_reconstruction` -- which ends in k_aug for the pixel covariance and
+  D-optimality, non-fatal by design -- and :func:`check_scaling`.
 
 The forward gates must pass before anything in the second half means a thing, which is why
-:func:`run_v6_reconstruction` re-runs the residual gate on the caller's OWN geometry rather than
-trusting the one baked into the Docker build.  There is no ``--reconstruct`` CLI: :func:`_cli`
-covers only the gates, so a long reconstruction needs the Streamlit tab or a driver script.
+:func:`run_shrinkage_decay_reconstruction` re-runs the residual gate on the caller's OWN geometry
+rather than trusting the one baked into the Docker build.  There is no ``--reconstruct`` CLI:
+:func:`_cli` covers only the gates, so a long reconstruction needs the Streamlit tab or a driver
+script.
 
-Same checking discipline as v2 and v5: the reference trajectory comes from
-:func:`degrade_v6.simulate`, which is numpy and scipy, so the model and the thing it is checked
-against stay two independent implementations of section 3.2.  Read the methodological lesson in
+The reference trajectory comes from :func:`senDOE.models.tomography_2d_shrinkage_decay.simulate`,
+which is numpy and scipy, so the model and the thing it is checked against stay two independent
+implementations of section 3.2.  Read the methodological lesson in
 CLAUDE.md before trusting the residual: agreeing to 1e-16 proves a shared *convention*,
 including a wrong one.  What earns trust here is that the two implementations solve steps 5-6 by
 completely different routes -- numpy factorises a sparse matrix and back-substitutes, Pyomo hands
 the same rows to IPOPT as constraints and never forms the matrix -- so a residual at round-off
 says the ROWS agree, not merely that one call reproduced another.
 
-Blocks per stage: ``S`` (the shielding chain), ``Ipix``, ``dw``, ``ft``, ``sig``, ``Pi``, ``phi``
--- all v5's, unchanged, because steps 1 to 4 are unchanged -- then ``sp`` on directed faces and
-the implicit mass row, which are v6's.
+Blocks per stage: ``S`` (the shielding chain), ``L``, ``Ipix``, ``Z``, ``dw``, ``ft`` (steps 1-3),
+``Pi``, ``sig``, ``phi`` (step 4), then ``sp`` on directed faces (step 5) and the implicit mass
+row (step 6).
 
 THE ONE REAL TRANSCRIPTION PROBLEM: softplus
 --------------------------------------------
@@ -47,8 +45,8 @@ That is not a hypothetical margin.  Measured over the tab's own slider ranges (g
     c_omega = 0.4  ->  max |dP| = 0.80 .. 3.79    naive form dies at eta <= 1e-3  (the default)
     c_omega = 3.0  ->  max |dP| = 2.59 .. 80.3    naive form dies at every eta the tab offers
 
-``c_omega = 0.4`` is the setting ``experiment_v6_fractionation.py`` runs at, so the direct
-transcription would fail on a configuration already in the repo, at the default ``eta``.
+``c_omega = 0.4`` is a setting the fractionation experiment runs at, so the direct
+transcription would fail on a configuration already in use, at the default ``eta``.
 
 It is not fixable by clamping either: subsec:system itself says the function "should be
 implemented with a stable softplus routine rather than by forming ``exp(z/eta)`` directly".
@@ -80,7 +78,7 @@ The implicit mass balance is EASIER here than in numpy
 ``eq:xd_implicit_transport`` is a global sparse solve for the numpy model.  In the NLP it is just
 a row -- ``f_{k+1}`` is already a variable, so the solver's own factorisation does the work and
 nothing is nested.  It is bilinear in ``(sp, f)``, so its second derivatives are constants.  Same
-argument v5 makes for lifting ``phi``.
+argument as for lifting ``phi``.
 """
 
 from __future__ import annotations
@@ -92,16 +90,47 @@ from typing import Optional
 import numpy as np
 import pyomo.environ as pyo
 
-from degrade_v2 import scale_to_optical_depth
-from degrade_v2_uq import measurement_rays, solve_with_fallback
-from degrade_v3_uq import _neighbours
-# TV and the IPOPT-log parser are v5's and unchanged by the v6 diff: _tv_expression reads only
-# m.f[:,0] and m.res, so it works on a v6 model as-is. Importing beats a second copy -- v2's TV
-# hardcodes eps = 1e-4, which swamps a theta peaking near 0.03, and v5 already fixed that.
-from degrade_v5_uq import _tv_expression, _reg_fraction
-from degrade_v6 import (V6Params, simulate, simulate_simultaneous, resolve, softplus,
-                        compaction_potential, shape_diagnostics, select_eta,
-                        ETA_RATIO_LO, ETA_RATIO_HI, _phantom, _demo_sequence)
+from senDOE.helpers.dose import scale_to_optical_depth
+from senDOE.helpers.nlp_scaling import scaling_report
+from senDOE.helpers.phantoms import demo_sequence, phantom
+from senDOE.helpers.rays import measurement_rays
+from senDOE.helpers.shape_metrics import shape_diagnostics
+from senDOE.helpers.solvers import reg_fraction, solve_with_fallback
+from senDOE.models.tomography_2d_shrinkage_decay import (
+    ShrinkageDecayParams, simulate, simulate_simultaneous, resolve, softplus,
+    compaction_potential, select_eta, ETA_RATIO_LO, ETA_RATIO_HI)
+
+
+def _neighbours(q, res):
+    """The four face neighbours of flat index ``q``, as ``(neighbour, )`` tuples that exist."""
+    i, j = q // res, q % res
+    out = []
+    if j > 0:
+        out.append(q - 1)
+    if j < res - 1:
+        out.append(q + 1)
+    if i > 0:
+        out.append(q - res)
+    if i < res - 1:
+        out.append(q + res)
+    return out
+
+
+def _tv_expression(m, theta_scale: float):
+    """Smoothed total variation of ``theta = f[:, 0]``.
+
+    ``eps`` scales with ``theta``: a fixed ``1e-4`` would swamp a ``theta`` peaking near 0.03.
+    """
+    res = m.res
+    eps = (1e-2 * theta_scale) ** 2
+    tv = 0.0
+    for i in range(res):
+        for j in range(res):
+            q = i * res + j
+            d0 = (m.f[q + res, 0] - m.f[q, 0]) if i < res - 1 else 0.0
+            d1 = (m.f[q + 1, 0] - m.f[q, 0]) if j < res - 1 else 0.0
+            tv += pyo.sqrt(d0 ** 2 + d1 ** 2 + eps)
+    return tv
 
 
 def _measurements(seq, res, simultaneous: bool):
@@ -111,7 +140,8 @@ def _measurements(seq, res, simultaneous: bool):
     below accumulate ``I_terms``/``Id_terms`` per ``(pixel, k)`` over all rays of measurement
     ``k``, so putting every angle's rays in one entry sums their dose fields before the single
     decay, potential solve and transport solve -- which is what
-    :func:`degrade_v6.step_simultaneous` does.  The merged entry's angle is unused downstream.
+    :func:`senDOE.models.tomography_2d_shrinkage_decay.step_simultaneous` does.  The merged entry's
+    angle is unused downstream.
     """
     meas = measurement_rays(seq, res)
     if not simultaneous or len(meas) <= 1:
@@ -122,14 +152,15 @@ def _measurements(seq, res, simultaneous: bool):
 
 # --- model ---------------------------------------------------------------------------------
 
-def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None,
-                   potential: bool = True, simultaneous: bool = False):
+def build_shrinkage_decay_model(theta_ref, seq, p: ShrinkageDecayParams, image_res: int, *,
+                                f_bounds=None, potential: bool = True,
+                                simultaneous: bool = False):
     """Steps 1-7 of section 3.2 as a Pyomo model.  ``theta_ref`` seeds every variable.
 
     ``potential=False`` omits the ``Pi``/``sig``/``phi``/``sp`` blocks entirely and is legal ONLY
-    at ``c_cp == 0``, where the mass row reads none of them.  Same switch, and the same reason,
-    as ``degrade_v5_uq.build_v5_model``: it exists so an ``I0 = 0, c_cp = 0`` continuation is
-    actually cheaper than the problem it initialises rather than the same size.
+    at ``c_cp == 0``, where the mass row reads none of them.  It exists so an
+    ``I0 = 0, c_cp = 0`` continuation is actually cheaper than the problem it initialises rather
+    than the same size.
     """
     theta_ref = np.asarray(theta_ref, dtype=float)
     p = resolve(p, theta_ref)
@@ -147,7 +178,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     if not (p.eta > 0.0):
         raise ValueError("eta = %r: eq:xd_rate_function needs eta > 0." % (p.eta,))
 
-    m = pyo.ConcreteModel(name="degrade_v6")
+    m = pyo.ConcreteModel(name="shrinkage_decay")
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
     m.seq, m.theta_ref = tuple(tuple(x) for x in seq), np.array(theta_ref, dtype=float)
     m.has_potential = bool(potential)
@@ -197,7 +228,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
     # turning what should be a handful of entries into a dense block. Lifting L makes c_Ipix and
     # the dose sum LINEAR and leaves exactly one exp per row, each of a single variable. Same
     # feasible set, same solution: this is a change of algebra, not of model. It is the same
-    # argument v5 makes for lifting Pi, sigma and phi rather than inlining them.
+    # argument as for lifting Pi, sigma and phi rather than inlining them.
     m.LX = pyo.Set(initialize=sorted({i for ts in I_terms.values() for i in ts}),
                    dimen=3, ordered=True)
     # c_L uniquely makes L positive. A redundant L >= 0 bound violates LICQ at I0 = 0, where
@@ -243,7 +274,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
         return mm.ft[q, k] == mm.f[q, k] * pyo.exp(expo)
     m.c_ft = pyo.Constraint(m.PIX, m.TM, rule=_ftc)
 
-    # --- 4. the compaction potential: Pi, sigma, then the elliptic row. All v5's. ----------
+    # --- 4. the compaction potential: Pi, sigma, then the elliptic row. ------------------
     fm = float(p.f_max)
     vsig = float(p.varsigma())
     gam = float(p.gamma)
@@ -307,7 +338,7 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
             return acc == mm.Pi[q, k]
         m.c_phi = pyo.Constraint(m.PIX, m.TM, rule=_phic)
 
-        # --- 5. the directed rates. THE v6 BLOCK. See the module docstring for why this is
+        # --- 5. the directed rates. See the module docstring for why this is
         # lifted rather than written as eta*log(1+exp(dP/eta)) -- the direct form overflows at
         # |dP| > 709.8*eta, which this model reaches.
         #
@@ -370,10 +401,11 @@ def build_v6_model(theta_ref, seq, p: V6Params, image_res: int, *, f_bounds=None
 
 # --- pinning and the gate ---------------------------------------------------------------
 
-def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool = False):
-    """Every variable of the model, taken off a :mod:`degrade_v6` run.
+def numpy_trajectory(theta, seq, p: ShrinkageDecayParams, image_res: int,
+                     simultaneous: bool = False):
+    """Every variable of the model, taken off a numpy forward run.
 
-    ``simultaneous`` picks :func:`degrade_v6.simulate_simultaneous` and the collapsed ray list,
+    ``simultaneous`` picks :func:`simulate_simultaneous` and the collapsed ray list,
     so the trajectory and the model it is pinned into describe the same schedule.
     """
     p = resolve(p, theta)
@@ -403,7 +435,7 @@ def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool
 
     # Through compaction_potential, NOT a local spsolve: that call carries the exact M-matrix
     # bound of eq:xd_potential_bound, and a sparse direct solver handed a near-singular operator
-    # returns a large finite answer rather than an error. Same reason v5's does.
+    # returns a large finite answer rather than an error.
     Pi = np.zeros_like(ft)
     sig = np.zeros_like(ft)
     phi = np.zeros_like(ft)
@@ -412,7 +444,7 @@ def numpy_trajectory(theta, seq, p: V6Params, image_res: int, simultaneous: bool
                                                 dw[:, k].reshape(res, res), p)
         phi[:, k], Pi[:, k], sig[:, k] = ph_k.ravel(), pi_k.ravel(), sg_k.ravel()
 
-    # sp on directed faces, straight off degrade_v6.softplus -- the same logaddexp the forward
+    # sp on directed faces, straight off softplus -- the same logaddexp the forward
     # model uses, so the gate is comparing the Pyomo ROWS against it rather than against a
     # second hand-written softplus.
     sp = {}
@@ -505,18 +537,19 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
     now defaults to -- both must hold, and they are different models: K = 1 with every ray in
     one measurement, against K = n_steps with one each.  Returns the worst residual.
     """
-    p = V6Params(**kw)
-    seq = _demo_sequence(n_steps)
-    theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
+    p = ShrinkageDecayParams(**kw)
+    seq = demo_sequence(n_steps)
+    theta = scale_to_optical_depth(phantom(image_res), 1.1, image_res)
     traj = numpy_trajectory(theta, seq, p, image_res, simultaneous=simultaneous)
-    m = build_v6_model(theta, seq, p, image_res, simultaneous=simultaneous)
+    m = build_shrinkage_decay_model(theta, seq, p, image_res, simultaneous=simultaneous)
     pin_model(m, traj)
     r, where, blocks = max_residual(m, by_block=True)
     if verbose:
         pr = resolve(p, theta)
         dP = max(abs(traj["phi"][b, k] - traj["phi"][a, k])
                  for (a, b, k) in traj["sp"]) if traj["sp"] else 0.0
-        print("  v6 Pyomo vs numpy: grid %d, %d rows, %s, c_cp=%g, eta=%g -> %.3e (%s)  %s"
+        print("  shrinkage-decay Pyomo vs numpy: grid %d, %d rows, %s, c_cp=%g, eta=%g -> %.3e "
+              "(%s)  %s"
               % (image_res, n_steps, "SIMULTANEOUS (K=1)" if simultaneous else "sequential",
                  pr.c_cp, pr.eta, r, where or "-", "PASS" if r < 1e-10 else "FAIL"))
         for name in sorted(blocks):
@@ -528,14 +561,14 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True,
         # a ratio of 183 look like comfortable margin when it was 6.5x past the edge.
         ratio = dP / pr.eta if pr.eta else float("inf")
         note = ("ok" if ETA_RATIO_LO <= ratio <= ETA_RATIO_HI else
-                "OUTSIDE the %.0f..%.0f window -- see degrade_v6.select_eta"
+                "OUTSIDE the %.0f..%.0f window -- see select_eta"
                 % (ETA_RATIO_LO, ETA_RATIO_HI))
         print("      max |dP| = %.4g, eta = %.3g -> max |dP|/eta = %.1f  (%s)"
               % (dP, pr.eta, ratio, note))
     return r
 
 
-def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma97",
+def forward_solve(theta, seq, p: ShrinkageDecayParams, image_res: int, *, linear_solver="ma97",
                   max_iter=3000, tol=1e-8, verbose=True, log_callback=None,
                   simultaneous: bool = False):
     """G2: fix ``f[:, 0] = theta`` and let IPOPT FIND the trajectory from the undamaged field.
@@ -547,7 +580,7 @@ def forward_solve(theta, seq, p: V6Params, image_res: int, *, linear_solver="ma9
     theta = np.asarray(theta, dtype=float)
     p = resolve(p, theta)
     res = int(image_res)
-    m = build_v6_model(theta, seq, p, res, simultaneous=simultaneous)
+    m = build_shrinkage_decay_model(theta, seq, p, res, simultaneous=simultaneous)
     flat = theta.ravel()
     for q in m.PIX:
         m.f[q, 0].set_value(float(flat[q]))
@@ -632,15 +665,15 @@ def _cli(argv=None):
     ap.add_argument("--f-ref-frac", type=float, default=0.002)
     ap.add_argument("--eta", type=float, default=None,
                     help="softplus smoothing. Omit to CHOOSE it from a forward run "
-                         "(degrade_v6.select_eta); a value here overrides that.")
+                         "(select_eta); a value here overrides that.")
     ap.add_argument("--linear-solver", default="ma97")
     ap.add_argument("--max-iter", type=int, default=3000)
     a = ap.parse_args(argv)
 
     # The GATES take a concrete eta -- they are residual/feasibility checks and do not care how
     # well conditioned it is, so `--eta` omitted just means the historical 1e-3 for them. Only
-    # run_v6_reconstruction interprets None as "choose it", because only it has a solve whose
-    # conditioning depends on the answer.
+    # run_shrinkage_decay_reconstruction interprets None as "choose it", because only it has a
+    # solve whose conditioning depends on the answer.
     kw = dict(I0=a.I0, c=a.c, a=a.a, b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
               f_ref_frac=a.f_ref_frac, eta=(1e-3 if a.eta is None else a.eta))
     print(__doc__.splitlines()[0])
@@ -652,24 +685,19 @@ def _cli(argv=None):
     ok = max(r, r_sim) < 1e-10
     if a.solve:
         print()
-        theta = scale_to_optical_depth(_phantom(a.image_res), 1.1, a.image_res)
+        theta = scale_to_optical_depth(phantom(a.image_res), 1.1, a.image_res)
         for sim in (False, True):
-            rel = forward_solve(theta, _demo_sequence(a.n_steps), V6Params(**kw), a.image_res,
-                                linear_solver=a.linear_solver, max_iter=a.max_iter,
+            rel = forward_solve(theta, demo_sequence(a.n_steps), ShrinkageDecayParams(**kw),
+                                a.image_res, linear_solver=a.linear_solver, max_iter=a.max_iter,
                                 simultaneous=sim)
             ok = ok and rel < 20 * 1e-8
     return 0 if ok else 1
 
 
-if __name__ == "__main__":
-    import sys
-    sys.exit(_cli())
-
-
 # --- estimation ----------------------------------------------------------------------------
 # Everything below is the inverse direction. The forward gates above must pass before any of it
-# means anything, and run_v6_reconstruction re-runs the residual gate on the caller's own
-# geometry rather than trusting the one in the Docker build.
+# means anything, and run_shrinkage_decay_reconstruction re-runs the residual gate on the
+# caller's own geometry rather than trusting the one in the Docker build.
 
 def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     """Fit the observations of ``eq:xd_obs_damage``, regularised by TV on ``theta``.
@@ -678,8 +706,8 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     parameters k_aug differentiates with respect to.  Declared only over the rays actually
     fired, so there are no structurally-dead columns to prune before the sensitivity extraction.
 
-    Both terms are normalised to O(1) before being weighed against each other.  Same reason v2
-    and v5 do it: ``theta`` peaks near 0.03 here while the ray integrals are O(1) -- optical
+    Both terms are normalised to O(1) before being weighed against each other: ``theta`` peaks
+    near 0.03 here while the ray integrals are O(1) -- optical
     depth is the product -- so raw sums put the fit about 1e3 above TV and ``tv_weight`` would be
     decoration.  The fit is written on ``m.yobs``, which is step 7's own variable, so the
     objective cannot disagree with the observation row.
@@ -701,7 +729,7 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
 
 
 def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False):
-    """Initialise every variable from a :mod:`degrade_v6` run through the SAME geometry.
+    """Initialise every variable from a numpy forward run through the SAME geometry.
 
     The forward and estimation models differ only in whether ``f[:,0]`` is fixed, so this is the
     same operation in both: hold the angles fixed, run the numpy model, copy the trajectory
@@ -756,8 +784,9 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False):
 
 
 @dataclass
-class V6UQParams:
-    """Inputs to :func:`run_v6_reconstruction`.  Physics defaults match the v6 tab's seeds."""
+class ShrinkageDecayUQParams:
+    """Inputs to :func:`run_shrinkage_decay_reconstruction`.  Physics defaults match the app
+    tab's seeds."""
 
     image_res: int = 32
     optical_depth: float = 1.1
@@ -765,7 +794,7 @@ class V6UQParams:
     phantom: Optional[np.ndarray] = None
     simultaneous: bool = True          # the tab's default schedule; must match how data was taken
 
-    # --- v6 physics (V6Params) ---
+    # --- physics (ShrinkageDecayParams) ---
     I0: float = 1.0
     c: float = 0.1
     a: float = 0.05
@@ -774,7 +803,7 @@ class V6UQParams:
     reach: Optional[float] = 7.0
     gamma: float = 100.0
     f_ref_frac: Optional[float] = 0.002
-    # None = CHOOSE IT from a forward run, via degrade_v6.select_eta. That is the default because
+    # None = CHOOSE IT from a forward run, via select_eta. That is the default because
     # no fixed value works: max|dP| spans 0.15 to 80 across this model's parameter range, and eta
     # has to track it or the estimation NLP degenerates (at the old fixed 1e-3: 97% of iterations
     # Hessian-regularised, lg(mu) stuck, inf_du climbing to 6.6e9). A float here overrides it.
@@ -805,16 +834,16 @@ class V6UQParams:
     run_uq: bool = True
     noise_cov_scale: float = 10.0      # sigma^2 in Sigma = sigma^2 J J^T
 
-    def to_physics(self, eta=None) -> V6Params:
+    def to_physics(self, eta=None) -> ShrinkageDecayParams:
         """``eta`` overrides the field, which is how the auto-selected value gets in."""
         use = eta if eta is not None else (self.eta if self.eta else 1e-3)
-        return V6Params(I0=self.I0, c=self.c, a=self.a, b=self.b, c_cp=self.c_cp,
+        return ShrinkageDecayParams(I0=self.I0, c=self.c, a=self.a, b=self.b, c_cp=self.c_cp,
                         reach=self.reach, gamma=self.gamma, f_ref_frac=self.f_ref_frac,
                         eta=float(use), dx=self.dx)
 
 
 @dataclass
-class V6UQResults:
+class ShrinkageDecayUQResults:
     """Arrays and scalars, not matplotlib figures -- the caller draws."""
 
     theta_true: np.ndarray
@@ -872,10 +901,11 @@ class V6UQResults:
         return 100.0 * self.regularised / max(self.n_iter_lines, 1)
 
 
-def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
+def run_shrinkage_decay_reconstruction(params: ShrinkageDecayUQParams,
+                                       log_callback=None) -> ShrinkageDecayUQResults:
     """Estimate ``theta = f_0`` from the projections, then k_aug for the pixel variance.
 
-    The data comes from :func:`degrade_v6.simulate` / :func:`~degrade_v6.simulate_simultaneous`,
+    The data comes from :func:`simulate` / :func:`simulate_simultaneous`,
     not from a Pyomo forward solve, so the measurements and the model fitting them stay two
     independent implementations.  ``gate=True`` re-runs the residual check on the caller's actual
     geometry and **refuses to reconstruct** if it has drifted: a reconstruction against a model
@@ -884,7 +914,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     def say(t):
         # A broken log sink must cost you the log, never the reconstruction. The Streamlit
         # callback raises NoSessionContext when it runs without a ScriptRunContext, and before
-        # this guard that exception propagated out of run_v6_reconstruction and killed the solve
+        # this guard that exception propagated out of the reconstruction and killed the solve
         # before it started.
         if log_callback is None:
             return
@@ -899,7 +929,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     p = params.to_physics()
 
     theta = (np.asarray(params.phantom, dtype=float) if params.phantom is not None
-             else scale_to_optical_depth(_phantom(res), params.optical_depth, res))
+             else scale_to_optical_depth(phantom(res), params.optical_depth, res))
     theta = theta.reshape(res, res)
 
     # --- eta, chosen from the forward model before anything else is built --------------------
@@ -925,14 +955,14 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     if params.gate:
         say("Gate: Pyomo model against the numpy model on this geometry...\n")
         traj_g = numpy_trajectory(theta, seq, p, res, simultaneous=params.simultaneous)
-        mg = build_v6_model(theta, seq, p, res, simultaneous=params.simultaneous)
+        mg = build_shrinkage_decay_model(theta, seq, p, res, simultaneous=params.simultaneous)
         pin_model(mg, traj_g)
         fwd_resid = max_residual(mg)[0]
         say("    residual %.3e\n" % fwd_resid)
         if not (fwd_resid < 1e-10):
             raise RuntimeError(
                 "forward gate FAILED on this geometry (residual %.3e): the Pyomo model and "
-                "degrade_v6.simulate no longer agree, so a reconstruction against it would not "
+                "the numpy simulate no longer agree, so a reconstruction against it would not "
                 "be a physics result. Fix the model before reading anything below." % fwd_resid)
 
     # --- synthetic data -------------------------------------------------------------------
@@ -960,8 +990,9 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
         say("Continuation: I0 = 0 (linear tomography + TV), potential block dropped...\n")
         try:
             p0 = replace(p, I0=0.0, c_cp=0.0)
-            m0 = build_v6_model(theta, seq, p0, res, f_bounds=(0.0, None), potential=False,
-                                simultaneous=params.simultaneous)
+            m0 = build_shrinkage_decay_model(theta, seq, p0, res, f_bounds=(0.0, None),
+                                             potential=False,
+                                             simultaneous=params.simultaneous)
             add_estimation_objective(m0, y_true, params.tv_weight, theta_scale)
             initialize_from_numpy(m0, theta_seed)
             r0, ls0 = solve_with_fallback(m0, linear_solver=params.linear_solver,
@@ -978,9 +1009,9 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
             theta_seed = np.full_like(theta, float(theta.mean()))
 
     # --- the estimation NLP ----------------------------------------------------------------
-    say("Building the v6 estimation model...\n")
-    m = build_v6_model(theta, seq, p, res, f_bounds=(0.0, None),
-                       simultaneous=params.simultaneous)
+    say("Building the estimation model...\n")
+    m = build_shrinkage_decay_model(theta, seq, p, res, f_bounds=(0.0, None),
+                                    simultaneous=params.simultaneous)
     add_estimation_objective(m, y_true, params.tv_weight, theta_scale)
     init_resid = initialize_from_numpy(m, theta_seed)
     say("    start residual %.3e (dynamically feasible; only the fit is wrong)\n" % init_resid)
@@ -1002,7 +1033,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
     def _tee(t):
         # Must NOT raise. _solve_streaming latches its forwarding off after one exception, so a
         # caller's callback blowing up here would stop `buf` filling too -- and `buf` is what
-        # _reg_fraction counts, so the Hessian-regularisation figure would silently be computed
+        # reg_fraction counts, so the Hessian-regularisation figure would silently be computed
         # from a truncated log rather than reported as unavailable.
         buf.append(t)
         if log_callback:
@@ -1015,7 +1046,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
                                 max_iter=params.ipopt_max_iter, log_callback=_tee,
                                 options=opts)
     t_solve = time.perf_counter() - t0
-    reg, nlines = _reg_fraction("".join(buf))
+    reg, nlines = reg_fraction("".join(buf))
 
     theta_hat = np.array([pyo.value(m.f[q, 0]) for q in m.PIX]).reshape(res, res)
     f_hat, infos_hat = _run(theta_hat, seq, p, res)
@@ -1024,7 +1055,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
                                           for (k, j, _n) in m.obs_index])])
     theta_rms = float(np.sqrt(np.mean((theta_hat - theta) ** 2)))
 
-    out = V6UQResults(
+    out = ShrinkageDecayUQResults(
         theta_true=theta, theta_hat=theta_hat, f_final_true=f_true, f_final_hat=f_hat,
         status=str(r.solver.termination_condition), linear_solver=ls,
         iters=str(getattr(r.solver, "iterations", "-")),
@@ -1070,7 +1101,7 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
             # NON-FATAL BY DESIGN. The covariance is intentionally rank deficient -- a starved
             # geometry leaves pixels no ray constrains -- so k_aug can legitimately come back
             # singular, and losing the covariance must not lose the reconstruction. Same call
-            # the 3D slice loop and the v2 driver make.
+            # the 3D slice loop makes.
             out.uq_error = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0][:200])
             say("    UQ failed (reconstruction kept): %s\n" % out.uq_error)
         out.t_uq = time.perf_counter() - t1
@@ -1080,7 +1111,8 @@ def run_v6_reconstruction(params: V6UQParams, log_callback=None) -> V6UQResults:
 # --- G3: the scaling gate ---------------------------------------------------------------------
 
 def _sp_and_chord_extra(m, p):
-    """v6-specific rows for :func:`degrade_v2_uq.scaling_report`, as an ``extra`` callback."""
+    """Model-specific rows for :func:`senDOE.helpers.nlp_scaling.scaling_report`, as an
+    ``extra`` callback."""
     def _extra(nlp, J, cons, varz):
         eta = float(p.eta)
         d = {"eta": eta, "f_max": float(p.f_max),
@@ -1121,9 +1153,9 @@ def _sp_and_chord_extra(m, p):
         err = 0.0
         for (a_, b_) in m.UFACE:
             for k in m.TM:
-                u, v2 = pyo.value(m.sp[a_, b_, k]), pyo.value(m.sp[b_, a_, k])
+                u, w = pyo.value(m.sp[a_, b_, k]), pyo.value(m.sp[b_, a_, k])
                 z = pyo.value(m.phi[b_, k]) - pyo.value(m.phi[a_, k])
-                err = max(err, abs((u - v2) - z))
+                err = max(err, abs((u - w) - z))
         d["sp_identity_err"] = float(err)
         return d
     return _extra
@@ -1140,9 +1172,10 @@ def _chord_stats(seq, image_res: int, simultaneous: bool = False):
     exact-vertex crossing TWICE, not a ray clipping a corner. 13 decades separate it from the
     smallest legitimate chord found (3.80e-3), so the two are not confusable.
 
-    NOT fixed here. The fix belongs in ``dose_response.ray_geometry``, which v1's Pyomo path does
-    not use, so correcting it would widen the convention split CLAUDE.md already records for
-    chord attribution. Reported so it is visible instead of silent.
+    NOT fixed here. The fix belongs in :func:`senDOE.helpers.rays.ray_geometry`, which the
+    pixel_intersection Pyomo model does not use, so correcting it would widen the convention
+    split CLAUDE.md already records for chord attribution. Reported so it is visible instead of
+    silent.
     """
     # ALWAYS the uncollapsed list, whatever the schedule. The rays are identical either way --
     # only the grouping differs -- but the simultaneous form merges every angle into one entry
@@ -1177,18 +1210,17 @@ def check_scaling(m=None, *, image_res: int = 16, n_steps: int = 2, simultaneous
     construction. S1-S6 are tripwires of unmeasured sensitivity -- they have never been observed
     to fail, which is a reason to keep their bounds loose, not a reason to trust them.
     """
-    from degrade_v2_uq import scaling_report
     p_used = None
     if m is None:
-        p0 = V6Params(**kw) if kw else V6Params()
-        theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
-        seq = _demo_sequence(n_steps)
+        p0 = ShrinkageDecayParams(**kw) if kw else ShrinkageDecayParams()
+        theta = scale_to_optical_depth(phantom(image_res), 1.1, image_res)
+        seq = demo_sequence(n_steps)
         eta, _info = select_eta(theta, seq, p0, image_res, simultaneous=simultaneous)
         p_used = resolve(replace(p0, eta=eta), theta)
         run = simulate_simultaneous if simultaneous else simulate
         _f, _i, y = run(theta, seq, p_used, image_res, record_observations=True)
-        m = build_v6_model(theta, seq, p_used, image_res, f_bounds=(0.0, None),
-                           simultaneous=simultaneous)
+        m = build_shrinkage_decay_model(theta, seq, p_used, image_res, f_bounds=(0.0, None),
+                                        simultaneous=simultaneous)
         add_estimation_objective(m, y, 0.001, float(np.abs(theta).max()))
         start = theta if seed == "truth" else np.full_like(theta, float(theta.mean()))
         resid = initialize_from_numpy(m, start)
@@ -1199,7 +1231,7 @@ def check_scaling(m=None, *, image_res: int = 16, n_steps: int = 2, simultaneous
     rep = scaling_report(m, extra=_sp_and_chord_extra(m, p_used))
     if rep.get("skipped"):
         if verbose:
-            print("  v6 scaling: SKIPPED (%s)" % rep["skipped"])
+            print("  shrinkage-decay scaling: SKIPPED (%s)" % rep["skipped"])
         return rep
     rep["residual"], rep["seed"] = float(resid), seed
     mc, nct, bad_ang = _chord_stats(seq, m.res)
@@ -1244,13 +1276,13 @@ def check_scaling(m=None, *, image_res: int = 16, n_steps: int = 2, simultaneous
             f.append("S8 c_sp_diff identity off by %.3e" % rep["sp_identity_err"])
         if rep["sp_zero_deriv_rows"]:
             f.append("S9 %d c_sp_pair rows have an exactly-zero derivative (eta too small for "
-                     "this geometry -- see degrade_v6.select_eta)" % rep["sp_zero_deriv_rows"])
+                     "this geometry -- see select_eta)" % rep["sp_zero_deriv_rows"])
     if rep["residual"] >= 1e-10:
         f.append("S10 start residual %.3e" % rep["residual"])
     rep["failures"], rep["ok"] = f, not f
 
     if verbose:
-        print("  v6 scaling (grid %d, %s, seed %s): %s"
+        print("  shrinkage-decay scaling (grid %d, %s, seed %s): %s"
               % (m.res, "simultaneous" if simultaneous else "sequential", rep["seed"],
                  "PASS" if rep["ok"] else "FAIL " + "; ".join(f)))
         print("      rows med %.3g  min %.3g (%s)  max %.3g (%s)  |  %.0f%% are exactly 1"
@@ -1272,3 +1304,8 @@ def check_scaling(m=None, *, image_res: int = 16, n_steps: int = 2, simultaneous
                   "vertex crossings, see _chord_stats" % (rep["n_chord_tiny"], rep["min_chord"],
                                                           rep["degenerate_angles"]))
     return rep
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli())

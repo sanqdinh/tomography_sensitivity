@@ -9,8 +9,7 @@ tomographic uncertainty-quantification pipeline from the research example
 * renders headless (Agg backend), and
 * can stream the IPOPT solver log to a caller-supplied ``log_callback``.
 
-The actual physics/solver building blocks come from the vendored ``senDOE`` package
-(see ``SENDOE_VENDOR.md``). This module does NOT import or modify the original example.
+The actual physics/solver building blocks come from the vendored ``senDOE`` package. This module does NOT import or modify the original example.
 
 The projection geometry is user-defined: each :class:`BeamStep` is one projection (its own
 angle, radial offset, and number of beams), replacing the old evenly-spaced ``linspace``
@@ -27,7 +26,6 @@ Pipeline (reconstruction/UQ identical in substance to Example2):
 
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -43,7 +41,7 @@ import pyomo.environ as pyo  # noqa: E402
 from skimage.transform import resize  # noqa: E402
 from skimage.data import shepp_logan_phantom  # noqa: E402
 
-from senDOE.models.tomography_pyomo_pixel_intersection import (  # noqa: E402
+from senDOE.models.tomography_pyomo_2d_pixel_intersection import (  # noqa: E402
     create_sample_model,
     load_image_to_sample,
     update_sinogram_rmse_expression,
@@ -54,6 +52,7 @@ from senDOE.models.tomography_pyomo_pixel_intersection import (  # noqa: E402
 )
 from senDOE.helpers.statistics import d_optimality  # noqa: E402
 from senDOE.sensitivity.pyomo_sensitivity import extract_sensitivity_matrix  # noqa: E402
+from senDOE.helpers.solvers import resolve_ipopt as _resolve_ipopt  # noqa: E402
 
 
 # --- DIAGNOSTIC: stream k_aug's own solver log ---------------------------------------------
@@ -179,19 +178,6 @@ class _LogWriter:
 
     def getvalue(self) -> str:
         return "".join(self._chunks)
-
-
-def _resolve_ipopt() -> str:
-    """Locate the IPOPT executable: env override -> common path -> PATH -> bare name."""
-    exe = os.environ.get("IPOPT_EXECUTABLE")
-    if exe and os.path.exists(exe):
-        return exe
-    if os.path.exists("/usr/local/bin/ipopt"):
-        return "/usr/local/bin/ipopt"
-    which = shutil.which("ipopt")
-    if which:
-        return which
-    return "ipopt"  # let Pyomo resolve it from PATH
 
 
 def _make_solver(params: UQParams) -> pyo.SolverFactory:

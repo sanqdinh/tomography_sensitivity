@@ -1,19 +1,17 @@
-"""v6, the implicit-transport damage model: the compaction flux made implicit and unconditional.
+"""The shrinkage-decay damage model: dose, decay, a nonlocal compaction potential, and an
+implicit, unconditionally positive mass transport.  Forward simulation in numpy/scipy.
 
-v5 with steps 5 and 6 changed and nothing else moved.
+The step map (section 3.2 of the manuscript), one measurement ``k``:
 
-What changes
-------------
-v5 discretised eq:xd_mass_transport explicitly, with a logistic upwind weight picking a donor
-value off the *decayed* field::
+1. **dose** -- Beer-Lambert walk along every ray (:func:`senDOE.helpers.dose.accumulate_dose`);
+2. **converted fraction** ``dw = 1 - exp(-c I_p delta_p)``;
+3. **decay** ``ft = f exp(-a I_p - b I_p^2)`` (eq:xd_decay);
+4. **compaction potential** -- ``Pi = dw ft / f_max``, a material indicator ``sigma``, and the
+   screened elliptic solve eq:xd_potential_solve for ``phi`` (:func:`compaction_potential`);
+5. **directed rates** ``r_{p->q} = c_cp phi_eta(dP_pq)`` with ``phi_eta`` the softplus;
+6. **implicit transport** -- the flux evaluated on the unknown post-transport field.
 
-    F_{p->q} = c_cp [ chi_pq ft_p + (1 - chi_pq) ft_q ] dP_pq,   chi_pq = 1/(1 + e^{-beta dP})
-    f_{k+1}  = ft - div F
-
-That is positive only under the compaction number ``C_k <= 1``, and only in the donor-cell limit
-``beta -> infinity``; at finite ``beta`` the face value mixes both sides and ``C_k`` is a
-diagnostic rather than a proof.  v6 replaces it with a nonnegative directed RATE and evaluates
-the flux on the unknown post-transport field (eq:xd_directed_rate, eq:xd_flux)::
+Steps 5 and 6 as equations (eq:xd_directed_rate, eq:xd_flux)::
 
     r_{p->q} = c_cp phi_eta(dP_pq),   phi_eta(z) = eta log(1 + e^{z/eta})      (softplus)
     F_{p->q} = r_{p->q} f_{k+1,p} - r_{q->p} f_{k+1,q}
@@ -24,21 +22,13 @@ so eq:xd_mass_transport becomes one global sparse system, eq:xd_implicit_transpo
 
 Its matrix has positive diagonal, nonpositive off-diagonal and **unit column sums**.  It is a
 nonsingular M-matrix, so ``ft >= 0`` implies ``f_{k+1} >= 0`` and the column sums give exact
-conservation -- both unconditionally.  ``C_k`` is therefore deleted, along with (S4)'s positivity
-caveat: there is no step-size restriction left to diagnose.  Outgoing transport is proportional
-to what remains in the donor, so an emptying pixel stops donating and vacuum cannot donate at
-all.
+conservation -- both unconditionally, with no step-size restriction to diagnose.  Outgoing
+transport is proportional to what remains in the donor, so an emptying pixel stops donating and
+vacuum cannot donate at all.
 
-Steps 1 to 4 are v5's, by import rather than by copy
-----------------------------------------------------
-``resolve``, ``material_indicator``, ``potential_operator`` and ``compaction_potential`` are
-imported from :mod:`degrade_v5` and called with a :class:`V6Params`.  That works because v6 keeps
-v5's field *names* for the potential block and v5's ``resolve`` goes through
-``dataclasses.replace``, so handed a ``V6Params`` it returns a ``V6Params``.  Reusing a params
-object across versions is new here, so :func:`check_invariants` pins it: check (g) asserts v6's
-step 4 equals v5's **bit for bit** on the same field.  The benefit is that eq:xd_potential_solve
-has exactly one implementation, and v5's exact M-matrix guard comes along with it -- and that
-guard *is* eq:xd_potential_bound, since ``(l/Delta)^2 = 1/varsigma``.
+The potential operator of step 4 is an M-matrix too, and :func:`compaction_potential` asserts
+its exact bound ``||phi||_inf <= ||Pi||_inf / varsigma`` -- which *is* eq:xd_potential_bound,
+since ``(l/Delta)^2 = 1/varsigma``.
 
 The softplus rate is not zero at zero, and that is structural
 -------------------------------------------------------------
@@ -63,9 +53,9 @@ diffusion::
 
 The diffusive part has a floor and cannot be removed.  Subtracting ``eta log 2`` to make the rate
 vanish at rest sends ``phi_eta`` negative for ``z < 0``, which flips an off-diagonal sign and
-costs the M-matrix, hence positivity and the conservation proof with it.  This is the same shape
-as v2's ``eps_up`` leak, and the same conclusion: it is numerics, not physics, and the honest
-response is to measure it rather than to assert an identity the model does not have.
+costs the M-matrix, hence positivity and the conservation proof with it.  It is numerics, not
+physics, and the honest response is to measure it rather than to assert an identity the model
+does not have.
 
 Mass conservation and positivity are untouched by it -- a diffusion moves mass, it does not
 create or destroy it, and it keeps the matrix an M-matrix.  Only the ``I0 = 0`` identity is
@@ -73,7 +63,7 @@ affected, and only at order ``c_cp eta``.  So :func:`check_invariants` check (c)
 residual beside its ``c_cp eta log 2`` prediction and asserts the *scaling law* instead: the leak
 must be proportional to ``eta``, which is the testable statement that the leak is only the
 smoothing.  Keep ``eta`` well under the ``max |dP|`` the run actually produces; ``step`` records
-both so the ratio is visible.
+both so the ratio is visible, and :func:`select_eta` chooses it from a forward run.
 
 There is no ``eta = 0`` escape hatch.  The model is eq:xd_rate_function as written.
 
@@ -88,9 +78,12 @@ than the vacuum penalty leaking into the bulk, one needs
 subsec:system gives only "``f_ref`` be at most a fifth of the smallest interior value", which
 leaves ``gamma e^{-5}``; at ``gamma = 1e3`` and ``varsigma = 6.9e-3`` that is ``6.74``, three
 decades too large, and the contraction measures **exactly 0.00%** with nothing raised.  The
-sufficient condition is ``f_ref <~ f_interior / log(gamma / varsigma)``.  ``StepInfo6`` carries
-``absorption_ratio`` -- the worst ``gamma (1 - sigma_p) / varsigma`` over the bulk -- so the
-closure cannot be silently off.  ``experiment_v6_limits.py`` locates the plateau.
+sufficient condition is ``f_ref <~ f_interior / log(gamma / varsigma)``.
+``ShrinkageDecayStepInfo`` carries ``absorption_ratio`` -- the worst ``gamma (1 - sigma_p) /
+varsigma`` over the bulk -- so the closure cannot be silently off.
+
+Run the module for the invariants: ``python3 -m senDOE.models.tomography_2d_shrinkage_decay [grid
+steps]``.
 """
 
 from __future__ import annotations
@@ -102,38 +95,31 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from dose_response import bundle_r_values, ray_line_integral
-from degrade_v2 import accumulate_dose, scale_to_optical_depth
-from degrade_v3 import (radius_of_gyration, support_radius, mass_outside, semi_axis_ratio,
-                        _disc, _phantom, _demo_sequence, _wedge_sequence)
-# Steps 1 to 4, unchanged by the v6 diff.  Imported, never retyped -- see the module docstring.
-from degrade_v5 import (resolve, material_indicator, potential_operator, compaction_potential,
-                        shape_diagnostics)
+from senDOE.helpers.rays import bundle_r_values, ray_line_integral
+from senDOE.helpers.dose import accumulate_dose, scale_to_optical_depth
+from senDOE.helpers.shape_metrics import (radius_of_gyration, support_radius, mass_outside,
+                                          semi_axis_ratio, shape_diagnostics)
+from senDOE.helpers.phantoms import disc, phantom, demo_sequence, wedge_sequence
 
 
 @dataclass(frozen=True)
-class V6Params:
-    """Parameters of v6.  v5's, minus the three upwind knobs, plus the softplus scale ``eta``.
-
-    Gone with the explicit flux: ``beta`` (logistic sharpness), ``flux`` (the upwind / harmonic /
-    central selector) and ``eps_h`` (the harmonic guard).  The implicit form has one face law and
-    no positivity condition, so there is nothing left for them to select between.
-    """
+class ShrinkageDecayParams:
+    """Parameters of the shrinkage-decay model.  ``f_max`` and ``reach`` are filled by
+    :func:`resolve` from the initial field when left as ``None``."""
 
     I0: float = 1.0
     c: float = 0.1           # conversion coefficient, dw = 1 - exp(-c I_p delta_p)
     a: float = 0.05          # decay, linear in fluence
     b: float = 0.0           # decay, quadratic
     c_cp: float = 0.3        # compaction amplitude; 0 annihilates every flux
-    # Fields below here are read by degrade_v5's step-4 functions, which this module calls with
-    # a V6Params. Their NAMES are load-bearing -- see check (g).
+    # Step 4, the compaction potential.
     reach: Optional[float] = None    # compaction reach l. None -> the specimen radius R.
     gamma: float = 100.0             # vacuum absorption. Needs gamma >> max(varsigma, 1) ...
     f_ref_frac: Optional[float] = 0.002   # ... but ALSO gamma*exp(-f_int/f_ref) << varsigma.
     f_max: Optional[float] = None
     # SOFTPLUS SMOOTHING of eq:xd_rate_function. Strictly positive: the model is the softplus,
     # and eta -> 0 is a limit to be reported, not a setting. Must sit well below the run's
-    # max |dP| or the rate stops discriminating direction; StepInfo6 records both. It is also
+    # max |dP| or the rate stops discriminating direction; the step info records both. It is also
     # the size of the resting diffusion (rate eta*log2 per face), so it is not free either way.
     eta: float = 1e-3
     dx: float = 1.0
@@ -141,7 +127,7 @@ class V6Params:
     def varsigma(self) -> float:
         """``(dx/reach)^2``.  Strictly positive; ``reach`` must have been resolved first."""
         if self.reach is None:
-            raise ValueError("reach is unresolved: call degrade_v6.resolve(p, theta) first")
+            raise ValueError("reach is unresolved: call resolve(p, theta) first")
         if not np.isfinite(self.reach) or self.reach <= 0:
             raise ValueError(
                 "reach = %r is not a legal setting. The pure Poisson closure (l = infinity, "
@@ -157,7 +143,7 @@ class V6Params:
 
 
 @dataclass
-class StepInfo6:
+class ShrinkageDecayStepInfo:
     mass: float
     lost: float                # what eq:xd_decay removed, measured at the START of the step
     mass_residual: float       # |sum f_{k+1} - sum ft|; prop:xd_mass, and it must be ~0
@@ -174,7 +160,92 @@ class StepInfo6:
     absorption_ratio: float    # max gamma(1-sigma)/varsigma over the bulk; must be << 1
     void: float                # sum_p Pi_p, the void created this step. Summed over a run it is
                                # what separates dw SATURATING from the transport merely compounding
-                               # -- see experiment_v6_fractionation.py.
+                               # -- which is the fractionation question.
+
+
+# --- step 4: the compaction potential --------------------------------------------------
+
+def resolve(p: ShrinkageDecayParams, theta) -> ShrinkageDecayParams:
+    """Fill ``f_max`` from the initial peak and ``reach`` from the specimen radius.
+
+    The default reach is ``R``, the radius containing 99% of the mass, which is the same
+    statistic the shrinkage is reported against.  It is a physical length, so it transfers
+    across grids.
+    """
+    theta = np.asarray(theta, dtype=float)
+    out = p
+    if out.f_max is None:
+        peak = float(np.abs(theta).max())
+        out = replace(out, f_max=(peak if peak > 0.0 else 1.0))
+    if out.reach is None:
+        out = replace(out, reach=float(support_radius(theta)))
+    out.varsigma()          # raises here, at entry, rather than downstream on a degenerate solve
+    return out
+
+
+def material_indicator(ft, f_max: float, f_ref_frac: Optional[float]):
+    """``sigma`` in [0,1): 0 in vacuum, ~1 in bulk material.
+
+    ``f_ref_frac`` None gives the parameter-free linear form ``ft/f_max``, which the spec warns
+    makes a low-contrast interior behave partly like vacuum.  Both are testable.
+    """
+    ft = np.asarray(ft, dtype=float)
+    # NO CLIPPING. The clip was a guard against the logistic's ~1e-6 negative residual, but it
+    # is not expressible in Pyomo, so numpy and the NLP would compute different functions and
+    # the gate fails on exactly those pixels (measured: 9.2e-05 on c_sig). The guard is not
+    # needed: at ft = -1e-6 the indicator is -2e-4 against a diagonal of gamma ~ 100, so the
+    # operator stays strongly diagonally dominant and the M-matrix property survives. In the
+    # NLP f carries a lower bound of 0 anyway, so ft >= 0 there by construction.
+    if f_ref_frac is None:
+        return ft / f_max
+    return 1.0 - np.exp(-ft / (f_ref_frac * f_max))
+
+
+def potential_operator(sigma, varsigma: float, gamma: float):
+    """The sparse operator of step 4a.  Symmetric, irreducibly diagonally dominant M-matrix.
+
+    Rows: ``[varsigma + gamma(1-sigma_p)] phi_p - sum_q sigma_pq (phi_q - phi_p) = Pi_p``.
+    Faces outside the grid are simply absent from the sum, which is the natural condition.
+    """
+    sigma = np.asarray(sigma, dtype=float)
+    nr, nc = sigma.shape
+    n = nr * nc
+    idx = np.arange(n).reshape(nr, nc)
+    rows, cols, vals = [], [], []
+    diag = varsigma + gamma * (1.0 - sigma.ravel())
+    for (a_idx, b_idx, s_face) in (
+            (idx[:, :-1].ravel(), idx[:, 1:].ravel(),
+             (0.5 * (sigma[:, :-1] + sigma[:, 1:])).ravel()),
+            (idx[:-1, :].ravel(), idx[1:, :].ravel(),
+             (0.5 * (sigma[:-1, :] + sigma[1:, :])).ravel())):
+        rows.append(a_idx); cols.append(b_idx); vals.append(-s_face)
+        rows.append(b_idx); cols.append(a_idx); vals.append(-s_face)
+        np.add.at(diag, a_idx, s_face)
+        np.add.at(diag, b_idx, s_face)
+    rows.append(np.arange(n)); cols.append(np.arange(n)); vals.append(diag)
+    return sp.csc_matrix((np.concatenate(vals),
+                          (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
+
+
+def compaction_potential(ft, dw, p: ShrinkageDecayParams):
+    """Solve step 4a for ``phi``.  Returns ``(phi, Pi, sigma)``."""
+    fm = float(p.f_max)
+    Pi = np.asarray(dw, dtype=float) * np.asarray(ft, dtype=float) / fm
+    sigma = material_indicator(ft, fm, p.f_ref_frac)
+    vs = p.varsigma()          # raises if reach is illegal, so varsigma > 0 from here on
+    A = potential_operator(sigma, vs, p.gamma)
+    phi = spla.spsolve(A, Pi.ravel()).reshape(Pi.shape)
+    # EXACT bound, not a heuristic. A is irreducibly diagonally dominant with row sums at least
+    # varsigma, so the M-matrix structure gives ||phi||_inf <= ||Pi||_inf / varsigma, and the
+    # bound is attained on a vacuum-free field with uniform void. Anything above it means the
+    # solve did not converge or the operator was assembled wrong.
+    bound = float(np.abs(Pi).max()) / vs
+    if not np.all(np.isfinite(phi)) or float(np.abs(phi).max()) > bound * (1.0 + 1e-6) + 1e-12:
+        raise ValueError("compaction potential violates its M-matrix bound: max|phi| = %.6e "
+                         "against ||Pi||_inf/varsigma = %.6e"
+                         % (float(np.abs(phi).max()), bound))
+    return phi, Pi, sigma
+
 
 
 # --- steps 5 and 6: the implicit transport -------------------------------------------------
@@ -188,7 +259,7 @@ def softplus(z, eta: float):
 
     ``eta <= 0`` is refused.  ``max(z, 0)`` is the ``eta -> 0`` limit of the model, not a setting
     of it, and admitting it here would let the resting diffusion be switched off by accident --
-    the one thing that makes v6's behaviour at ``I0 = 0`` worth reporting.
+    the one thing that makes this model's behaviour at ``I0 = 0`` worth reporting.
     """
     if not (eta > 0.0) or not np.isfinite(eta):
         raise ValueError(
@@ -198,7 +269,8 @@ def softplus(z, eta: float):
 
 
 def _face_pairs(nr: int, nc: int):
-    """The oriented face list ``(p, q)``, horizontal then vertical, as v5's operator walks it."""
+    """The oriented face list ``(p, q)``, horizontal then vertical, as :func:`potential_operator`
+    walks it."""
     idx = np.arange(nr * nc).reshape(nr, nc)
     return ((idx[:, :-1].ravel(), idx[:, 1:].ravel()),
             (idx[:-1, :].ravel(), idx[1:, :].ravel()))
@@ -264,7 +336,7 @@ def face_fluxes(f_next, phi, c_cp: float, eta: float):
     return Fh, Fv
 
 
-def absorption_ratio(sigma, ft, p: V6Params, bulk_frac: float = 0.5) -> float:
+def absorption_ratio(sigma, ft, p: ShrinkageDecayParams, bulk_frac: float = 0.5) -> float:
     """``gamma(1 - sigma)/varsigma`` in the bulk.  Must be ``<< 1``; see the module docstring.
 
     Above 1 the vacuum penalty, which exists only to represent the free surface, is also setting
@@ -289,7 +361,7 @@ def absorption_ratio(sigma, ft, p: V6Params, bulk_frac: float = 0.5) -> float:
 
 # --- the step ------------------------------------------------------------------------------
 
-def step(f, r_values, angle_rad: float, p: V6Params, _decay_last: bool = False):
+def step(f, r_values, angle_rad: float, p: ShrinkageDecayParams, _decay_last: bool = False):
     """One measurement step carrying ONE bundle.  The sequential path.
 
     A thin call into :func:`step_bundles`, so the sequential and simultaneous schedules are one
@@ -300,7 +372,7 @@ def step(f, r_values, angle_rad: float, p: V6Params, _decay_last: bool = False):
     return step_bundles(f, [(r_values, angle_rad)], p, _decay_last=_decay_last)
 
 
-def step_simultaneous(f, bundles, p: V6Params):
+def step_simultaneous(f, bundles, p: ShrinkageDecayParams):
     """One step carrying SEVERAL ``(r_values, angle_rad)`` bundles at once.
 
     Every ray integrates the field as it stood at the START of the step, so rays do not shield
@@ -312,8 +384,8 @@ def step_simultaneous(f, bundles, p: V6Params):
     return step_bundles(f, bundles, p)
 
 
-def step_bundles(f, bundles, p: V6Params, _decay_last: bool = False):
-    """The step map.  Steps 1 to 4 are v5's verbatim; only 5 and 6 changed.
+def step_bundles(f, bundles, p: ShrinkageDecayParams, _decay_last: bool = False):
+    """The step map, steps 1 to 6.
 
     ``bundles`` is a list of ``(r_values, angle_rad)``.  One entry is a sequential measurement;
     several is a simultaneous one.  The ONLY difference is that steps 1-2 accumulate over every
@@ -335,7 +407,7 @@ def step_bundles(f, bundles, p: V6Params, _decay_last: bool = False):
     f_next, colsum_err = implicit_transport(ft, phi, p.c_cp, p.eta)      # 5 and 6
 
     if _decay_last:
-        # THE WRONG ORDER, run rather than reasoned about, so check (h) can measure the leak.
+        # THE WRONG ORDER, run rather than reasoned about, so check (g) can measure the leak.
         # Transport the undecayed field and decay afterwards. Antisymmetry still makes the
         # unweighted flux sum vanish, so this is NOT a loss of telescoping; what it costs is the
         # common factor at the two ends of each face, leaving sum_faces (e_p - e_q) F_{p->q} in
@@ -353,7 +425,7 @@ def step_bundles(f, bundles, p: V6Params, _decay_last: bool = False):
           if rim.any() and abs(float(phi[rim].mean())) > 1e-300 else float("nan"))
     gmax = max(float(np.abs(phi[:, 1:] - phi[:, :-1]).max()) if nc > 1 else 0.0,
                float(np.abs(phi[1:, :] - phi[:-1, :]).max()) if nr > 1 else 0.0)
-    info = StepInfo6(mass=float(f_next.sum()), lost=lost,
+    info = ShrinkageDecayStepInfo(mass=float(f_next.sum()), lost=lost,
                      mass_residual=abs(float(f_next.sum()) - float(ft.sum())),
                      dw_max=float(dw.max()), I_max=float(I_p.max()),
                      state_min=float(f_next.min()), max_g=gmax,
@@ -366,16 +438,17 @@ def step_bundles(f, bundles, p: V6Params, _decay_last: bool = False):
     return f_next, info
 
 
-def simulate_simultaneous(theta, seq, p: V6Params, image_res: int,
+def simulate_simultaneous(theta, seq, p: ShrinkageDecayParams, image_res: int,
                           record_observations: bool = False, record_trajectory: bool = False):
     """The whole sequence as ONE exposure.  Same return shape as :func:`simulate`.
 
     Every row of ``seq`` contributes its bundle to a single step, so there is exactly one
-    ``StepInfo6`` however many rows there are, and ``hist`` has length 2.  Observations are taken
-    after that step, at the one angle-set fired -- one ray list, concatenated in row order.
+    ``ShrinkageDecayStepInfo`` however many rows there are, and ``hist`` has length 2.
+    Observations are taken after that step, at the one angle-set fired -- one ray list,
+    concatenated in row order.
 
     The two schedules deliver the SAME total exposure and differ only in how it is split in time,
-    which is the fractionation question ``experiment_v6_fractionation.py`` measures.
+    which is the fractionation question.
     """
     theta = np.asarray(theta, dtype=float)
     p = resolve(p, theta)
@@ -400,7 +473,7 @@ def simulate_simultaneous(theta, seq, p: V6Params, image_res: int,
     return tuple(out)
 
 
-def simulate(theta, seq, p: V6Params, image_res: int,
+def simulate(theta, seq, p: ShrinkageDecayParams, image_res: int,
              record_observations: bool = False, record_trajectory: bool = False):
     """Run a measurement sequence, one step per row.  ``y_{k+1} = C f_{k+1}``, index-shifted."""
     theta = np.asarray(theta, dtype=float)
@@ -467,9 +540,8 @@ def centroid_of(f):
 
 # --- invariants -------------------------------------------------------------------------
 # There is no test suite in this repo (see CLAUDE.md), so this is the verification path, in the
-# "run the module" style of degrade_v2.py and tomography_3d.py. v5 broke that chain -- it has no
-# check_* of its own and delegates to degrade_v5_uq, which needs pyomo. v6 restores it: every
-# check below is pure numpy/scipy and runs in seconds without a solver.
+# "run the module" style of senDOE.models.tomography_3d: every check below is pure numpy/scipy
+# and runs in seconds without a solver.
 #
 # What is asserted and what is only reported is a deliberate distinction. subsec:assumptions'
 # "Numerical checks" paragraph lists six; five are reachable without the estimation model, and
@@ -481,7 +553,7 @@ _LOCALITY_MSG = (
     "NONLOCAL one can. If this fails the potential is not doing the job it exists to do.")
 
 
-def _uniform_damage_pair(image_res: int, p: V6Params, dw_level: float = 0.05,
+def _uniform_damage_pair(image_res: int, p: ShrinkageDecayParams, dw_level: float = 0.05,
                          c_cp: float = 3.0, n_steps: int = 8):
     """Uniform damage on a hard disc, driven by ``phi`` and by ``Pi``.  prop:xd_locality's own
     configuration, and measured by its own statistic.
@@ -505,7 +577,7 @@ def _uniform_damage_pair(image_res: int, p: V6Params, dw_level: float = 0.05,
     the same at every grid; ``c_cp`` is raised above the tab default because this is a diagnostic
     configuration and the signal should not be marginal.
     """
-    theta = _disc(image_res, edge=0.0)
+    theta = disc(image_res, edge=0.0)
     # a = b = 0: pure transport, mass conserved. reach=None -> R, so the check is grid-invariant.
     p = resolve(replace(p, a=0.0, b=0.0, c_cp=float(c_cp), reach=None), theta)
     ctr = centroid_of(theta)
@@ -536,7 +608,7 @@ def _uniform_damage_pair(image_res: int, p: V6Params, dw_level: float = 0.05,
 
 
 def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = True):
-    """Assert what section 3 claims for v6.  Returns a dict of measured numbers.
+    """Assert what section 3 claims for this model.  Returns a dict of measured numbers.
 
     (a) **Exact mass conservation** (prop:xd_mass).  ``a = b = 0`` removes eq:xd_decay and then
         the discrete attenuation sum is conserved to machine precision for *any* ``c_cp``: the
@@ -556,8 +628,8 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
         reported next to that prediction and the ASSERTION is the scaling law, that the leak is
         proportional to ``eta`` and therefore is only the smoothing.  See the module docstring.
 
-    (d) **eq:xd_potential_bound**, ``max phi <= (l/Delta)^2 max Pi``.  Inherited: v5's
-        ``compaction_potential`` raises on violation, so reaching the end of a run is the pass.
+    (d) **eq:xd_potential_bound**, ``max phi <= (l/Delta)^2 max Pi``.
+        :func:`compaction_potential` raises on violation, so reaching the end of a run is the pass.
 
     (e) **Positivity and conservation of the operator itself**: ``min f > 0`` along the whole
         trajectory and unit column sums.  The M-matrix gives both with no step-size condition,
@@ -565,21 +637,16 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
 
     (f) **prop:xd_locality**, the reason the potential exists at all.
 
-    (g) **Step 4 is v5's**, bit for bit, which is what licenses calling v5's step-4 functions
-        with a ``V6Params``.
-
-    (h) **The step ordering**, run rather than argued: transport-then-decay leaks where
+    (g) **The step ordering**, run rather than argued: transport-then-decay leaks where
         decay-then-transport does not.
     """
-    import degrade_v5 as _v5
-
     out = {}
-    theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
-    seq = _demo_sequence(n_steps)
-    base = V6Params(reach=7.0, gamma=100.0, f_ref_frac=0.002, eta=1e-3)
+    theta = scale_to_optical_depth(phantom(image_res), 1.1, image_res)
+    seq = demo_sequence(n_steps)
+    base = ShrinkageDecayParams(reach=7.0, gamma=100.0, f_ref_frac=0.002, eta=1e-3)
     say = (lambda *a: print(*a)) if verbose else (lambda *a: None)
 
-    say("v6 invariants: grid %d, %d steps, c_cp=%.3g, eta=%.3g"
+    say("shrinkage-decay invariants: grid %d, %d steps, c_cp=%.3g, eta=%.3g"
         % (image_res, n_steps, base.c_cp, base.eta))
 
     # (a) ---------------------------------------------------------------------------------
@@ -636,7 +703,7 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     # (d) and (e) -------------------------------------------------------------------------
     out["phi_bound_ok"] = True       # compaction_potential raises; reaching here is the pass
     out["f_min"] = min(i.state_min for i in infos_d)
-    say("  (d) eq:xd_potential_bound satisfied every step       (v5's guard raises otherwise)")
+    say("  (d) eq:xd_potential_bound satisfied every step       (the guard raises otherwise)")
     say("  (e) min f over the trajectory  %.3e  > 0   |colsum-1|  %.3e"
         % (out["f_min"], out["colsum_err"]))
     assert out["f_min"] > 0.0, out["f_min"]
@@ -660,19 +727,6 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     assert loc["nonlocal"]["drift"] < 1e-13 and loc["pointwise"]["drift"] < 1e-13, loc
 
     # (g) ---------------------------------------------------------------------------------
-    p6 = resolve(base, theta)
-    p5 = _v5.V5Params(I0=p6.I0, c=p6.c, a=p6.a, b=p6.b, c_cp=p6.c_cp, reach=p6.reach,
-                      gamma=p6.gamma, f_ref_frac=p6.f_ref_frac, f_max=p6.f_max)
-    dq, I_p = accumulate_dose(theta, bundle_r_values(0.0, 0, image_res), 0.0, p6.I0, p6.c)
-    ft = theta * p6.decay_factor(I_p)
-    a6 = compaction_potential(ft, 1.0 - np.exp(-dq), p6)
-    a5 = _v5.compaction_potential(ft, 1.0 - np.exp(-dq), p5)
-    out["step4_vs_v5"] = max(float(np.abs(x - y).max()) for x, y in zip(a6, a5))
-    say("  (g) step 4 against degrade_v5          %.3e   (phi, Pi and sigma, bit for bit)"
-        % out["step4_vs_v5"])
-    assert out["step4_vs_v5"] == 0.0, out["step4_vs_v5"]
-
-    # (h) ---------------------------------------------------------------------------------
     pw = replace(base, a=0.2)
     rv = bundle_r_values(0.0, 0, image_res)
     right, _ri = step(theta, rv, 0.0, resolve(pw, theta))
@@ -681,7 +735,7 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
     expected = float((theta * pw.decay_factor(I2)).sum())
     out["order_right"] = abs(float(right.sum()) - expected)
     out["order_wrong"] = abs(float(wrong.sum()) - expected)
-    say("  (h) decay-then-transport unexplained mass  %.3e" % out["order_right"])
+    say("  (g) decay-then-transport unexplained mass  %.3e" % out["order_right"])
     say("      transport-then-decay                   %.3e   (the ordering is load-bearing)"
         % out["order_wrong"])
     assert out["order_right"] < 1e-11, out["order_right"]
@@ -690,14 +744,6 @@ def check_invariants(image_res: int = 64, n_steps: int = 12, verbose: bool = Tru
 
     say("  ALL ASSERTED CHECKS PASS  (c) is reported, not asserted -- the identity is false")
     return out
-
-
-if __name__ == "__main__":
-    import sys
-
-    _res = int(sys.argv[1]) if len(sys.argv) > 1 else 64
-    _steps = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-    check_invariants(image_res=_res, n_steps=_steps)
 
 
 # --- choosing eta -----------------------------------------------------------------------------
@@ -750,7 +796,7 @@ ETA_RATIO_HI = 28.0         # above this, exp(-|dP|/eta) stops being representab
 ETA_RATIO_TARGET = 20.0
 
 
-def select_eta(theta, seq, p: V6Params, image_res: int, *, simultaneous: bool = False,
+def select_eta(theta, seq, p: ShrinkageDecayParams, image_res: int, *, simultaneous: bool = False,
                target_ratio: float = ETA_RATIO_TARGET, probe_eta: float = 1e-3):
     """Choose ``eta`` from a forward run.  Returns ``(eta, info)``.
 
@@ -766,12 +812,9 @@ def select_eta(theta, seq, p: V6Params, image_res: int, *, simultaneous: bool = 
     The probe run is not wasted work: the reconstruction has to run the forward model anyway to
     produce its data, and the forward model is solver-free.
 
-    ``info`` carries ``dP_max``, the achieved ``ratio``, the resting diffusion rate this ``eta``
-    implies, and ``warning`` -- a string, or "" when there is nothing to say.  **Read the
-    warning.**  At large ``c_omega`` the numerical window can be satisfied while the physics is
-    nonsense: ``max|dP| = 80`` asks for ``eta = 8``, at which softplus is nearly linear and the
-    resting diffusion swamps the transport. Satisfying the conditioning does not make the model
-    meaningful, and this function will not pretend otherwise.
+    ``info`` carries ``dP_max``, the achieved ``ratio``, and the resting diffusion rate this
+    ``eta`` implies. These values remain available for diagnostics, but do not restrict the
+    simulation's parameter choices.
     """
     theta = np.asarray(theta, dtype=float)
     eta_in = float(p.eta)                       # the caller's value, kept for the degenerate path
@@ -786,25 +829,22 @@ def select_eta(theta, seq, p: V6Params, image_res: int, *, simultaneous: bool = 
         # NOT c_cp = 0: that annihilates the flux but the potential is still solved, so dP is
         # still positive there and the formula below applies (harmlessly, since every rate is
         # zero anyway). Keep the CALLER's eta rather than inventing one from a division by zero.
-        info.update(eta=eta_in, ratio=float("nan"), rest_rate=0.0,
-                    warning="max|dP| is 0, so there is no transport to resolve (I0 = 0, or no "
-                            "measurements) and eta is unconstrained. Supplied value kept.")
+        info.update(eta=eta_in, ratio=float("nan"), rest_rate=0.0)
         return eta_in, info
 
     eta = float(dP) / float(target_ratio)
     rest = float(p.c_cp * eta * np.log(2.0))
-    # Fraction of a pixel's content the SMOOTHING ALONE moves per step, summed over its four
-    # faces. This, not eta itself, is the quantity that says whether the choice is physically
-    # tolerable: at the target ratio the resting rate is always log2/ratio ~ 7% of the peak
-    # advective rate, so eta on its own carries no information about whether the model still
-    # means anything -- only its product with c_cp and the face count does.
+    # Four-face baseline smoothing scale, retained for diagnostics. At the target ratio the
+    # resting rate is always log2/ratio ~ 7% of the peak advective rate; the total coupling
+    # depends on eta, c_cp, and the number of faces.
     rest_total = 4.0 * rest
     info.update(eta=eta, ratio=float(dP / eta), rest_rate=rest, rest_total=rest_total)
-    if rest_total > 0.2:
-        info["warning"] = (
-            "max|dP| = %.3g forces eta = %.3g to stay conditioned, and at that scale the "
-            "smoothing ALONE redistributes %.0f%% of a pixel per step (resting rate %.3g x 4 "
-            "faces) before any damage-driven transport. The NUMERICS are fine and the MODEL is "
-            "questionable -- lower c_omega or c_cp if the answer matters."
-            % (dP, eta, 100.0 * rest_total, rest))
     return eta, info
+
+
+if __name__ == "__main__":
+    import sys
+
+    _res = int(sys.argv[1]) if len(sys.argv) > 1 else 64
+    _steps = int(sys.argv[2]) if len(sys.argv) > 2 else 12
+    check_invariants(image_res=_res, n_steps=_steps)

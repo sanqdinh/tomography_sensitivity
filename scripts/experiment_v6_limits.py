@@ -1,7 +1,8 @@
 """The two v6 limits subsec:assumptions asks for and does not report.
 
-Both are "Numerical checks" items that :func:`degrade_v6.check_invariants` deliberately leaves
-out, because each is a *sweep* rather than an assertion and neither belongs in a Docker build.
+Both are "Numerical checks" items that
+:func:`senDOE.models.tomography_2d_shrinkage_decay.check_invariants` deliberately leaves out,
+because each is a *sweep* rather than an assertion and neither belongs in a Docker build.
 
 1. **The conduction-threshold plateau.**  subsec:system says of ``f_ref``: "The rule is that
    ``f_ref`` be at most a fifth of the smallest interior value the phantom carries, and
@@ -27,12 +28,13 @@ out, because each is a *sweep* rather than an assertion and neither belongs in a
 
 Run it::
 
-    python3 experiment_v6_limits.py                 # both sweeps, disc, grid 64
-    python3 experiment_v6_limits.py --phantom       # the same on Shepp-Logan
-    python3 experiment_v6_limits.py --only reach
+    PYTHONPATH=. python3 scripts/experiment_v6_limits.py            # both sweeps, disc, grid 64
+    PYTHONPATH=. python3 scripts/experiment_v6_limits.py --phantom  # the same on Shepp-Logan
+    PYTHONPATH=. python3 scripts/experiment_v6_limits.py --only reach
 
 Nothing here is asserted: these are measurements to quote, and the numbers move with the
-geometry.  The assertions live in :func:`degrade_v6.check_invariants`.
+geometry.  The assertions live in
+:func:`senDOE.models.tomography_2d_shrinkage_decay.check_invariants`.
 """
 
 from __future__ import annotations
@@ -41,9 +43,11 @@ from dataclasses import replace
 
 import numpy as np
 
-from degrade_v6 import (V6Params, simulate, resolve, compaction_potential, implicit_transport,
-                        half_mass_radius, centroid_of, scale_to_optical_depth,
-                        _disc, _phantom, _demo_sequence)
+from senDOE.helpers.phantoms import (demo_sequence as _demo_sequence, disc as _disc,
+                                     phantom as _phantom)
+from senDOE.models.tomography_2d_shrinkage_decay import (
+    ShrinkageDecayParams as V6Params, simulate, resolve, compaction_potential, implicit_transport,
+    half_mass_radius, centroid_of, scale_to_optical_depth)
 
 F_REF_FRACS = (0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 5e-4, 2e-4)
 REACH_PX = (16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125)
@@ -57,8 +61,8 @@ def _theta(image_res: int, use_phantom: bool, edge: float = 2.0, depth: float = 
     reads FACE DIFFERENCES of the driver, so a one-pixel jump in ``Pi`` keeps the two drivers'
     gradients apart long after their values have converged: on a hard disc sweep 2's rel(field)
     sits at 1.1-1.8 until l drops below a quarter pixel, while on a smoothstep disc it falls
-    monotonically with rel(driver).  Same lesson as degrade_v3's ``edge``, which is not
-    cosmetic either.  Pass ``--edge 0`` to see the sharp-interface behaviour.
+    monotonically with rel(driver).  Same lesson as ``senDOE.helpers.phantoms.disc``'s ``edge``,
+    which is not cosmetic either.  Pass ``--edge 0`` to see the sharp-interface behaviour.
     """
     base = _phantom(image_res) if use_phantom else _disc(image_res, edge=float(edge))
     return scale_to_optical_depth(base, depth, image_res)
@@ -151,8 +155,8 @@ def sweep_reach(image_res: int = 64, n_steps: int = 12, use_phantom: bool = Fals
           % ("l (px)", "c_cp", "eta", "rel(driver)", "rel(grad)", "rel(field)"))
     rows = []
     seq = _demo_sequence(n_steps)
-    from degrade_v2 import accumulate_dose
-    from dose_response import bundle_r_values
+    from senDOE.helpers.dose import accumulate_dose
+    from senDOE.helpers.rays import bundle_r_values
     ang, off, nb = seq[0]
     for ell in REACH_PX:
         c_cp = c_eff * (1.0 / ell) ** 2

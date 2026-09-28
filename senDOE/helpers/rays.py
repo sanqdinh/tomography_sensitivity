@@ -1,27 +1,18 @@
-"""Dose-response degradation physics, shared by the 2D and 3D simulators.
+"""Beam and ray geometry on a pixel grid: which pixels a ray crosses, and in what order.
 
-Extracted verbatim from ``app.py`` so it can be imported by non-Streamlit code: ``app.py`` is a
-Streamlit script executed top-to-bottom with no ``__main__`` guard, so ``import app`` would run
-the whole page. Keeping the physics here means the 2D live picture and the 3D volume simulator
-call the *same* function and cannot drift apart.
+Pure numpy on top of the vendored :mod:`senDOE.helpers.geometry` intersection routine. Nothing
+here reads pixel values except :func:`ray_line_integral`, so the geometry is cached per
+``(r, theta, grid shape)`` and reused across every slice and every time step.
 
-Pure numpy + the vendored ``senDOE`` geometry — no Streamlit, no Pyomo, no solver. Safe to
-import from a headless script or a test.
-
-NOTE: ``bundle_r_values`` is mirrored in two other places that must stay in sync — the backend
-copy at ``tomography_uq.py`` (inside the geometry build loop) and the JS ``bundleR()`` in
-``live_sim_component/index.html``.
+``bundle_r_values`` is mirrored in JavaScript in ``frontend/live_sim_component/index.html`` and
+``frontend/volume_sim_component/index.html``; the two must stay in sync.
 """
 
 from functools import lru_cache
 
 import numpy as np
 
-# Vendored geometry primitives (importing them is not a backend change).
-from senDOE.helpers.geometry import (
-    get_line_abc_from_r_theta,
-    line_grid_intersections,
-)
+from senDOE.helpers.geometry import get_line_abc_from_r_theta, line_grid_intersections
 
 
 @lru_cache(maxsize=8192)
@@ -88,55 +79,6 @@ def ray_line_integral_stack(vol, r, theta):
     return np.einsum("i,ik->k", seg_lengths, vol[rows[:m], cols[:m], :])
 
 
-def degradation_dose_response(image, r, theta, I0, alpha, beta):
-    """numpy port of ``util.HelperTools.degradation_Dose_Response`` (numpy branch).
-
-    Degrades the image along the ray ``x·cosθ + y·sinθ = r`` using the dose-response model
-    ``pixel·exp(-α·I_local - β·I_local²)`` with ``I_local = I0·exp(-Σ radon)``, where Σ runs in
-    the beam **travel direction** ``(-sinθ, cosθ)`` — so the entry pixel sees full ``I0`` and 0°
-    (bottom-up) differs from 180° (top-down). The ray path comes from the cached
-    :func:`ray_geometry` (which wraps the vendored intersection routine). Returns the image
-    unchanged if the ray misses the grid, mirroring the backend's |r| clamp.
-    """
-    g = ray_geometry(float(r), float(theta), *image.shape)
-    if g is None:
-        return image  # line never enters the grid → no-op
-    rows, cols, seg_lengths, forward = g
-    # radon[i] = chord_length_i * pixel_value_at_crossing_i, exactly as the vendored routine
-    # builds it — but from the cached geometry, and read off the ORIGINAL image so the walk
-    # below (which writes into a copy) sees undamaged values, as it always has.
-    values = image[rows, cols]
-    radon = seg_lengths * values[: len(seg_lengths)]
-
-    out = image.copy()
-    n = len(rows)
-    # Walk the pixels in beam-travel order so 0° (bottom-up) differs from 180° (top-down); see
-    # ``ray_geometry`` for why the cached order may need reversing.
-    indices = range(n) if forward else range(n - 1, -1, -1)
-    dose = 0.0
-    for i in indices:
-        seg = i if forward else i - 1  # segment crossed to reach the next pixel in travel order
-        valid = 0 <= seg < len(radon)
-        # Degrade the pixel that OWNS the chord about to be traversed. On forward rays seg == i,
-        # so this is unchanged (including the tail at i = n-1, which owns no chord and is still
-        # degraded, preserving this function's long-standing convention). On antiparallel rays
-        # the owner is rows[seg] = rows[i-1], and writing rows[i] instead made every pixel shield
-        # itself -- the chord added below belonged to the pixel written on the NEXT iteration.
-        # The i = 0 tail is skipped there because rows[0] has already been written as the owner
-        # of segment 0, and rewriting it with its own chord included is exactly the defect.
-        if forward:
-            dst = i
-        elif valid:
-            dst = seg
-        else:
-            continue
-        local = I0 * np.exp(-dose)
-        out[rows[dst], cols[dst]] = values[dst] * np.exp(-alpha * local - beta * local**2)
-        if valid:
-            dose += radon[seg]
-    return out
-
-
 def bundle_r_values(offset: float, n_beams: int, image_res: int) -> list:
     """Radial positions of a ray bundle (BeamStep convention: n rays, 1 unit apart, centered).
 
@@ -154,3 +96,45 @@ def bundle_r_values(offset: float, n_beams: int, image_res: int) -> list:
     rs = np.floor(offset + (np.arange(n) - (n - 1) / 2.0)) + 0.5
     return [float(r) for r in rs if abs(r) <= r_max]
 
+
+def ray_walk(r: float, angle_rad: float, res: int):
+    """:func:`senDOE.helpers.dose.accumulate_dose`'s travel-order walk, as a list of records.
+
+    One record per crossing that actually deposits dose:
+    ``(dose_pixel, chord, shield_pixel)``, with pixels flattened to ``row * res + col``.
+    The shielding after record ``t`` is ``sum_{s <= t} chord_s * f[shield_pixel_s]``, and its
+    final value is the ray integral.
+
+    Returns ``None`` if the ray never enters the grid, matching ``ray_geometry``.
+    """
+    g = ray_geometry(float(r), float(angle_rad), int(res), int(res))
+    if g is None:
+        return None
+    rows, cols, seg, forward = g
+    n, n_seg = len(rows), len(seg)
+    walk = []
+    for i in (range(n) if forward else range(n - 1, -1, -1)):
+        s = i if forward else i - 1          # chord traversed on leaving crossing i
+        if 0 <= s < n_seg:
+            # Deposit pixel and shielding pixel are BOTH the chord's owner, rows[s]: that is
+            # eq:xd_dose_state, where they are the same symbol p. They are kept as separate
+            # fields only because the constraint builder reads them separately.
+            dst = i if forward else s
+            walk.append((int(rows[dst]) * res + int(cols[dst]),    # receives the dose
+                         float(seg[s]),                            # chord for that dose
+                         int(rows[s]) * res + int(cols[s])))       # shields the rest of the ray
+    return walk or None
+
+
+def measurement_rays(seq, image_res: int):
+    """``[(angle_rad, [(r, walk), ...]), ...]`` -- one entry per measurement, rays that hit."""
+    out = []
+    for angle_deg, offset, n_beams in seq:
+        ang = float(np.deg2rad(float(angle_deg)))
+        rays = []
+        for r in bundle_r_values(float(offset), int(n_beams), int(image_res)):
+            w = ray_walk(r, ang, image_res)
+            if w is not None:
+                rays.append((float(r), w))
+        out.append((ang, rays))
+    return out

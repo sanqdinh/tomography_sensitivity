@@ -12,7 +12,8 @@ The page has two tabs. The **2D** tab holds two modes that share it:
    picture shows that step, the viewed measurement's beams are traced in **blue**, and the table
    highlights that row. This runs entirely in the browser — no solver needed.
 
-2. **Reconstruct** (button) — runs :func:`tomography_uq.run_simple_uq` (a forward + inverse
+2. **Reconstruct** (button) — runs
+   :func:`senDOE.models.tomography_pyomo_2d_pixel_intersection_uq.run_simple_uq` (a forward + inverse
    optimization plus a sensitivity extraction, minutes at the default size). It solves **exactly**
    the table's
    sequence (same conversion the live image uses) with the live I0/α/β values, then shows the
@@ -43,9 +44,10 @@ import streamlit.components.v1 as components
 import plotly
 import plotly.graph_objects as go
 
-from tomography_uq import UQParams, BeamStep, run_simple_uq
+from senDOE.models.tomography_pyomo_2d_pixel_intersection_uq import (
+    UQParams, BeamStep, run_simple_uq)
 
-import matplotlib.pyplot as plt  # after tomography_uq sets the Agg backend
+import matplotlib.pyplot as plt  # after the UQ module sets the Agg backend
 import matplotlib.image as mpimg
 
 # Vendored geometry primitives (importing them is not a backend change).
@@ -55,36 +57,23 @@ from senDOE.helpers.geometry import (
     get_segment_polar,
 )
 
-# Dose-response physics lives in a Streamlit-free module so the 3D simulator can import it too
+# Dose-response physics lives in senDOE, Streamlit-free, so the 3D simulator shares it too
 # (importing app.py would execute this whole page). Bound to the old private names so the rest
 # of this file is unchanged.
-from dose_response import (
-    bundle_r_values as _bundle_r_values,
-    degradation_dose_response as _degradation_dose_response,
-)
-from tomography_3d import shepp_logan_3d, simulate_3d, detector_grid
-from degrade_v2 import (
-    V2Params,
-    radius_of_gyration,
-    scale_to_optical_depth,
-    simulate as simulate_v2_seq,
-)
-from degrade_v2_uq import V2UQParams, run_v2_reconstruction
-from degrade_v5_uq import V5UQParams, run_v5_reconstruction
-from degrade_v6_uq import V6UQParams, run_v6_reconstruction
-from degrade_v4 import (
-    V4Params,
-    simulate as simulate_v4_seq,
-    support_radius as support_radius_v4,
-)
-from degrade_v5 import V5Params, simulate as simulate_v5_seq, resolve as resolve_v5
-# v6 is forward-only: nothing from a *_uq module, so this tab never imports pyomo.
-from degrade_v6 import (V6Params, simulate as simulate_v6_seq,
-                        simulate_simultaneous as simulate_v6_sim, resolve as resolve_v6,
-                        shape_diagnostics as shape_diagnostics_v6,
-                        compaction_potential as _compaction_potential_v6,
-                        select_eta as _select_eta_v6)
-from degrade_v2 import accumulate_dose as _accumulate_dose
+from senDOE.helpers.rays import bundle_r_values as _bundle_r_values
+from senDOE.helpers.dose import degradation_dose_response as _degradation_dose_response
+from senDOE.models.tomography_3d import shepp_logan_3d, simulate_3d, detector_grid
+from senDOE.helpers.dose import accumulate_dose as _accumulate_dose, scale_to_optical_depth
+from senDOE.models.tomography_pyomo_2d_shrinkage_decay import (
+    ShrinkageDecayUQParams as ShrinkageDecayUQParams,
+    run_shrinkage_decay_reconstruction as run_shrinkage_decay_reconstruction)
+# The shrinkage-decay tab's model is senDOE's shrinkage-decay model, imported under the tab's shrinkage-decay names.
+from senDOE.models.tomography_2d_shrinkage_decay import (
+    ShrinkageDecayParams as ShrinkageDecayParams, simulate as simulate_shrinkage_seq,
+    simulate_simultaneous as simulate_shrinkage_sim, resolve as resolve_shrinkage,
+    shape_diagnostics as shape_diagnostics_shrinkage,
+    compaction_potential as _compaction_potential_shrinkage,
+    select_eta as _select_eta_shrinkage)
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 
@@ -105,14 +94,14 @@ IMAGE_RES = 30
 # Angle/Offset/#Beams sliders + the beam overlay and redraws the red preview lines *while* dragging,
 # client-side, so there is no server round-trip per drag (st.slider only reports on release). The
 # component reports the values back on release; Python renders only the static background image and
-# the committed (blue) bundle. See live_sim_component/index.html.
-_LIVE_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_sim_component")
+# the committed (blue) bundle. See frontend/live_sim_component/index.html.
+_LIVE_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "live_sim_component")
 _live_sim = components.declare_component("live_sim", path=_LIVE_SIM_DIR)
 
 # The 3D Volume view is the same idea one level up: the plot itself lives in the component, so the
 # beam curtains can be restyled in the browser while a slider is dragged. st.plotly_chart cannot do
 # that -- it is server-rendered, so the earliest it can react is the release.
-_VOLUME_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volume_sim_component")
+_VOLUME_SIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "volume_sim_component")
 
 
 def _ensure_plotly_asset() -> bool:
@@ -236,7 +225,7 @@ def _attach_script_ctx(ctx) -> bool:
     whole life of the reader thread, so there is no concurrent script run to race against.
 
     Never raises. On a Streamlit that has moved these symbols the caller just buffers instead,
-    and ``degrade_v2_uq._solve_streaming`` keeps the complete log either way.
+    and ``senDOE.helpers.solvers._solve_streaming`` keeps the complete log either way.
     """
     try:
         from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -607,92 +596,32 @@ for _k, _v in {
 }.items():
     st.session_state.setdefault(_k, _v)
 
-# 2D model v2 keeps its own namespace too. Its grid is NOT IMAGE_RES: the model is meaningless
-# on a coarse grid (numerical diffusion eats the moving interface), so it starts at 64.
-if "beam_table_v2" not in st.session_state:
-    st.session_state["beam_table_v2"] = _empty_beam_table()
-for _k, _v in {
-    "v2_angle": 45.0, "v2_offset": 0.0, "v2_nbeams": 0, "v2_res": 64,
-    "v2_view": "Attenuation f", "v2_showbeams": True,
-    "v2_depth": 1.1, "v2_I0": 1.0, "v2_c_q": 0.032, "v2_Q_c": 1.0,
-    "v2_omega_inf": 0.2, "v2_c_cp": 0.3, "v2_a": 0.05, "v2_b": 0.0,
-    "v2_eps_up": 0.0, "v2_E0": 1.0, "v2_nu": 0.3, "v2_clamp": False,
-    "v2_preset_lo": 0.0, "v2_preset_hi": 180.0, "v2_preset_n": 9,
-    "v2_view_k": 0,
-    # Reconstruct. eps_rel is NOT a forward-simulation knob: the tab simulates at eps_up = 0,
-    # which is exact, but sqrt(v^2) has no derivative at v = 0 so the NLP cannot use it. See
-    # degrade_v2.check_invariants -- the relative form is the one that is both differentiable
-    # and leaves the collapse and the I0 = 0 identity exact.
-    # 0.001, not the 2D tab's 0.1: this objective normalises both terms (see
-    # degrade_v2_uq.add_estimation_objective), so the weight means something different here.
-    # Measured at grid 12 with an over-determined geometry, theta error vs peak:
-    # tv 0 -> 0.63%, 0.001 -> 0.80%, 0.01 -> 3.47%, 0.05 -> 9.28%, 0.2 -> 19.0%.
-    "v2_tv_weight": 0.001, "v2_eps_rel": 1e-3, "v2_freeze": False, "v2_uq": True,
-}.items():
-    st.session_state.setdefault(_k, _v)
-
-# 2D reduced model (v4) -- its own namespace again. The dose state is gone, so there is no
-# c_q / Q_c / omega_inf here: the converted fraction is dw = 1 - exp(-c_omega * I_p * delta_p),
-# a function of THIS exposure alone. c_omega carries v3's c_q/Q_c = 0.1.
-if "beam_table_v4" not in st.session_state:
-    st.session_state["beam_table_v4"] = _empty_beam_table()
-for _k, _v in {
-    "v4_angle": 45.0, "v4_offset": 0.0, "v4_nbeams": 0, "v4_res": 32,
-    "v4_view": "Attenuation f", "v4_showbeams": True,
-    "v4_depth": 1.1, "v4_I0": 1.0,
-    "v4_c_omega": 0.1, "v4_c_cp": 0.3, "v4_a": 0.05, "v4_b": 0.0,
-    "v4_flux": "upwind", "v4_beta": 1000.0,
-    "v4_preset_lo": 0.0, "v4_preset_hi": 180.0, "v4_preset_n": 10,
-    "v4_view_k": 0,
-}.items():
-    st.session_state.setdefault(_k, _v)
-
-# 2D shrinkage dose-response (v5). v4 plus a compaction POTENTIAL: the flux driver stops being
-# pointwise,
-# which is what lets a uniformly damaged bulk condense instead of shuffling at the rim.
-if "beam_table_v5" not in st.session_state:
-    st.session_state["beam_table_v5"] = _empty_beam_table()
-for _k, _v in {
-    "v5_angle": 45.0, "v5_offset": 0.0, "v5_nbeams": 0, "v5_res": 32,
-    "v5_view": "Attenuation f", "v5_showbeams": True,
-    "v5_depth": 1.1, "v5_I0": 1.0,
-    "v5_c_omega": 0.1, "v5_c_cp": 0.3, "v5_a": 0.05, "v5_b": 0.0,
-    "v5_reach": 7.0, "v5_gamma": 100.0, "v5_fref": 0.002, "v5_beta": 1000.0,
-    "v5_preset_lo": 0.0, "v5_preset_hi": 180.0, "v5_preset_n": 10,
-    "v5_view_k": 0,
-    # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D
-    # tab's scale; maxiter is what keeps a browser run bounded, since the
-    # monolithic v5 NLP is not reliably convergent.
-    "v5_tv_weight": 0.001, "v5_maxiter": 300,
-}.items():
-    st.session_state.setdefault(_k, _v)
-
-# 2D implicit-transport shrinkage (v6). v5 with steps 5 and 6 changed: a softplus directed
+# 2D implicit-transport shrinkage (shrinkage-decay). v5 with steps 5 and 6 changed: a softplus directed
 # rate and one global sparse solve, so positivity and conservation are unconditional and the
-# compaction number is gone. Forward only -- no tv_weight, no maxiter, no results_v6.
-if "beam_table_v6" not in st.session_state:
-    st.session_state["beam_table_v6"] = _empty_beam_table()
+# compaction number is gone. Forward only -- no tv_weight, no maxiter, no stored results.
+if "beam_table_shrinkage" not in st.session_state:
+    st.session_state["beam_table_shrinkage"] = _empty_beam_table()
 for _k, _v in {
-    "v6_angle": 45.0, "v6_offset": 0.0, "v6_nbeams": 0, "v6_res": 32,
-    "v6_view": "Attenuation f", "v6_showbeams": True,
-    "v6_depth": 1.1, "v6_I0": 1.0,
-    "v6_c_omega": 0.1, "v6_c_cp": 0.3, "v6_a": 0.05, "v6_b": 0.0,
-    "v6_reach": 7.0, "v6_gamma": 100.0, "v6_fref": 0.002, "v6_eta": 1e-3,
+    "shrinkage_angle": 45.0, "shrinkage_offset": 0.0, "shrinkage_nbeams": 0, "shrinkage_res": 32,
+    "shrinkage_showbeams": True,
+    "shrinkage_depth": 1.1, "shrinkage_I0": 1.0,
+    "shrinkage_c_omega": 0.1, "shrinkage_c_cp": 0.3, "shrinkage_a": 0.05, "shrinkage_b": 0.0,
+    "shrinkage_reach": 7.0, "shrinkage_gamma": 100.0, "shrinkage_fref": 0.002, "shrinkage_eta": 1e-3,
     # eta is CHOSEN from the forward run by default -- no fixed value works, because max|dP|
     # spans 0.15 to 80 across this tab's own slider range. The slider is the override.
-    "v6_eta_auto": True,
+    "shrinkage_eta_auto": True,
     # Measurement schedule. SIMULTANEOUS is the default: the table's rows are one exposure
     # carrying every bundle, not one exposure each.
-    "v6_mode": "Simultaneous",
+    "shrinkage_mode": "Simultaneous",
     # Reconstruct. tv_weight is the normalised trade-off ratio, NOT the 2D tab's scale.
     # maxiter 3000, NOT 500. It was cut to 500 on the belief that this solve never converges and
     # the cap only decided how fast you found that out. That belief predated ma97 + select_eta +
     # the sigma-bound fix: grid 32 / K=5 simultaneous now reaches `optimal` at iteration 1253
     # (219 s, inf_du 2.5e-14, theta 9.16%), so a cap of 500 does not reveal a failure, it CAUSES
     # one. IPOPT stops at convergence, so the cap costs nothing when the solve succeeds.
-    "v6_tv_weight": 0.01, "v6_maxiter": 3000, "v6_noise": 0.0,
-    "v6_preset_lo": 0.0, "v6_preset_hi": 180.0, "v6_preset_n": 10,
-    "v6_view_k": 0,
+    "shrinkage_tv_weight": 0.01, "shrinkage_maxiter": 3000, "shrinkage_noise": 0.0,
+    "shrinkage_preset_lo": 0.0, "shrinkage_preset_hi": 180.0, "shrinkage_preset_n": 10,
+    "shrinkage_view_k": 0,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -783,10 +712,6 @@ def _recon_slice_figure(original, recon, logcov, k: int, status: str):
     return fig
 
 
-# Log-spaced, because the useful range is 1e-3..1e-1 and a linear 0.01 step cannot reach it.
-_V2_TV_WEIGHTS = (0.0, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)
-
-
 def _v2_recon_figure(res):
     """theta | reconstruction | error | log-variance, drawn from the stored arrays.
 
@@ -805,35 +730,6 @@ def _v2_recon_figure(res):
     if res.log_cov_diag_2D is not None:
         lc = np.where(np.isfinite(res.log_cov_diag_2D), res.log_cov_diag_2D, np.nan)
         panels.append((lc, "log10 posterior variance", "viridis", {}))
-    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
-    axes = np.atleast_1d(axes)
-    for ax, (img, ttl, cmap, kw) in zip(axes, panels):
-        if not np.any(np.isfinite(img)):
-            ax.text(0.5, 0.5, "unavailable", ha="center", va="center", transform=ax.transAxes)
-        else:
-            im = ax.imshow(img, cmap=cmap, interpolation="nearest", **kw)
-            fig.colorbar(im, ax=ax, fraction=0.046)
-        ax.set_title(ttl, fontsize=10)
-        ax.set_xticks([]); ax.set_yticks([])
-    fig.tight_layout()
-    return fig
-
-
-def _v5_recon_figure(res):
-    """theta | reconstruction | error, drawn from the stored arrays.
-
-    Three panels, not v2's four: there is no covariance panel because v5 runs no k_aug.  The
-    backend returns arrays rather than Figures, so the layout is built here.
-    """
-    theta, hat = res.theta_true, res.theta_hat
-    err = hat - theta
-    span = max(float(np.abs(err).max()), 1e-12)
-    vmax = max(float(theta.max()), 1e-12)
-    panels = [
-        (theta, "theta (truth)", "gray", dict(vmin=0.0, vmax=vmax)),
-        (hat, "theta reconstructed", "gray", dict(vmin=0.0, vmax=vmax)),
-        (err, "error (hat - truth)", "coolwarm", dict(vmin=-span, vmax=span)),
-    ]
     fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
     axes = np.atleast_1d(axes)
     for ax, (img, ttl, cmap, kw) in zip(axes, panels):
@@ -1030,8 +926,8 @@ def _sinogram_figure(panel, image_res, xlabel, xticklabels, title):
     """A sinogram panel: detector position (rows) against ``xlabel`` (columns).
 
     ``panel`` is a slice of the ``(detector, measurement, slice)`` array from
-    :func:`tomography_3d.simulate_3d`, so unmeasured cells are ``NaN``. A hand-built sequence
-    samples only a few of the ``image_res`` detector slots, so most of the panel is genuinely
+    :func:`senDOE.models.tomography_3d.simulate_3d`, so unmeasured cells are ``NaN``. A hand-built
+    sequence samples only a few of the ``image_res`` detector slots, so most of the panel is genuinely
     unmeasured — those cells are drawn in a flat off-colour via ``set_bad`` so they read as
     "no data" rather than as a real low line-integral.
 
@@ -1936,594 +1832,58 @@ def _render_3d_tab():
         st.caption("Slice z=%d mean: %.4f" % (k, float(vol[:, :, k].mean())))
 
 
-# --- 2D model v2 tab (revised damage model: dose is a state, mass moves) ----------------
-# Own session_state namespace (v2_*, beam_table_v2) so it cannot clobber the other two tabs.
-# The measurement-table schema is identical, so _empty_beam_table / _table_to_seq are reused
-# as-is, exactly as the 3D tab reuses them.
-
-# The manuscript is explicit that coarse grids make this model meaningless: at 10x10 numerical
-# diffusion smears the moving interface across the whole sample within a step or two. So this
-# tab does NOT use IMAGE_RES (30) -- it carries its own, finer grid.
-_V2_RESOLUTIONS = (64, 96, 128)
-
-_V2_VIEWS = ("Attenuation f", "Accumulated dose Q", "Change (f - theta)")
-
-
-def _cb_v2_step():
-    """Take a v2 measurement: append the current bundle to the v2 sequence table."""
-    s = st.session_state
-    new_row = pd.DataFrame(
-        [{
-            "angle_deg": float(s["v2_angle"]),
-            "offset": float(s["v2_offset"]),
-            "n_beams": int(s["v2_nbeams"]),
-        }]
-    )
-    s["beam_table_v2"] = pd.concat([s["beam_table_v2"], new_row], ignore_index=True)
-    s["v2_view_k"] = len(s["beam_table_v2"])  # jump the view to the just-taken measurement
-
-
-def _cb_v2_reset():
-    """Clear the v2 sequence -- back to the undamaged sample at zero dose."""
-    st.session_state["beam_table_v2"] = _empty_beam_table()
-
-
-def _cb_sync_live_sim_v2():
-    """Fold the component's reported bundle back into the canonical ``v2_*`` values."""
-    _sync_live_sim("v2", "live_sim_v2")
-
-
-@st.cache_data(show_spinner=False)
-def _simulate_v2(seq: tuple, image_res: int, optical_depth: float, I0: float, c_q: float,
-                 Q_c: float, omega_inf: float, c_cp: float, a: float, b: float, eps_up: float,
-                 E0: float, nu: float, clamp_bottom: bool):
-    """``(theta, f, Q, summary)`` for the sequence -- a pure function of the table + parameters.
-
-    Cached like ``_simulate_3d``, so panning the view, switching what is plotted and re-reading
-    the table are all cache hits; only taking a measurement or moving a parameter recomputes.
-    The stiffness factorisation, the expensive part, therefore happens once per distinct setting.
-
-    ``summary`` is plain floats rather than the ``StepInfo`` dataclasses so nothing exotic goes
-    through the cache.
-    """
-    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
-    p = V2Params(I0=float(I0), c_q=float(c_q), Q_c=float(Q_c), omega_inf=float(omega_inf),
-                 c_cp=float(c_cp), a=float(a), b=float(b), eps_up=float(eps_up),
-                 E0=float(E0), nu=float(nu), clamp_bottom=bool(clamp_bottom))
-    f, Q, infos = simulate_v2_seq(theta, seq, p, int(image_res))
-    rg0, rg1 = radius_of_gyration(theta), radius_of_gyration(f)
-    summary = {
-        "courant": max((i.courant for i in infos), default=0.0),
-        "mass0": float(theta.sum()),
-        "mass1": float(f.sum()),
-        "lost": sum((i.lost for i in infos), 0.0),
-        "rg0": rg0,
-        "rg1": rg1,
-        "rg_pct": (100.0 * (rg1 - rg0) / rg0) if rg0 > 0 else float("nan"),
-        "q_max": float(Q.max()),
-        "f_min": float(f.min()),
-        "dw_max": max((i.dw_max for i in infos), default=0.0),
-    }
-    return theta, f, Q, summary
-
-
-# --- 2D reduced model (v4) tab: forward simulation only, no reconstruction ---------------
-# v3 with the dose state removed. Setting the response floor to zero collapses the accumulated
-# dose out of the algebra, so the converted fraction depends on THIS exposure alone:
-#   dw = 1 - omega(Q_k+1)/omega(Q_k) = 1 - exp(-(Q_k+1 - Q_k)/Qc) = 1 - exp(-c_omega I_p delta_p)
-# The state is the single field f. Verified bit-identical to v3 at omega_inf = 0
-# (degrade_v4's G4), so this tab is the same physics with one fewer state variable.
-_V4_RESOLUTIONS = (32, 48, 64, 96)
-_V4_VIEWS = ("Attenuation f", "Converted fraction dw", "Change (f - theta)")
-_V4_FLUXES = ("upwind", "harmonic")
-
-
-def _cb_v4_step():
-    """Take a v4 measurement: append the current bundle to the v4 sequence table."""
-    s = st.session_state
-    s["beam_table_v4"] = pd.concat(
-        [s["beam_table_v4"], pd.DataFrame([{
-            "angle_deg": float(s["v4_angle"]),
-            "offset": float(s["v4_offset"]),
-            "n_beams": int(s["v4_nbeams"]),
-        }])], ignore_index=True)
-    s["v4_view_k"] = len(s["beam_table_v4"])
-
-
-def _cb_v4_reset():
-    """Clear the v4 sequence -- back to the undamaged sample."""
-    st.session_state["beam_table_v4"] = _empty_beam_table()
-
-
-def _cb_sync_live_sim_v4():
-    """Fold the component's reported bundle back into the canonical ``v4_*`` values."""
-    _sync_live_sim("v4", "live_sim_v4")
-
-
-@st.cache_data(show_spinner=False)
-def _simulate_v4(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
-                 c_cp: float, a: float, b: float, flux: str, beta: float):
-    """``(theta, f, dw, summary)`` for the sequence -- a pure function of table + parameters.
-
-    Cached like ``_simulate_v2``: scrubbing the view or switching the panel is a cache hit, only
-    a new measurement or a moved parameter recomputes. ``summary`` is plain floats so nothing
-    exotic crosses the cache.
-
-    The shrinkage statistic is the SUPPORT RADIUS about the FIXED INITIAL CENTROID, not the
-    radius of gyration and not the support radius about the field's own centroid. Both of those
-    were measured to be misleading on this model: Rg reported the WRONG SIGN in both directions,
-    and the own-centroid support radius reported +1.0% growth for a specimen that had not grown,
-    because asymmetric mass loss drags the centroid 0.36 px. Rg is kept as a secondary readout
-    and labelled.
-    """
-    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
-    p = V4Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
-                 beta=float(beta), flux=str(flux))
-    f, infos = simulate_v4_seq(theta, seq, p, int(image_res))
-
-    nr, nc = theta.shape
-    yy, xx = np.mgrid[0:nr, 0:nc]
-    m0 = float(theta.sum())
-    cx0, cy0 = (xx * theta).sum() / m0, (yy * theta).sum() / m0
-    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2).ravel()
-    order = np.argsort(rad)
-    rsort = rad[order]
-
-    def _sup(img):
-        w = np.clip(np.asarray(img, dtype=float).ravel(), 0.0, None)[order]
-        c = np.cumsum(w)
-        return float(rsort[np.searchsorted(c, 0.99 * c[-1])]) if c[-1] > 0 else float("nan")
-
-    r0, r1 = _sup(theta), _sup(f)
-    msum = float(f.sum())
-    drift = (float(np.hypot((xx * f).sum() / msum - cx0, (yy * f).sum() / msum - cy0))
-             if msum > 0 else float("nan"))
-    rg0, rg1 = radius_of_gyration(theta), radius_of_gyration(f)
-    # dw of the NEXT exposure at the current aim, for the panel -- a view, not a state.
-    dw_panel = np.zeros_like(theta)
-    if seq:
-        from degrade_v2 import accumulate_dose as _acc
-        from dose_response import bundle_r_values as _brv
-        ang, off, nb = seq[-1]
-        cid, _ip = _acc(f, _brv(float(off), int(nb), int(image_res)),
-                        float(np.deg2rad(float(ang))), float(I0), float(c_omega))
-        dw_panel = 1.0 - np.exp(-cid)
-    summary = {
-        "mass0": m0, "mass1": msum, "lost": sum((i.lost for i in infos), 0.0),
-        "sup0": r0, "sup1": r1,
-        "sup_pct": (100.0 * (r1 - r0) / r0) if r0 > 0 else float("nan"),
-        "drift": drift,
-        "rg0": rg0, "rg1": rg1,
-        "rg_pct": (100.0 * (rg1 - rg0) / rg0) if rg0 > 0 else float("nan"),
-        "ck": max((i.compaction for i in infos), default=0.0),
-        "dw_max": max((i.dw_max for i in infos), default=0.0),
-        "f_min": min((i.state_min for i in infos), default=float(f.min())),
-        "beta_g": float(beta) * max((i.max_g for i in infos), default=0.0),
-    }
-    return theta, f, dw_panel, summary
-
-
-# --- 2D shrinkage dose-response (v5) tab: forward simulation only ------------------------
-# v4 with the compaction potential made NONLOCAL. v4's flux is driven by Pi, a pointwise
-# function of the local state, and prop:xd_locality then forbids a uniformly damaged bulk from
-# moving at all -- measured interior flux divergence exactly 0.000e+00, which is why v4 shuffles
-# mass at the rim instead of condensing the specimen. v5 drives the same flux with a potential
-# phi solved across the whole specimen, so the bulk can move.
-#
-# THE REACH SLIDER IS THE POINT. l -> small recovers v4 (rim shuffling); l ~ R and above gives
-# whole-body contraction. Sliding it walks the closure between the two behaviours.
-_V5_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
-_V5_RESOLUTIONS = (32, 48, 64)
-
-
-def _cb_v5_step():
-    s = st.session_state
-    s["beam_table_v5"] = pd.concat(
-        [s["beam_table_v5"], pd.DataFrame([{
-            "angle_deg": float(s["v5_angle"]), "offset": float(s["v5_offset"]),
-            "n_beams": int(s["v5_nbeams"])}])], ignore_index=True)
-    s["v5_view_k"] = len(s["beam_table_v5"])
-
-
-def _cb_v5_reset():
-    st.session_state["beam_table_v5"] = _empty_beam_table()
-
-
-def _cb_sync_live_sim_v5():
-    _sync_live_sim("v5", "live_sim_v5")
-
-
-@st.cache_data(show_spinner=False)
-def _simulate_v5(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
-                 c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
-                 beta: float):
-    """``(theta, f, phi, summary)``. Support radius is about the FIXED initial centroid."""
-    theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
-    p = V5Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b), c_cp=float(c_cp),
-                 reach=float(reach), gamma=float(gamma), f_ref_frac=float(fref),
-                 beta=float(beta))
-    try:
-        f, infos = simulate_v5_seq(theta, seq, p, int(image_res))
-        err = None
-    except Exception as exc:                 # the potential's guards raise rather than return junk
-        f, infos, err = theta.copy(), [], str(exc).split(":")[0]
-
-    nr, nc = theta.shape
-    yy, xx = np.mgrid[0:nr, 0:nc]
-    m0 = float(theta.sum())
-    cx0, cy0 = (xx * theta).sum() / m0, (yy * theta).sum() / m0
-    rad = np.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2).ravel()
-    order = np.argsort(rad)
-    rsort = rad[order]
-
-    def _q(img, frac):
-        w = np.clip(np.asarray(img, float).ravel(), 0.0, None)[order]
-        c = np.cumsum(w)
-        return float(rsort[np.searchsorted(c, frac * c[-1])]) if c[-1] > 0 else float("nan")
-
-    r0, r1 = _q(theta, 0.99), _q(f, 0.99)
-    h0, h1 = _q(theta, 0.50), _q(f, 0.50)
-    # signed radial transport: one sign change is condensation, many is rim shuffling
-    d = f - theta
-    bands = [float(d[(rad.reshape(nr, nc) >= lo) & (rad.reshape(nr, nc) < lo + 2)].sum())
-             for lo in range(0, int(0.55 * nr), 2)]
-    flips = sum(1 for i in range(len(bands) - 1) if bands[i] * bands[i + 1] < 0)
-    msum = float(f.sum())
-    phi_panel = np.zeros_like(theta)
-    if infos and seq:
-        from degrade_v5 import compaction_potential
-        from degrade_v2 import accumulate_dose as _acc
-        from dose_response import bundle_r_values as _brv
-        pr = resolve_v5(p, theta)
-        ang, off, nb = seq[-1]
-        cid, I_p = _acc(f, _brv(float(off), int(nb), int(image_res)),
-                        float(np.deg2rad(float(ang))), pr.I0, pr.c)
-        try:
-            phi_panel, _Pi, _sg = compaction_potential(f * pr.decay_factor(I_p),
-                                                       1.0 - np.exp(-cid), pr)
-        except Exception:
-            pass
-    summary = {
-        "err": err, "mass0": m0, "mass1": msum,
-        "sup0": r0, "sup1": r1, "sup_pct": (100.0 * (r1 - r0) / r0) if r0 > 0 else float("nan"),
-        "half_pct": (100.0 * (h1 - h0) / h0) if h0 > 0 else float("nan"),
-        "flips": flips,
-        "inner": float(d[(rad.reshape(nr, nc) < 0.25 * nr)].sum()),
-        "outer": float(d[(rad.reshape(nr, nc) > 0.30 * nr)].sum()),
-        "ck": max((i.compaction for i in infos), default=0.0),
-        "dw_max": max((i.dw_max for i in infos), default=0.0),
-        "f_min": min((i.state_min for i in infos), default=float(f.min())),
-        "phi_cr": (infos[-1].phi_core_rim if infos else float("nan")),
-    }
-    return theta, f, phi_panel, summary
-
-
-def _render_2d_v5_tab():
-    """Shrinkage dose-response: whole-body condensation rather than rim shuffling."""
-    s = st.session_state
-    st.caption(
-        "**Shrinkage dose-response model (v5).** v4 with one change: the compaction flux is driven "
-        "by a "
-        "**potential solved across the whole specimen** instead of by the pointwise `Pi`. That "
-        "matters because a pointwise antisymmetric flux *cannot* move a uniformly damaged bulk "
-        "\u2014 measured interior divergence exactly 0.000e+00 in v4 \u2014 so v4 shuffles mass "
-        "between neighbours at the rim where v5 condenses the sample. **The reach slider walks "
-        "between them:** small reach reproduces v4, reach of order the specimen radius gives the "
-        "elasticity-like whole-body contraction. Forward simulation only."
-    )
-    left, mid, right = st.columns([3, 2, 2])
-    res = int(s["v5_res"])
-    seq_all = _table_to_seq(s["beam_table_v5"])
-    n_all = len(seq_all)
-    seq = seq_all[:max(0, min(int(s["v5_view_k"]), n_all))]
-    n_meas = len(seq)
-    theta, f, phi, summary = _simulate_v5(
-        seq, res, float(s["v5_depth"]), float(s["v5_I0"]), float(s["v5_c_omega"]),
-        float(s["v5_c_cp"]), float(s["v5_a"]), float(s["v5_b"]), float(s["v5_reach"]),
-        float(s["v5_gamma"]), float(s["v5_fref"]), float(s["v5_beta"]))
-
-    view = s["v5_view"]
-    if view == _V5_VIEWS[1]:
-        panel, vlo, vhi = phi, 0.0, max(float(phi.max()), 1e-12)
-    elif view == _V5_VIEWS[2]:
-        panel = f - theta
-        span = max(float(np.abs(panel).max()), 1e-12); vlo, vhi = -span, span
-    else:
-        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
-
-    with left:
-        _nav_block("v5_view_k", n_all)
-        _live_sim(
-            image_uri=_live_background_uri(panel, vlo, vhi), image_res=res, k=n_meas,
-            angle=float(s["v5_angle"]), offset=float(s["v5_offset"]),
-            nbeams=int(s["v5_nbeams"]),
-            committed=(list(seq[-1]) if n_meas else None),
-            beams_visible=bool(s["v5_showbeams"]),
-            angle_range=[0, 360, 1], offset_range=[-float(res)/2, float(res)/2, 0.5],
-            nbeams_range=[0, res, 1],
-            title="%s   \u00b7   %d measurement%s   \u00b7   %d\u00d7%d"
-                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
-            hint='<b style="color:#ff2b2b">Red</b> = next-measurement preview; '
-                 '<b style="color:#1f77ff">blue</b> = last measurement taken.',
-            legend="%.3g" % vhi,
-            default={"angle": float(s["v5_angle"]), "offset": float(s["v5_offset"]),
-                     "nbeams": int(s["v5_nbeams"])},
-            key="live_sim_v5", on_change=_cb_sync_live_sim_v5)
-        st.radio("View", _V5_VIEWS, key="v5_view", horizontal=True)
-
-    with mid:
-        act = st.columns(2)
-        act[0].button("\u2795 Take measurement", on_click=_cb_v5_step,
-                      use_container_width=True, key="v5_take")
-        act[1].button("Reset", on_click=_cb_v5_reset, use_container_width=True, key="v5_clear")
-        st.checkbox("Show beams", key="v5_showbeams")
-        with st.expander("Compaction reach \u2014 the v4/v5 dial", expanded=True):
-            st.slider("l \u2014 compaction reach (px)", 0.5, 32.0, step=0.5, key="v5_reach",
-                      help="A PHYSICAL length, so unlike c_cp it transfers across grids. Small l "
-                           "recovers v4 exactly and the sample shuffles at the rim; l of order "
-                           "the specimen radius (~15 px here) gives whole-body contraction. "
-                           "Below about R/2 the potential is still rim-peaked.")
-            st.slider("c_cp \u2014 compaction number", 0.0, 3.0, step=0.05, key="v5_c_cp")
-        with st.expander("Beam, conversion and decay", expanded=True):
-            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v5_I0")
-            st.slider("c_omega \u2014 conversion", 0.0, 3.0, step=0.05, key="v5_c_omega")
-            st.slider("a \u2014 decay", 0.0, 0.5, step=0.005, format="%.3f", key="v5_a",
-                      help="a = b = 0 conserves mass EXACTLY, whatever c_cp does. That is the "
-                           "clean shrinkage test: any change in support is then transport alone.")
-            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
-                      key="v5_b")
-        with st.expander("Potential numerics", expanded=False):
-            st.select_slider("f_ref / f_max", options=(0.0005, 0.002, 0.01, 0.05, 0.2),
-                             key="v5_fref",
-                             help="Density at which material starts conducting. PHYSICAL, not "
-                                  "numerical: at most a fifth of the smallest interior value the "
-                                  "phantom carries. Too large and the closure switches off over "
-                                  "a low-contrast interior \u2014 on Shepp-Logan 0.05 expands "
-                                  "and 0.01 or below contracts.")
-            st.select_slider("gamma \u2014 vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
-                             key="v5_gamma", help="Sets how fast the potential decays into "
-                                                  "vacuum. Needs gamma >> 1.")
-            st.select_slider("beta", options=(100.0, 1000.0, 5000.0), key="v5_beta")
-            st.select_slider("Grid", options=_V5_RESOLUTIONS, key="v5_res")
-
-    with right:
-        _preset_block("v5", "beam_table_v5", "v5_view_k")
-        st.markdown("**Measurement sequence**")
-        st.dataframe(s["beam_table_v5"], use_container_width=True, height=180)
-        if summary["err"]:
-            st.error("Potential solve refused: %s. The guards raise rather than return a wrong "
-                     "answer \u2014 raise the reach or f_ref." % summary["err"])
-        if summary["ck"] > 1.0:
-            st.warning("C_k = %.2f > 1: the positivity bound no longer holds. Check min f."
-                       % summary["ck"])
-        m = st.columns(2)
-        m[0].metric("Support radius (99%)", "%.4g" % summary["sup1"],
-                    delta="%+.3f%%" % summary["sup_pct"], delta_color="inverse",
-                    help="About the FIXED initial centroid. Negative is contraction.")
-        m[1].metric("Half-mass radius (50%)", "%.4g" % summary["half_pct"] if False else
-                    "%+.3f%%" % summary["half_pct"],
-                    help="The interior statistic. v4 leaves this at 0.000% because it only ever "
-                         "moves the rim; v5 moving it is the whole-body condensation.")
-        m2 = st.columns(2)
-        m2[0].metric("Radial sign changes", "%d" % summary["flips"],
-                     help="**The elasticity test.** ONE sign change is coherent condensation: "
-                          "mass leaves the outside and arrives inside. Several means mass is "
-                          "shuffling between neighbours, which is what v4 does.")
-        m2[1].metric("Total attenuation", "%.4g" % summary["mass1"],
-                     delta="%+.3g" % (summary["mass1"] - summary["mass0"]))
-        st.caption(
-            "net mass inside **%+.3g** \u00b7 outside **%+.3g** \u00b7 C_k **%.3f** \u00b7 "
-            "min f **%.2e** \u00b7 phi centre/rim **%.2f**"
-            % (summary["inner"], summary["outer"], summary["ck"], summary["f_min"],
-               summary["phi_cr"]))
-        if float(s["v5_a"]) == 0.0 and float(s["v5_b"]) == 0.0:
-            st.success("a = b = 0: mass exactly conserved, so any support change is transport "
-                       "alone \u2014 the clean shrinkage test.")
-        if summary["phi_cr"] == summary["phi_cr"] and summary["phi_cr"] < 1.0:
-            st.info("phi is still rim-peaked (centre/rim %.2f < 1): raise the reach above about "
-                    "half the specimen radius to get whole-body contraction."
-                    % summary["phi_cr"])
-
-    # --- Reconstruct ------------------------------------------------------------------------
-    # Appended below the live layout rather than given a sub-tab, mirroring the 2D and v2 tabs.
-    # The solve runs the WHOLE table however far the view is scrubbed back.
-    st.divider()
-    st.subheader("Reconstruct")
-    st.caption(
-        "Estimate the undamaged reference field **theta = f_0** from the projections, by "
-        "solving the v5 dynamics backwards. The measurements come from the numpy simulator "
-        "above; the NLP is an independent Pyomo transcription of the same steps, and it is "
-        "re-checked against the simulator on your geometry before every solve. **One "
-        "monolithic solve** — no Picard iteration, and no retry on a better start."
-    )
-
-    rc = st.columns([1, 1, 2])
-    with rc[0]:
-        st.select_slider(
-            "TV weight", options=_V2_TV_WEIGHTS, key="v5_tv_weight",
-            format_func=lambda v: ("%g" % v) if v else "0",
-            help="Total-variation regularisation on theta. Both objective terms are normalised "
-                 "to O(1) first, so this is a dimensionless trade-off ratio and **not** the 2D "
-                 "tab's scale. Raise it when the geometry is starved of rays, not otherwise.")
-    with rc[1]:
-        st.number_input("Max IPOPT iterations", min_value=50, max_value=5000, step=50,
-                        key="v5_maxiter",
-                        help="One shot: if this cap is hit the run reports and stops rather "
-                             "than retrying. The cap is what makes a browser run bounded.")
-    with rc[2]:
-        if not n_all:
-            st.caption("Take at least one measurement first.")
-        else:
-            _nr = sum(len(_bundle_r_values(o, nb, res)) for (_a, o, nb) in seq_all)
-            st.caption("**%d** measurement%s · %d rays · grid %d×%d · "
-                       "%d observations for %d pixels."
-                       % (n_all, "" if n_all == 1 else "s", _nr, res, res, _nr, res * res))
-            if _nr < res * res:
-                st.caption("Underdetermined by **%.1fx** — the TV term, not the data, is "
-                           "choosing among the fields that fit. A theta error here mixes the "
-                           "estimator with the regulariser; set **I0 = 0** above to see the "
-                           "tomography-only baseline and read the gap."
-                           % (res * res / max(_nr, 1)))
-            st.warning(
-                "⚠️ **The monolithic v5 estimation NLP is not reliably convergent.** "
-                "`c_phi` is bilinear in `(sigma, phi)`, which puts an indefinite cross block in "
-                "the Lagrangian Hessian at every iterate. Measured at grid 32 / K=4: the "
-                "`I0 = 0` control converges (116 iterations, 49% regularised), the full "
-                "dynamics is the open question this surface exists to answer. For a long run "
-                "use the CLI, not a browser tab: `python3 degrade_v5_uq.py --reconstruct "
-                "--image-res %d --n-steps %d -o out.npz`." % (res, n_all))
-
-    go_v5 = st.button("Reconstruct", type="primary", key="btn_v5_recon",
-                      disabled=(n_all == 0), use_container_width=False)
-
-    # Signature of everything the answer depends on, stored with it: a stale result is reported
-    # rather than silently shown. Same guard the v2 and 3D surfaces use.
-    v5_key = (seq_all, res, float(s["v5_depth"]), float(s["v5_I0"]), float(s["v5_c_omega"]),
-              float(s["v5_c_cp"]), float(s["v5_a"]), float(s["v5_b"]), float(s["v5_reach"]),
-              float(s["v5_gamma"]), float(s["v5_fref"]), float(s["v5_beta"]),
-              float(s["v5_tv_weight"]), int(s["v5_maxiter"]))
-
-    if go_v5:
-        log_box = st.empty()
-        log_lines: list[str] = []
-        _last = [0.0]
-
-        def _render_v5_log() -> None:
-            _render_log_box(log_box, "".join(log_lines))
-
-        def _v5_log(chunk: str) -> None:
-            log_lines.append(chunk)
-            now = time.time()
-            if now - _last[0] >= 0.2:
-                _last[0] = now
-                _render_v5_log()
-
-        params_v5 = V5UQParams(
-            image_res=res, optical_depth=float(s["v5_depth"]), beam_steps=seq_all,
-            I0=float(s["v5_I0"]), c=float(s["v5_c_omega"]), a=float(s["v5_a"]),
-            b=float(s["v5_b"]), c_cp=float(s["v5_c_cp"]), reach=float(s["v5_reach"]),
-            gamma=float(s["v5_gamma"]), f_ref_frac=float(s["v5_fref"]),
-            beta=float(s["v5_beta"]), tv_weight=float(s["v5_tv_weight"]),
-            ipopt_max_iter=int(s["v5_maxiter"]))
-        with st.spinner("Solving the v5 estimation NLP…"):
-            try:
-                out = run_v5_reconstruction(params_v5, log_callback=_v5_log)
-                st.session_state["results_v5"] = {"res": out, "key": v5_key}
-            except RuntimeError as exc:      # curated: the drift gate, or no usable solver
-                st.session_state.pop("results_v5", None)
-                st.error(str(exc))
-            except Exception as exc:
-                st.session_state.pop("results_v5", None)
-                st.error("Reconstruct failed: %s" % exc)
-                st.exception(exc)
-            finally:
-                _render_v5_log()
-
-    stash5 = st.session_state.get("results_v5")
-    if stash5 is None:
-        st.info("Build a measurement sequence, then press **Reconstruct**.")
-    else:
-        out = stash5["res"]
-        if stash5["key"] != v5_key:
-            st.warning("Parameters or the sequence changed since this was solved — press "
-                       "**Reconstruct** again to refresh it.")
-        _ok = "optimal" in out.status
-        (st.success if _ok else st.error)(
-            "inverse: **%s** (%s) · %s iterations · continuation: %s · "
-            "fit RMS **%.3g** · theta error **%.2f%% of peak** · %s vars / %s cons "
-            "· model-vs-simulator residual %.1e"
-            % (out.status, out.linear_solver, out.iters, out.continuation_status, out.obs_rms,
-               out.theta_pct_peak, "{:,}".format(out.n_vars), "{:,}".format(out.n_cons),
-               out.forward_residual))
-        # The two numbers that separate "the start was bad" from "the Hessian is indefinite".
-        # Without both, a non-convergence is unattributable and the run says nothing.
-        st.caption(
-            "Start residual **%.1e** · Hessian regularised on **%d of %d** iterations "
-            "(**%.0f%%**) · continuation reached %.2f%% on its own. %s"
-            % (out.init_residual, out.regularised, out.n_iter_lines, out.regularised_pct,
-               out.theta_rms_cont,
-               "" if _ok else
-               "**Not converged.** A low start residual with a high regularisation fraction "
-               "points at the bilinear `(sigma, phi)` block in `c_phi`, not at the "
-               "initialisation — set **I0 = 0** to keep that block but remove the "
-               "dynamics, and compare."))
-        st.caption(
-            "eq:xd_box active set on theta: **%d** at the lower bound, **%d** at the upper, "
-            "%d interior. Damage this run: mass **%.3f → %.3f**, C_k **%.3f**, max phi "
-            "**%.3g**, support **%+.2f%%**, half-mass **%+.2f%%**, %d radial sign change(s). "
-            "If the shape numbers are near zero the transport did almost nothing, and the "
-            "reconstruction was not really asked to invert it."
-            % (out.n_theta_at_lower, out.n_theta_at_upper, out.n_theta_interior,
-               out.theta_true.sum(), out.mass_true, out.ck_max, out.phi_max,
-               out.support_pct, out.half_pct, out.flips))
-        st.pyplot(_v5_recon_figure(out), use_container_width=True)
-        st.caption(
-            "**theta error** is available only because the data is synthetic — the "
-            "estimator scored against the truth it was generated from, not something a real "
-            "experiment could report. **Fit RMS** is the residual the NLP actually minimised. "
-            "No covariance and no D-optimality here: v5 is scoped to the damage model and its "
-            "solve, so the k_aug step the v2 surface carries is deliberately absent."
-        )
-
-
-
-# --- 2D implicit-transport shrinkage (v6) tab: forward simulation only --------------------
+# --- 2D implicit-transport shrinkage (shrinkage-decay) tab: forward simulation only --------------------
 # v5 with steps 5 and 6 changed. The explicit upwind flux and its compaction number are gone;
 # eq:xd_implicit_transport is one sparse solve whose matrix is an M-matrix with unit column
 # sums, so positivity and exact conservation hold with no step-size condition. What replaces
 # C_k on the readout is the pair that CAN go wrong here: eta against the max |dP| it has to
 # discriminate, and gamma(1-sigma)/varsigma inside the bulk.
-_V6_VIEWS = ("Attenuation f", "Potential phi", "Change (f - theta)")
 # The measurement schedule. Same total exposure either way -- every row's bundle is fired with
 # the same I0 -- and the two differ only in how it is split in time, which is the fractionation
-# question experiment_v6_fractionation.py measures (3.46x at c_omega = 0.4).
-_V6_MODES = ("Simultaneous", "Sequential")
-# TV weight ladder for the v6 Reconstruct. WIDER than the v2/v5 tabs' _V2_TV_WEIGHTS, which tops
-# out at 0.5: 1-2-5 per decade from 1e-4 to 100, so the range runs 200x higher and 5x lower.
-# A separate tuple rather than widening _V2_TV_WEIGHTS, which v2 and v5 share and which was
-# calibrated against v2's measured behaviour (0.01 -> 3.5% theta error, 0.2 -> 19%).
+# question experiment_shrinkage_fractionation.py measures (3.46x at c_omega = 0.4).
+_SHRINKAGE_MODES = ("Simultaneous", "Sequential")
+# TV weight ladder for the shrinkage-decay Reconstruct: 1-2-5 per decade from 1e-4 to 100.
 #
-# The top of this range is not decoration. v6's estimation NLP does not converge at grid 32 --
+# The top of this range is not decoration. shrinkage-decay's estimation NLP does not converge at grid 32 --
 # 100 iterations leave inf_du at 1.2e+06 with 62% of iterations Hessian-regularised -- and a
 # heavy TV term is one of the few levers that makes the objective more strongly convex, so the
 # region above 1 is worth being able to reach even though it will visibly over-smooth.
-_V6_TV_WEIGHTS = (0.0, 1e-4, 2e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+_SHRINKAGE_TV_WEIGHTS = (0.0, 1e-4, 2e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
                   0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
-_V6_RESOLUTIONS = (32, 48, 64, 96)
-from degrade_v6 import ETA_RATIO_TARGET as _ETA_TARGET_V6
-_V6_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.2, 0.5)
-_V6_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
+_SHRINKAGE_RESOLUTIONS = (32, 48, 64, 96)
+from senDOE.models.tomography_2d_shrinkage_decay import ETA_RATIO_TARGET as _ETA_TARGET_SHRINKAGE
+_SHRINKAGE_ETAS = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.2, 0.5)
+_SHRINKAGE_FREFS = (0.0002, 0.001, 0.002, 0.01, 0.05, 0.2)
 
 
-def _cb_v6_step():
+def _cb_shrinkage_step():
     s = st.session_state
-    s["beam_table_v6"] = pd.concat(
-        [s["beam_table_v6"], pd.DataFrame([{
-            "angle_deg": float(s["v6_angle"]), "offset": float(s["v6_offset"]),
-            "n_beams": int(s["v6_nbeams"])}])], ignore_index=True)
-    s["v6_view_k"] = len(s["beam_table_v6"])
+    s["beam_table_shrinkage"] = pd.concat(
+        [s["beam_table_shrinkage"], pd.DataFrame([{
+            "angle_deg": float(s["shrinkage_angle"]), "offset": float(s["shrinkage_offset"]),
+            "n_beams": int(s["shrinkage_nbeams"])}])], ignore_index=True)
+    s["shrinkage_view_k"] = len(s["beam_table_shrinkage"])
 
 
-def _cb_v6_reset():
-    st.session_state["beam_table_v6"] = _empty_beam_table()
+def _cb_shrinkage_reset():
+    st.session_state["beam_table_shrinkage"] = _empty_beam_table()
 
 
-def _cb_sync_live_sim_v6():
-    _sync_live_sim("v6", "live_sim_v6")
+def _cb_sync_live_sim_shrinkage():
+    _sync_live_sim("shrinkage", "live_sim_shrinkage")
 
 
 @st.cache_data(show_spinner=False)
-def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
+def _simulate_shrinkage(seq: tuple, image_res: int, optical_depth: float, I0: float, c_omega: float,
                  c_cp: float, a: float, b: float, reach: float, gamma: float, fref: float,
                  eta: float, mode: str = "Simultaneous", auto_eta: bool = True):
     """``(theta, f, phi, summary)``.  Radii are about the FIXED initial centroid.
 
-    Shape statistics come from ``degrade_v6.shape_diagnostics`` rather than being re-derived
-    here: ``_simulate_v5`` keeps a hand copy of that block, which is one edit away from
-    disagreeing with the module it is supposed to mirror.
+    Shape statistics come from ``senDOE.helpers.shape_metrics.shape_diagnostics`` rather than
+    being re-derived here, so the tab cannot disagree with the module it mirrors.
     """
     theta = scale_to_optical_depth(_phantom(image_res), float(optical_depth), int(image_res))
-    _mk = lambda e: V6Params(I0=float(I0), c=float(c_omega), a=float(a), b=float(b),
+    _mk = lambda e: ShrinkageDecayParams(I0=float(I0), c=float(c_omega), a=float(a), b=float(b),
                              c_cp=float(c_cp), reach=float(reach), gamma=float(gamma),
                              f_ref_frac=float(fref), eta=float(e))
     p = _mk(eta)
@@ -2533,21 +1893,21 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     eta_info = {"warning": ""}
     if auto_eta and seq:
         try:
-            eta_used, eta_info = _select_eta_v6(theta, seq, p, int(image_res),
-                                                simultaneous=(mode == _V6_MODES[0]))
+            eta_used, eta_info = _select_eta_shrinkage(theta, seq, p, int(image_res),
+                                                simultaneous=(mode == _SHRINKAGE_MODES[0]))
             p = _mk(eta_used)
         except Exception:
             pass
-    # One step carrying every bundle, or one step per bundle. Both come from degrade_v6's
+    # One step carrying every bundle, or one step per bundle. Both come from the model's
     # single step_bundles body, so the two schedules cannot drift apart.
-    _run = simulate_v6_sim if mode == _V6_MODES[0] else simulate_v6_seq
+    _run = simulate_shrinkage_sim if mode == _SHRINKAGE_MODES[0] else simulate_shrinkage_seq
     try:
         f, infos = _run(theta, seq, p, int(image_res))
         err = None
     except Exception as exc:                 # the potential's guards raise rather than return junk
         f, infos, err = theta.copy(), [], str(exc).split(":")[0]
 
-    sup_pct, half_pct, flips = shape_diagnostics_v6(theta, f)
+    sup_pct, half_pct, flips = shape_diagnostics_shrinkage(theta, f)
     nr, nc = theta.shape
     yy, xx = np.mgrid[0:nr, 0:nc]
     m0 = float(theta.sum())
@@ -2557,10 +1917,10 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
 
     phi_panel = np.zeros_like(theta)
     if infos and seq:
-        pr = resolve_v6(p, theta)
+        pr = resolve_shrinkage(p, theta)
         # Match the schedule: simultaneous accumulates EVERY bundle against the same field, so a
         # panel built from the last row alone would show a potential the run never solved.
-        rows = seq if mode == _V6_MODES[0] else seq[-1:]
+        rows = seq if mode == _SHRINKAGE_MODES[0] else seq[-1:]
         cid = np.zeros_like(theta)
         I_p = np.zeros_like(theta)
         for ang, off, nb in rows:
@@ -2569,7 +1929,7 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
             cid = cid + dq
             I_p = I_p + ip
         try:
-            phi_panel, _Pi, _sg = _compaction_potential_v6(f * pr.decay_factor(I_p),
+            phi_panel, _Pi, _sg = _compaction_potential_shrinkage(f * pr.decay_factor(I_p),
                                                            1.0 - np.exp(-cid), pr)
         except Exception:
             pass
@@ -2597,48 +1957,39 @@ def _simulate_v6(seq: tuple, image_res: int, optical_depth: float, I0: float, c_
     return theta, f, phi_panel, summary
 
 
-def _render_2d_v6_tab():
+def _render_2d_shrinkage_tab():
     """Implicit-transport shrinkage: unconditionally positive and conservative. Forward only."""
     s = st.session_state
     st.caption(
-        "**Implicit-transport shrinkage model (v6).** v5 with steps 5 and 6 changed and nothing "
-        "else moved. The flux is now a nonnegative **softplus rate** applied to the *unknown* "
-        "post-transport field, so `eq:xd_mass_transport` becomes one global sparse solve whose "
-        "matrix is an M-matrix with **unit column sums**. Positivity and exact conservation "
-        "therefore hold with no step-size condition — which is why v5's compaction number "
-        "`C_k` is gone rather than merely satisfied. Steps 1–4 are v5's, imported rather "
-        "than copied. Forward simulation only; run `python3 degrade_v6.py` for the invariants."
+        "**Implicit-transport shrinkage model.** Build a measurement sequence, preview how "
+        "decay and transport change the field, then reconstruct the undamaged field and its "
+        "uncertainty. Transport is solved implicitly with a nonnegative softplus rate, which "
+        "preserves positivity and mass conservation without a step-size limit."
     )
     left, mid, right = st.columns([3, 2, 2])
-    res = int(s["v6_res"])
-    seq_all = _table_to_seq(s["beam_table_v6"])
+    res = int(s["shrinkage_res"])
+    seq_all = _table_to_seq(s["beam_table_shrinkage"])
     n_all = len(seq_all)
-    seq = seq_all[:max(0, min(int(s["v6_view_k"]), n_all))]
+    seq = seq_all[:max(0, min(int(s["shrinkage_view_k"]), n_all))]
     n_meas = len(seq)
-    theta, f, phi, summary = _simulate_v6(
-        seq, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
-        float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
-        float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]), str(s["v6_mode"]),
-        bool(s["v6_eta_auto"]))
-    simultaneous = (str(s["v6_mode"]) == _V6_MODES[0])
+    theta, f, phi, summary = _simulate_shrinkage(
+        seq, res, float(s["shrinkage_depth"]), float(s["shrinkage_I0"]), float(s["shrinkage_c_omega"]),
+        float(s["shrinkage_c_cp"]), float(s["shrinkage_a"]), float(s["shrinkage_b"]), float(s["shrinkage_reach"]),
+        float(s["shrinkage_gamma"]), float(s["shrinkage_fref"]), float(s["shrinkage_eta"]), str(s["shrinkage_mode"]),
+        bool(s["shrinkage_eta_auto"]))
+    simultaneous = (str(s["shrinkage_mode"]) == _SHRINKAGE_MODES[0])
 
-    view = s["v6_view"]
-    if view == _V6_VIEWS[1]:
-        panel, vlo, vhi = phi, 0.0, max(float(phi.max()), 1e-12)
-    elif view == _V6_VIEWS[2]:
-        panel = f - theta
-        span = max(float(np.abs(panel).max()), 1e-12); vlo, vhi = -span, span
-    else:
-        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
+    view = "Attenuation"
+    panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
 
     with left:
-        _nav_block("v6_view_k", n_all)
+        _nav_block("shrinkage_view_k", n_all)
         _live_sim(
             image_uri=_live_background_uri(panel, vlo, vhi), image_res=res, k=n_meas,
-            angle=float(s["v6_angle"]), offset=float(s["v6_offset"]),
-            nbeams=int(s["v6_nbeams"]),
+            angle=float(s["shrinkage_angle"]), offset=float(s["shrinkage_offset"]),
+            nbeams=int(s["shrinkage_nbeams"]),
             committed=(list(seq[-1]) if n_meas else None),
-            beams_visible=bool(s["v6_showbeams"]),
+            beams_visible=bool(s["shrinkage_showbeams"]),
             angle_range=[0, 360, 1], offset_range=[-float(res)/2, float(res)/2, 0.5],
             nbeams_range=[0, res, 1],
             title="%s   ·   %d bundle%s %s   ·   %d×%d"
@@ -2647,65 +1998,63 @@ def _render_2d_v6_tab():
             hint='<b style="color:#ff2b2b">Red</b> = next-measurement preview; '
                  '<b style="color:#1f77ff">blue</b> = last measurement taken.',
             legend="%.3g" % vhi,
-            default={"angle": float(s["v6_angle"]), "offset": float(s["v6_offset"]),
-                     "nbeams": int(s["v6_nbeams"])},
-            key="live_sim_v6", on_change=_cb_sync_live_sim_v6)
-        st.radio("View", _V6_VIEWS, key="v6_view", horizontal=True)
+            default={"angle": float(s["shrinkage_angle"]), "offset": float(s["shrinkage_offset"]),
+                     "nbeams": int(s["shrinkage_nbeams"])},
+            key="live_sim_shrinkage", on_change=_cb_sync_live_sim_shrinkage)
 
     with mid:
         st.radio(
-            "Measurement schedule", _V6_MODES, key="v6_mode", horizontal=True,
+            "Measurement schedule", _SHRINKAGE_MODES, key="shrinkage_mode", horizontal=True,
             help="**Simultaneous** fires every row of the table in ONE exposure: the dose fields "
                  "are summed against the same starting field, then one decay, one potential "
                  "solve and one transport solve. **Sequential** fires one exposure per row, each "
                  "seeing the damage the previous ones did.\n\nSame total exposure either way, so "
                  "the difference is fractionation, not dose — and it is large, because "
                  "`dw = 1 - exp(-sum c I delta)` saturates. Measured at c_omega = 0.4, 10 angles: "
-                 "sequential contracts **3.46x** as much. Run "
-                 "`experiment_v6_fractionation.py` for the full comparison.")
+                 "sequential contracts **3.46x** as much. Run the fractionation experiment "
+                 "script for the full comparison.")
         act = st.columns(2)
-        act[0].button("➕ Take measurement", on_click=_cb_v6_step,
-                      use_container_width=True, key="v6_take")
-        act[1].button("Reset", on_click=_cb_v6_reset, use_container_width=True, key="v6_clear")
-        st.checkbox("Show beams", key="v6_showbeams")
+        act[0].button("➕ Take measurement", on_click=_cb_shrinkage_step,
+                      use_container_width=True, key="shrinkage_take")
+        act[1].button("Reset", on_click=_cb_shrinkage_reset, use_container_width=True, key="shrinkage_clear")
+        st.checkbox("Show beams", key="shrinkage_showbeams")
         with st.expander("Compaction reach and amplitude", expanded=True):
-            st.slider("l — compaction reach (px)", 0.5, 32.0, step=0.5, key="v6_reach",
+            st.slider("l — compaction reach (px)", 0.5, 32.0, step=0.5, key="shrinkage_reach",
                       help="A PHYSICAL length, so unlike c_cp it transfers across grids. As "
                            "l → 0 the potential approaches the pointwise driver "
-                           "(l/Δ)²·Pi and you are back in v4's regime; l of order "
+                           "(l/Δ)²·Pi; l of order "
                            "the specimen radius (~15 px here) gives whole-body contraction. "
                            "Below about R/2 the potential is still rim-peaked.")
-            st.slider("c_cp — compaction amplitude", 0.0, 3.0, step=0.05, key="v6_c_cp",
-                      help="0 annihilates every flux and the dynamics collapse exactly to the "
-                           "v1 decay. There is no upper positivity bound any more — that "
-                           "was C_k, and the implicit form does not need it.")
+            st.slider("c_cp — compaction amplitude", 0.0, 3.0, step=0.05, key="shrinkage_c_cp",
+                      help="0 turns transport off. Higher values increase transport while the "
+                           "implicit solve preserves positivity.")
         with st.expander("Beam, conversion and decay", expanded=True):
-            st.slider("I0 — incident intensity", 0.0, 5.0, step=0.1, key="v6_I0")
-            st.slider("c_omega — conversion", 0.0, 3.0, step=0.05, key="v6_c_omega")
-            st.slider("a — decay", 0.0, 0.5, step=0.005, format="%.3f", key="v6_a",
+            st.slider("I0 — incident intensity", 0.0, 5.0, step=0.1, key="shrinkage_I0")
+            st.slider("c_omega — conversion", 0.0, 3.0, step=0.05, key="shrinkage_c_omega")
+            st.slider("a — decay", 0.0, 0.5, step=0.005, format="%.3f", key="shrinkage_a",
                       help="a = b = 0 conserves mass EXACTLY, whatever c_cp does. That is the "
                            "clean shrinkage test: any change in support is then transport alone.")
             st.slider("b — quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
-                      key="v6_b")
+                      key="shrinkage_b")
         with st.expander("Transport and potential numerics", expanded=False):
             st.checkbox(
-                "Auto η from the forward run", key="v6_eta_auto",
+                "Auto η from the forward run", key="shrinkage_eta_auto",
                 help="Sets eta = max|dP| / %g from a forward run. No fixed value works: max|dP| "
                      "spans 0.15 to 80 across this tab's sliders. Too small and the estimation "
                      "NLP degenerates (at eta = 1e-3, 97%% of IPOPT iterations were "
                      "Hessian-regularised and inf_du climbed to 6.6e9); too large and the "
                      "smoothing does the transport's job. Not circular: max|dP| is set in step "
-                     "4, which never reads eta." % _ETA_TARGET_V6)
+                     "4, which never reads eta." % _ETA_TARGET_SHRINKAGE)
             st.select_slider(
-                "eta — softplus smoothing (manual)", options=_V6_ETAS, key="v6_eta",
-                disabled=bool(s["v6_eta_auto"]),
+                "eta — softplus smoothing (manual)", options=_SHRINKAGE_ETAS, key="shrinkage_eta",
+                disabled=bool(s["shrinkage_eta_auto"]),
                 format_func=lambda v: "%.0e" % v,
                 help="THE RATE FUNCTION IS NOT ZERO AT ZERO. phi_eta(0) = eta·log2, so at "
                      "rest both directed rates are c_cp·eta·log2 and a motionless "
                      "field still diffuses. Set I0 = 0 and raise eta to watch it: the spec says "
                      "that case must be an exact identity, and it is not. Keep eta well under "
                      "max |dP| below, or the rate stops discriminating direction.")
-            st.select_slider("f_ref / f_max", options=_V6_FREFS, key="v6_fref",
+            st.select_slider("f_ref / f_max", options=_SHRINKAGE_FREFS, key="shrinkage_fref",
                              help="Density at which material starts conducting. The stated rule "
                                   "— at most a fifth of the smallest interior value — "
                                   "is NOT sufficient: what must be small is "
@@ -2713,18 +2062,15 @@ def _render_2d_v6_tab():
                                   "below. At 0.2 that ratio is ~33 and the specimen does not "
                                   "move at all, silently.")
             st.select_slider("gamma — vacuum absorption", options=(1.0, 10.0, 100.0, 1000.0),
-                             key="v6_gamma", help="Sets how fast the potential decays into "
+                             key="shrinkage_gamma", help="Sets how fast the potential decays into "
                                                   "vacuum. Needs gamma >> 1, but raising it also "
                                                   "raises absorp/vs.")
-            st.select_slider("Grid", options=_V6_RESOLUTIONS, key="v6_res")
+            st.select_slider("Grid", options=_SHRINKAGE_RESOLUTIONS, key="shrinkage_res")
 
     with right:
-        _preset_block("v6", "beam_table_v6", "v6_view_k")
+        _preset_block("shrinkage", "beam_table_shrinkage", "shrinkage_view_k")
         st.markdown("**Measurement sequence**")
-        st.dataframe(s["beam_table_v6"], use_container_width=True, height=180)
-        if summary["err"]:
-            st.error("Potential solve refused: %s. The guards raise rather than return a wrong "
-                     "answer — raise the reach or lower f_ref." % summary["err"])
+        st.dataframe(s["beam_table_shrinkage"], use_container_width=True, height=180)
         # NO STANDING DIAGNOSTIC BLOCK. The metrics and the two numeric captions that used to sit
         # here (half-mass / support radius / sign changes / total attenuation, then min f,
         # |colsum-1|, transport residual, phi centre/rim, max |dP|, eta/max|dP|, resting rate,
@@ -2732,28 +2078,7 @@ def _render_2d_v6_tab():
         # offers, so they read as a wall of numbers demanding interpretation when there is
         # nothing to interpret. What is left below fires only when something actually needs the
         # user's attention. The numbers themselves are unchanged and still computed in
-        # `_simulate_v6`'s `summary`; `python3 degrade_v6.py` prints the full set.
-        if summary["eta_warning"]:
-            st.warning(summary["eta_warning"])
-        if summary["absorp"] > 1.0:
-            st.warning(
-                "absorp/vs = %.2g > 1: the vacuum penalty is setting the scale INSIDE the "
-                "specimen, so the potential is suppressed by about that factor and the body "
-                "will barely move — with nothing raised and the M-matrix bound still "
-                "satisfied. Lower f_ref, lower gamma, or raise the reach."
-                % summary["absorp"])
-        if summary["eta_ratio"] == summary["eta_ratio"] and summary["eta_ratio"] > 0.1:
-            st.warning(
-                "eta is %.0f%% of max |dP|: the softplus is no longer discriminating direction, "
-                "and the transport is mostly the resting diffusion. Lower eta."
-                % (100.0 * summary["eta_ratio"]))
-        if float(s["v6_I0"]) == 0.0 and float(s["v6_c_cp"]) > 0.0:
-            st.info(
-                "I0 = 0 with c_cp > 0. subsec:system says this must return **bitwise** what "
-                "c_cp = 0 returns. It does not: phi is exactly zero, but phi_eta(0) = "
-                "eta·log2 > 0, so every face still carries a rate of %.2e and the field "
-                "diffuses. Change-view shows it. This is reported, not worked around — "
-                "see degrade_v6's docstring." % summary["rest_rate"])
+        # `_simulate_shrinkage`'s `summary`; the model module's check_invariants prints the full set.
         # The rim-peaked (centre/rim < 1) banner is gone too. It fired on essentially every
         # Shepp-Logan setting, because that phantom's mass sits in a bright ring and the void
         # source is weighted by material present, so phi peaks near r ~ 10 px and the ratio
@@ -2770,8 +2095,8 @@ def _render_2d_v6_tab():
     st.divider()
     st.subheader("Reconstruct")
     st.caption(
-        "Estimate the undamaged field `theta = f_0` from the projections, inverting the v6 "
-        "dynamics, then differentiate the estimate with **k_aug** for the per-pixel posterior "
+        "Estimate the undamaged field `theta = f_0` from the projections, inverting the "
+        "shrinkage-decay dynamics, then differentiate the estimate with **k_aug** for the per-pixel posterior "
         "variance. The forward residual gate re-runs on *this* geometry first and the solve is "
         "**refused** if the Pyomo model has drifted from the simulator — a reconstruction "
         "against a model that no longer matches would read as a physics result. "
@@ -2780,19 +2105,18 @@ def _render_2d_v6_tab():
     )
     rc = st.columns([1, 1, 1, 2])
     with rc[0]:
-        st.select_slider("TV weight", options=_V6_TV_WEIGHTS, key="v6_tv_weight",
+        st.select_slider("TV weight", options=_SHRINKAGE_TV_WEIGHTS, key="shrinkage_tv_weight",
                          format_func=lambda v: "%g" % v,
                          help="Both objective terms are normalised to O(1) first, so this is a "
                               "trade-off **ratio**, not the 2D tab's scale \u2014 a value of 1 "
                               "means TV and the data fit carry equal weight.\n\nRange runs to "
                               "100, well past the point of visible over-smoothing. That is "
-                              "deliberate: the v6 NLP does not converge at grid 32, and a heavy "
+                              "deliberate: the estimation NLP does not converge at grid 32, and a heavy "
                               "TV term is one of the few levers that makes the objective more "
-                              "strongly convex. Expect a smoothed-out theta up there \u2014 on "
-                              "v2 the error was already 19% at 0.2.")
+                              "strongly convex. Expect a smoothed-out theta at high values.")
     with rc[1]:
         st.number_input("Max IPOPT iterations", min_value=1500, max_value=8000, step=50,
-                        key="v6_maxiter",
+                        key="shrinkage_maxiter",
                         help="Measured at grid 32 / K=5 simultaneous: `optimal` at iteration "
                              "**1253**, 219 s (~0.175 s/iter on ma97). Grid 16 converges in "
                              "520-642. A cap below ~1500 will cut grid 32 off before it gets "
@@ -2800,48 +2124,48 @@ def _render_2d_v6_tab():
                              "rather than a truncated one.")
     with rc[2]:
         st.number_input("Noise sigma", min_value=0.0, max_value=1.0, step=0.001,
-                        format="%.3f", key="v6_noise",
+                        format="%.3f", key="shrinkage_noise",
                         help="Gaussian noise added to the synthetic projections. 0 is the "
                              "noiseless case the other tabs use.")
     with rc[3]:
-        n_rays_v6 = sum(len(_bundle_r_values(o, n, res)) for _a, o, n in seq_all)
-        n_obs_v6 = n_rays_v6
+        n_rays_shrinkage = sum(len(_bundle_r_values(o, n, res)) for _a, o, n in seq_all)
+        n_obs_shrinkage = n_rays_shrinkage
         st.caption(
             "%d measurement%s · %d rays · **%d observations for %d pixels** "
             "(%.2fx %s) · schedule **%s**"
-            % (n_all, "" if n_all == 1 else "s", n_rays_v6, n_obs_v6, res * res,
-               (n_obs_v6 / max(res * res, 1)) if n_obs_v6 >= res * res
-               else (res * res / max(n_obs_v6, 1)),
-               "over-determined" if n_obs_v6 >= res * res else "UNDER-determined",
-               s["v6_mode"]))
-        if n_obs_v6 < res * res:
+            % (n_all, "" if n_all == 1 else "s", n_rays_shrinkage, n_obs_shrinkage, res * res,
+               (n_obs_shrinkage / max(res * res, 1)) if n_obs_shrinkage >= res * res
+               else (res * res / max(n_obs_shrinkage, 1)),
+               "over-determined" if n_obs_shrinkage >= res * res else "UNDER-determined",
+               s["shrinkage_mode"]))
+        if n_obs_shrinkage < res * res:
             st.caption(
                 ":orange[Under-determined: TV rather than the data chooses among the fields "
                 "that fit, so the optimum is not unique enough to pin theta and individual "
                 "digits should not be quoted. Add measurements or drop the grid.]")
 
-    go_v6 = st.button("Reconstruct", type="primary", key="btn_v6_recon",
+    go_shrinkage = st.button("Reconstruct", type="primary", key="btn_shrinkage_recon",
                       disabled=(n_all == 0))
 
     # Signature of everything the answer depends on, stored with it: a stale result is reported
     # rather than silently shown. Same guard the v2, v5 and 3D surfaces use.
-    v6_key = (seq_all, res, float(s["v6_depth"]), float(s["v6_I0"]), float(s["v6_c_omega"]),
-              float(s["v6_c_cp"]), float(s["v6_a"]), float(s["v6_b"]), float(s["v6_reach"]),
-              float(s["v6_gamma"]), float(s["v6_fref"]), float(s["v6_eta"]),
-              str(s["v6_mode"]), float(s["v6_tv_weight"]), int(s["v6_maxiter"]),
-              float(s["v6_noise"]))
+    shrinkage_key = (seq_all, res, float(s["shrinkage_depth"]), float(s["shrinkage_I0"]), float(s["shrinkage_c_omega"]),
+              float(s["shrinkage_c_cp"]), float(s["shrinkage_a"]), float(s["shrinkage_b"]), float(s["shrinkage_reach"]),
+              float(s["shrinkage_gamma"]), float(s["shrinkage_fref"]), float(s["shrinkage_eta"]),
+              str(s["shrinkage_mode"]), float(s["shrinkage_tv_weight"]), int(s["shrinkage_maxiter"]),
+              float(s["shrinkage_noise"]))
 
-    if go_v6:
+    if go_shrinkage:
         log_box = st.empty()
         log_lines: list[str] = []
         _last = [0.0]
         # Captured HERE, on the script thread, for THIS session -- see _current_script_ctx.
         _ctx = _current_script_ctx()
 
-        def _render_v6_log() -> None:
+        def _render_shrinkage_log() -> None:
             _render_log_box(log_box, "".join(log_lines))
 
-        def _v6_log(chunk: str) -> None:
+        def _shrinkage_log(chunk: str) -> None:
             # Runs on Pyomo's reader thread. Terminal first and unthrottled -- that is the raw
             # IPOPT log and it should appear as it is produced. Then buffer, so the box stays
             # complete even when the render cannot happen. Then render, at most every 0.2 s.
@@ -2853,33 +2177,33 @@ def _render_2d_v6_tab():
             _last[0] = now
             if _attach_script_ctx(_ctx):
                 try:
-                    _render_v6_log()
+                    _render_shrinkage_log()
                 except Exception:
                     pass        # a dropped frame is fine; the buffer still holds every line
 
-        params_v6 = V6UQParams(
-            image_res=res, optical_depth=float(s["v6_depth"]), beam_steps=seq_all,
+        params_shrinkage = ShrinkageDecayUQParams(
+            image_res=res, optical_depth=float(s["shrinkage_depth"]), beam_steps=seq_all,
             simultaneous=simultaneous,
-            I0=float(s["v6_I0"]), c=float(s["v6_c_omega"]), a=float(s["v6_a"]),
-            b=float(s["v6_b"]), c_cp=float(s["v6_c_cp"]), reach=float(s["v6_reach"]),
-            gamma=float(s["v6_gamma"]), f_ref_frac=float(s["v6_fref"]),
-            eta=(None if bool(s["v6_eta_auto"]) else float(s["v6_eta"])),
-            tv_weight=float(s["v6_tv_weight"]),
-            noise_sigma=float(s["v6_noise"]), ipopt_max_iter=int(s["v6_maxiter"]))
-        with st.spinner("Solving the v6 estimation NLP, then k_aug…"):
+            I0=float(s["shrinkage_I0"]), c=float(s["shrinkage_c_omega"]), a=float(s["shrinkage_a"]),
+            b=float(s["shrinkage_b"]), c_cp=float(s["shrinkage_c_cp"]), reach=float(s["shrinkage_reach"]),
+            gamma=float(s["shrinkage_gamma"]), f_ref_frac=float(s["shrinkage_fref"]),
+            eta=(None if bool(s["shrinkage_eta_auto"]) else float(s["shrinkage_eta"])),
+            tv_weight=float(s["shrinkage_tv_weight"]),
+            noise_sigma=float(s["shrinkage_noise"]), ipopt_max_iter=int(s["shrinkage_maxiter"]))
+        with st.spinner("Solving the estimation NLP, then k_aug…"):
             try:
-                out = run_v6_reconstruction(params_v6, log_callback=_v6_log)
-                st.session_state["results_v6"] = {"res": out, "key": v6_key}
+                out = run_shrinkage_decay_reconstruction(params_shrinkage, log_callback=_shrinkage_log)
+                st.session_state["results_shrinkage"] = {"res": out, "key": shrinkage_key}
             except Exception as exc:
-                st.session_state.pop("results_v6", None)
+                st.session_state.pop("results_shrinkage", None)
                 st.error("Reconstruction failed: %s" % exc)
             finally:
-                _render_v6_log()
+                _render_shrinkage_log()
 
-    stash6 = st.session_state.get("results_v6")
-    if stash6:
-        out = stash6["res"]
-        if stash6["key"] != v6_key:
+    stash_shrinkage = st.session_state.get("results_shrinkage")
+    if stash_shrinkage:
+        out = stash_shrinkage["res"]
+        if stash_shrinkage["key"] != shrinkage_key:
             st.warning("These results are STALE — a setting changed since they were "
                        "computed. Press Reconstruct again.")
         ok = out.status == "optimal"
@@ -2919,7 +2243,7 @@ def _render_2d_v6_tab():
                 "posterior variance: log10 range **%.2f to %.2f** · condition number "
                 "**%.2e** · k_aug took **%.1f s**"
                 % (np.nanmin(lv), np.nanmax(lv), out.uq_conditioning, out.t_uq))
-        # Same figure the v2 surface draws -- V6UQResults carries the same field names, so one
+        # Same figure the 2D reconstruction surface draws -- its result object carries the same
         # implementation rather than a fourth copy of the same four panels.
         st.pyplot(_v2_recon_figure(out), use_container_width=True)
         st.caption(
@@ -2930,536 +2254,10 @@ def _render_2d_v6_tab():
         )
 
 
-def _render_2d_v4_tab():
-    """The reduced damage model: one state field, no dose. Forward simulation only."""
-    s = st.session_state
-    st.caption(
-        "**Reduced damage model (v4).** v3 with the dose state removed. Setting the response "
-        "floor to zero makes the accumulated dose cancel out of the algebra, so the converted "
-        "fraction is `dw = 1 - exp(-c_omega * I_p * delta_p)` -- a function of *this* exposure "
-        "and nothing carried forward. **The state is the single field f.** Gone with the dose: "
-        "`omega_inf`, `Q_c`, `c_q`, the energy density and the dose budget. Kept verbatim: the "
-        "photon balance, the decay `exp(-aI - bI^2)`, the compaction flux and the mass balance. "
-        "Verified bit-identical to v3 at `omega_inf = 0`. Forward simulation only -- no "
-        "reconstruction, no solver."
-    )
-    left, mid, right = st.columns([3, 2, 2])
-
-    res = int(s["v4_res"])
-    seq_all = _table_to_seq(s["beam_table_v4"])
-    n_all = len(seq_all)
-    seq = seq_all[:max(0, min(int(s["v4_view_k"]), n_all))]
-    n_meas = len(seq)
-
-    theta, f, dw_panel, summary = _simulate_v4(
-        seq, res, float(s["v4_depth"]), float(s["v4_I0"]), float(s["v4_c_omega"]),
-        float(s["v4_c_cp"]), float(s["v4_a"]), float(s["v4_b"]),
-        str(s["v4_flux"]), float(s["v4_beta"]),
-    )
-
-    view = s["v4_view"]
-    if view == _V4_VIEWS[1]:
-        panel, vlo, vhi = dw_panel, 0.0, max(float(dw_panel.max()), 1e-12)
-    elif view == _V4_VIEWS[2]:
-        panel = f - theta
-        span = max(float(np.abs(panel).max()), 1e-12)
-        vlo, vhi = -span, span
-    else:
-        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
-
-    with left:
-        _nav_block("v4_view_k", n_all)
-        _live_sim(
-            image_uri=_live_background_uri(panel, vlo, vhi),
-            image_res=res,
-            k=n_meas,
-            angle=float(s["v4_angle"]),
-            offset=float(s["v4_offset"]),
-            nbeams=int(s["v4_nbeams"]),
-            committed=(list(seq[-1]) if n_meas else None),
-            beams_visible=bool(s["v4_showbeams"]),
-            angle_range=[0, 360, 1],
-            offset_range=[-float(res) / 2, float(res) / 2, 0.5],
-            nbeams_range=[0, res, 1],
-            title="%s   \u00b7   %d measurement%s applied   \u00b7   %d\u00d7%d"
-                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
-            hint='<b style="color:#ff2b2b">Red</b> dashes = next-measurement preview '
-                 '(these sliders); <b style="color:#1f77ff">blue</b> dashes = the last '
-                 'measurement taken. # Beams at 0 means the full fan.',
-            legend="%.3g" % vhi,
-            default={"angle": float(s["v4_angle"]), "offset": float(s["v4_offset"]),
-                     "nbeams": int(s["v4_nbeams"])},
-            key="live_sim_v4",
-            on_change=_cb_sync_live_sim_v4,
-        )
-        # Return value deliberately unused -- it is the standing widget value and survives
-        # reruns, so writing it back each run resurrects a stale bundle. The on_change owns the
-        # sync and runs before these args are rebuilt.
-        st.radio("View", _V4_VIEWS, key="v4_view", horizontal=True)
-
-    with mid:
-        act = st.columns(2)
-        act[0].button("\u2795 Take measurement", on_click=_cb_v4_step,
-                      use_container_width=True, key="v4_take")
-        act[1].button("Reset", on_click=_cb_v4_reset, use_container_width=True, key="v4_clear")
-        st.caption(
-            "Aiming at **%.0f\u00b0**, offset **%.1f**, **%s** \u2014 set these under the picture."
-            % (float(s["v4_angle"]), float(s["v4_offset"]),
-               "full fan" if int(s["v4_nbeams"]) == 0 else "%d beams" % int(s["v4_nbeams"])))
-        st.checkbox("Show beams", key="v4_showbeams")
-
-        with st.expander("Beam and conversion", expanded=True):
-            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v4_I0",
-                      help="0 is the undamaged limit: the step map is exactly the identity, "
-                           "bitwise, with no structural special case in the code.")
-            st.slider("c_omega \u2014 conversion coefficient", 0.0, 3.0, step=0.05,
-                      key="v4_c_omega",
-                      help="dw = 1 - exp(-c_omega * I_p * delta_p). Replaces v3's c_q/Q_c and "
-                           "carries its value, 0.1. It SATURATES: dw is bounded by 1, so the "
-                           "whole available gain from this knob is about 10x. Above c_omega "
-                           "~1 the largest dw exceeds 0.8 and the flux starts running on the "
-                           "density gradient rather than on dose contrast \u2014 aggregation "
-                           "rather than radiation damage. Watch the max dw readout.")
-
-        with st.expander("Compaction and mass", expanded=True):
-            st.slider("c_cp \u2014 compaction number", 0.0, 3.0, step=0.05, key="v4_c_cp",
-                      help="Dimensionless and GRID DEPENDENT: at nearest-neighbour range the "
-                           "compaction length IS one cell, so a value does not transfer between "
-                           "grids. Linear in the flux, bounded only by positivity \u2014 watch "
-                           "C_k.")
-            st.slider("a \u2014 decay coefficient", 0.0, 0.5, step=0.005, format="%.3f",
-                      key="v4_a",
-                      help="Mass leaves by exp(-a*I - b*I^2), driven by instantaneous fluence. "
-                           "**a = b = 0 conserves mass exactly, whatever c_cp does** \u2014 that "
-                           "is the switch, and it is the clean test of shrinkage, since any "
-                           "change in support is then transport alone.")
-            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
-                      key="v4_b",
-                      help="Keep at 0. A non-zero b makes one large exposure damage more than "
-                           "many small ones of the same total fluence, against the dose "
-                           "fractionation theorem.")
-
-        with st.expander("Numerics", expanded=False):
-            st.radio("Face weighting", _V4_FLUXES, key="v4_flux", horizontal=True,
-                     help="**upwind** is the logistic donor cell: the vacuum is inert because "
-                          "at a material/vacuum face the donor is the empty side. **harmonic** "
-                          "weights by 2ab/(a+b), which vanishes when EITHER side is empty, so "
-                          "the vacuum is inert structurally and there is no beta. Harmonic is "
-                          "exactly positive in the working window and loses positivity faster "
-                          "above it; it also costs more per step on easy problems and much less "
-                          "on hard ones.")
-            st.select_slider("beta \u2014 logistic sharpness", options=(20.0, 100.0, 500.0,
-                             1000.0, 2000.0, 5000.0), key="v4_beta",
-                             help="Only read for the upwind flux. The switch must SATURATE: "
-                                  "beta*max|g| needs to be well above 5 or the scheme is still "
-                                  "effectively central. The readout below shows it.")
-            st.select_slider("Grid", options=_V4_RESOLUTIONS, key="v4_res",
-                             help="Unlike v2 this model has no moving-interface diffusion "
-                                  "constraint forcing 64+, so 32 is usable and fast. c_cp is "
-                                  "grid dependent, so re-read the contraction after changing it.")
-
-    with right:
-        _preset_block("v4", "beam_table_v4", "v4_view_k")
-        st.markdown("**Measurement sequence**")
-        st.dataframe(s["beam_table_v4"], use_container_width=True, height=200)
-
-        if summary["ck"] > 1.0:
-            st.warning(
-                "C_k = %.2f \u2014 above 1 the donor-cell positivity bound no longer holds. "
-                "The bound is sufficient, not necessary, so check **min f** below: that is the "
-                "real test. Lower c_cp or c_omega." % summary["ck"])
-        if summary["dw_max"] > 0.8:
-            st.warning(
-                "max dw = %.3f \u2014 above ~0.8 the conversion has saturated, Pi tends to the "
-                "density alone, and the flux runs up the density gradient rather than on dose "
-                "contrast. The model is doing aggregation, not radiation damage."
-                % summary["dw_max"])
-
-        m = st.columns(2)
-        m[0].metric("Total attenuation", "%.4g" % summary["mass1"],
-                    delta="%+.3g" % (summary["mass1"] - summary["mass0"]),
-                    help="Conserved EXACTLY at a = b = 0, whatever c_cp does: the face fluxes "
-                         "are antisymmetric so transport moves mass and never removes it. Above "
-                         "that, the whole change is the decay.")
-        m[1].metric("Support radius (99% mass)", "%.4g" % summary["sup1"],
-                    delta="%+.3f%%" % summary["sup_pct"], delta_color="inverse",
-                    help="**This is what shrinkage means here.** Measured about the FIXED "
-                         "initial centroid, deliberately: about the field's own centroid the "
-                         "same run reads +1.0% growth for a specimen that has not grown, "
-                         "because asymmetric mass loss drags the centroid ~0.36 px. Read it at "
-                         "a = b = 0 for the clean answer.")
-        m2 = st.columns(2)
-        m2[0].metric("C_k (positivity)", "%.3f" % summary["ck"],
-                     help="c_cp * max_p sum_q max(Pi_q - Pi_p, 0). C_k <= 1 is SUFFICIENT for "
-                          "f >= 0 under a saturated donor cell; it is not necessary, so min f "
-                          "is the real check.")
-        m2[1].metric("Max dw", "%.4g" % summary["dw_max"],
-                     help="Largest converted fraction in any one step. Above ~0.8 the "
-                          "conversion has saturated \u2014 see the warning above.")
-        st.caption(
-            "Radius of gyration **%.4g** (%+.2f%%) \u00b7 centroid drift **%.3f px** \u00b7 "
-            "min f **%.3g** \u00b7 beta\u00b7max|g| **%.0f** \u00b7 mass lost **%.4g**"
-            % (summary["rg1"], summary["rg_pct"], summary["drift"], summary["f_min"],
-               summary["beta_g"], summary["lost"]))
-        st.caption(
-            ":gray[Rg is reported for continuity and is **not** the shrinkage statistic: on this "
-            "model it has been measured returning the *opposite sign* to the support radius, in "
-            "both directions. Trust the support radius.]")
-        if float(s["v4_I0"]) == 0.0:
-            st.info("I0 = 0: the step map is the identity, bitwise. The sample stays undamaged.")
-        if float(s["v4_a"]) == 0.0 and float(s["v4_b"]) == 0.0:
-            st.success("a = b = 0: mass is conserved exactly, so any change in support radius "
-                       "is transport alone. This is the clean shrinkage test.")
-
-
-def _render_2d_v2_tab():
-    """The revised damage model: dose is a state, and mass moves instead of vanishing.
-
-    **NOT WIRED INTO THE TAB BAR.** v4 took this slot; the reduced model is bit-identical to v3
-    at ``omega_inf = 0`` and v3 superseded v2. Kept, unused, the same way ``_live_figure`` and
-    ``_slice_figure`` are kept: it is the reference implementation of the elasticity closure and
-    the only UI that ever drove it. Re-wire by swapping the call in the ``with tab_v4:`` block.
-    """
-    s = st.session_state
-    st.caption(
-        "**Revised damage model (v2).** The 2D tab's model is a pure local sink -- "
-        "`f <- f*exp(-aI - bI^2)` -- so mass vanishes where it stands and the sample fades but "
-        "never changes shape. Here dose accumulation is split from the dose response and a mass "
-        "balance is added, so mass *moves*: converting material to void is a stress-free "
-        "contraction, linear elasticity relieves it, and the resulting displacement transports "
-        "attenuation between pixels. The sample can shrink. Forward simulation only -- no "
-        "reconstruction, no solver."
-    )
-    left, mid, right = st.columns([3, 2, 2])
-
-    res = int(s["v2_res"])
-    seq_all = _table_to_seq(s["beam_table_v2"])
-    n_all = len(seq_all)
-    seq = seq_all[:max(0, min(int(s["v2_view_k"]), n_all))]
-    n_meas = len(seq)
-
-    theta, f, Q, summary = _simulate_v2(
-        seq, res, float(s["v2_depth"]), float(s["v2_I0"]), float(s["v2_c_q"]),
-        float(s["v2_Q_c"]), float(s["v2_omega_inf"]), float(s["v2_c_cp"]),
-        float(s["v2_a"]), float(s["v2_b"]), float(s["v2_eps_up"]), float(s["v2_E0"]),
-        float(s["v2_nu"]), bool(s["v2_clamp"]),
-    )
-
-    view = s["v2_view"]
-    if view == _V2_VIEWS[1]:
-        panel, vlo, vhi = Q, 0.0, max(float(Q.max()), 1e-12)
-    elif view == _V2_VIEWS[2]:
-        panel = f - theta
-        span = max(float(np.abs(panel).max()), 1e-12)
-        vlo, vhi = -span, span
-    else:
-        panel, vlo, vhi = f, 0.0, max(float(theta.max()), 1e-12)
-
-    with left:
-        _nav_block("v2_view_k", n_all)
-        # Third instance of the 2D tab's live component. It owns the Angle / Offset / # Beams
-        # sliders and redraws the red preview client-side while the thumb is held; st.slider only
-        # reports on release, so a Python-owned slider cannot track a drag at all.
-        _live_sim(
-            image_uri=_live_background_uri(panel, vlo, vhi),
-            image_res=res,
-            k=n_meas,
-            angle=float(s["v2_angle"]),
-            offset=float(s["v2_offset"]),
-            nbeams=int(s["v2_nbeams"]),
-            committed=(list(seq[-1]) if n_meas else None),
-            beams_visible=bool(s["v2_showbeams"]),
-            angle_range=[0, 360, 1],
-            offset_range=[-float(res) / 2, float(res) / 2, 0.5],
-            nbeams_range=[0, res, 1],
-            title="%s   \u00b7   %d measurement%s applied   \u00b7   %d\u00d7%d"
-                  % (view, n_meas, "" if n_meas == 1 else "s", res, res),
-            hint='<b style="color:#ff2b2b">Red</b> dashes = next-measurement preview '
-                 '(these sliders); <b style="color:#1f77ff">blue</b> dashes = the last '
-                 'measurement taken. # Beams at 0 means the full fan.',
-            legend="%.3g" % vhi,
-            default={
-                "angle": float(s["v2_angle"]),
-                "offset": float(s["v2_offset"]),
-                "nbeams": int(s["v2_nbeams"]),
-            },
-            key="live_sim_v2",
-            on_change=_cb_sync_live_sim_v2,
-        )
-        # Return value deliberately unused: it is the standing widget value and survives reruns,
-        # so writing it back each run would resurrect a stale bundle. _cb_sync_live_sim_v2 owns
-        # the sync and runs before the args above are rebuilt.
-        st.radio("View", _V2_VIEWS, key="v2_view", horizontal=True)
-
-    with mid:
-        act = st.columns(2)
-        act[0].button("\u2795 Take measurement", on_click=_cb_v2_step,
-                      use_container_width=True, key="v2_take")
-        act[1].button("Reset", on_click=_cb_v2_reset, use_container_width=True, key="v2_clear")
-        st.caption(
-            "Aiming at **%.0f\u00b0**, offset **%.1f**, **%s** \u2014 set these under the picture."
-            % (float(s["v2_angle"]), float(s["v2_offset"]),
-               "full fan" if int(s["v2_nbeams"]) == 0 else "%d beams" % int(s["v2_nbeams"]))
-        )
-        st.checkbox("Show beams", key="v2_showbeams")
-
-        with st.expander("Beam and dose", expanded=True):
-            st.slider("I0 \u2014 incident intensity", 0.0, 5.0, step=0.1, key="v2_I0",
-                      help="0 is the undamaged limit: the step map is exactly the identity.")
-            # Hidden on request -- these keep running at their seeded defaults (v2_c_q,
-            # v2_Q_c, v2_depth in the session-state block), so the model is unchanged; only
-            # the controls are gone. Uncomment to expose them again.
-            # st.slider("c_q \u2014 fluence to dose", 0.0, 1.0, step=0.001, key="v2_c_q",
-            #           format="%.3f")
-            # st.slider("Q_c \u2014 characteristic dose", 0.05, 5.0, step=0.05, key="v2_Q_c")
-            # st.slider("Peak optical depth \u03bcL", 0.1, 5.0, step=0.1, key="v2_depth",
-            #           help="Rescales the phantom so its largest line integral is this. f is a "
-            #                "reciprocal length, so its size is meaningless without the pixel "
-            #                "pitch: left unscaled this phantom sits at 34, where the beam is "
-            #                "fully absorbed in two pixels. Real tomography is of order 1.")
-
-        with st.expander("Response and mass", expanded=True):
-            st.slider("\u03c9\u221e \u2014 residual attenuation floor", 0.0, 0.99, step=0.01,
-                      key="v2_omega_inf",
-                      help="The interior can never fall below this: the response saturates.")
-            st.slider("c_cp \u2014 void closure", 0.0, 1.0, step=0.05, key="v2_c_cp",
-                      help="Fraction of created void the matrix closes. 1 fully compliant, "
-                           "0 a rigid skeleton in which no void ever closes and nothing moves.")
-            st.slider("a \u2014 decay coefficient", 0.0, 0.5, step=0.005, format="%.3f",
-                      key="v2_a",
-                      help="Mass leaves by the v1 multiplicative decay exp(-a*I - b*I^2), "
-                           "driven by the instantaneous local fluence rather than accumulated "
-                           "dose, and with no floor. a = b = 0 conserves mass exactly, whatever "
-                           "c_cp does \u2014 that is the switch, and it replaced the old escape "
-                           "sink.")
-            st.slider("b \u2014 quadratic decay", 0.0, 0.05, step=0.001, format="%.3f",
-                      key="v2_b",
-                      help="Keep at 0. A non-zero b makes one large exposure damage more than "
-                           "many small ones of the same total fluence, which runs against the "
-                           "dose fractionation theorem; at realistic I0 it contributes well "
-                           "under a percent of the exponent anyway.")
-
-        # "Mechanics and numerics" hidden on request. Every value below still comes from the
-        # session-state seeds (v2_E0, v2_nu, v2_eps_up, v2_clamp, v2_res), so the simulation is
-        # byte-identical to what it was with the box open at its defaults -- only the controls
-        # are gone. Uncomment the block to bring it back.
-        # with st.expander("Mechanics and numerics", expanded=False):
-        #     st.slider("E \u2014 modulus", 0.1, 10.0, step=0.1, key="v2_E0",
-        #               help="Very nearly a no-op on its own: the eigenstrain load scales with E "
-        #                    "too, so a uniform modulus cancels out of K dx = B dw. The ersatz "
-        #                    "contrast between sample and background is what bites.")
-        #     st.slider("\u03bd \u2014 Poisson ratio", 0.0, 0.49, step=0.01, key="v2_nu")
-        #     st.select_slider("\u03b5_up \u2014 upwind smoothing", options=(0.0, 1e-8, 1e-6, 1e-4),
-        #                      key="v2_eps_up", format_func=lambda v: "%g" % v,
-        #                      help="Keeps the step map differentiable for the sensitivity "
-        #                           "extraction. It is not free: at v = 0 the split still passes "
-        #                           "0.5*eps*(f_L - f_R) across every face, so I0 = 0 stops being "
-        #                           "exactly the identity. 0 is exact and fine for this tab.")
-        #     st.checkbox("Clamp one edge (substrate)", key="v2_clamp",
-        #                 help="Off is a free-floating body with three dofs pinned only to kill "
-        #                      "the rigid modes.")
-        #     st.select_slider("Grid", options=_V2_RESOLUTIONS, key="v2_res",
-        #                      help="Below 64 numerical diffusion smears the moving interface "
-        #                           "across the sample within a step or two.")
-
-    with right:
-        _preset_block("v2", "beam_table_v2", "v2_view_k")
-
-        st.markdown("**Measurement sequence**")
-        st.dataframe(s["beam_table_v2"], use_container_width=True, height=200)
-        if summary["courant"] > 0.5:
-            st.warning(
-                "Courant %.2f \u2014 above ~0.5 the upwind transport starts to lose positivity. "
-                "Lower c_cp, or coarsen the grid." % summary["courant"]
-            )
-        m = st.columns(2)
-        m[0].metric("Total attenuation", "%.4g" % summary["mass1"],
-                    delta="%+.3g" % (summary["mass1"] - summary["mass0"]),
-                    help="Conserved exactly at a = b = 0, whatever c_cp does: transport moves mass, it never removes it. Above that, the whole change is the decay.")
-        m[1].metric("Radius of gyration", "%.4g" % summary["rg1"],
-                    delta="%+.2f%%" % summary["rg_pct"],
-                    help="The compactness diagnostic: this is what shrinkage means. Read it "
-                         "against the c_cp = 0 baseline, NOT against zero: the decay fades the "
-                         "field non-uniformly because I_p varies, so c_cp = 0 already registers "
-                         "a small contraction with nothing having moved. Only at a = b = 0 is "
-                         "c_cp = 0 exactly flat.")
-        m2 = st.columns(2)
-        m2[0].metric("Max dose Q", "%.4g" % summary["q_max"])
-        m2[1].metric("Courant", "%.2f" % summary["courant"])
-        st.caption(
-            "Mass lost to decay **%.4g** \u00b7 largest converted fraction in one step "
-            "**%.3g** \u00b7 min f **%.3g**"
-            % (summary["lost"], summary["dw_max"], summary["f_min"])
-        )
-        if float(s["v2_I0"]) == 0.0:
-            st.info("I0 = 0: the step map is the identity, so the sample stays undamaged.")
-
-    # --- Reconstruct ------------------------------------------------------------------
-    # Appended below the live layout rather than given a sub-tab, mirroring the 2D tab. The
-    # solve runs the WHOLE table however far the view is scrubbed back -- same invariant as the
-    # other two Reconstruct surfaces (see _nav_block).
-    st.divider()
-    st.subheader("Reconstruct")
-    st.caption(
-        "Estimate the undamaged reference field **theta = f_0** from the projections, by "
-        "solving the v2 dynamics backwards. The measurements come from the numpy simulator "
-        "above; the NLP is an independent Pyomo transcription of the same ten steps, and it is "
-        "re-checked against the simulator on your geometry before every solve."
-    )
-
-    rc = st.columns([1, 1, 2])
-    with rc[0]:
-        st.select_slider(
-            "TV weight", options=_V2_TV_WEIGHTS, key="v2_tv_weight",
-            format_func=lambda v: ("%g" % v) if v else "0",
-            help="Total-variation regularisation on theta. **This is not the 2D tab's scale** "
-                 "-- that objective sums raw residuals, this one normalises both terms to O(1) "
-                 "first, because theta peaks near 0.03 here while the ray integrals are still "
-                 "O(1). Measured on an over-determined geometry, theta error against the truth: "
-                 "0 gives 0.63% of peak, 0.001 gives 0.80%, 0.01 gives 3.5%, 0.05 gives 9.3%. "
-                 "Raise it when the geometry is starved of rays, not otherwise.")
-    with rc[1]:
-        st.checkbox("Sensitivity / UQ", key="v2_uq",
-                    help="k_aug extracts d(theta)/d(y) -- eq:xd_composed_jacobian -- giving the "
-                         "posterior covariance map and D-optimality. Non-fatal: if it fails "
-                         "(the covariance is intentionally rank deficient, and a starved "
-                         "geometry can make it singular) the reconstruction is still returned.")
-        st.checkbox("Frozen mechanics", key="v2_freeze",
-                    help="Take the displacement field from a numpy pre-pass and hold it fixed, "
-                         "instead of solving K dx = B dw inside the NLP. This is the "
-                         "manuscript's named 'frozen-transport approximation' -- much cheaper, "
-                         "and an untested open item. Off = the exact coupling.")
-    with rc[2]:
-        if not n_all:
-            st.caption("Take at least one measurement first.")
-        else:
-            _nrays = sum(len(_bundle_r_values(o, nb, res)) for (_a, o, nb) in seq_all)
-            st.caption(
-                "**%d** measurement%s \u00b7 %d rays \u00b7 grid %d\u00d7%d \u00b7 "
-                "%s coupling."
-                % (n_all, "" if n_all == 1 else "s", _nrays, res, res,
-                   "frozen-mechanics" if s["v2_freeze"] else "exact"))
-            if not s["v2_freeze"]:
-                # Measured on the dev box at 4 measurements: 42.7 s at grid 12, 124.7 s at 16,
-                # 529.1 s at 20. The exponent in pixel count ACCELERATES (1.86 then 3.25), so
-                # this is not a mild extrapolation -- grid 64 is hours to days, and ~239k
-                # variables is also an OOM risk on the 2 GB deploy VM. Frozen mechanics was
-                # 36x cheaper at grid 20 and returned the identical theta.
-                st.warning(
-                    "\u26a0\ufe0f **The exact coupling is slow, and superlinearly so.** It puts "
-                    "the elasticity solve and every smoothed-upwind face flux inside the NLP "
-                    "\u2014 about **%s variables** here. Measured at 4 measurements: 43 s at "
-                    "grid 12, 125 s at 16, **529 s at 20**, with the exponent rising, so grid "
-                    "64 is hours to days and may exhaust memory. **Frozen mechanics** was 36x "
-                    "cheaper at grid 20 and returned the identical theta (it changes the "
-                    "D-optimality, not the estimate). For a long run use the CLI instead of a "
-                    "browser tab: `python3 degrade_v2_uq.py --reconstruct --image-res %d "
-                    "--n-steps %d -o out.npz`."
-                    % ("{:,}".format(2 * res * res * (n_all + 1)
-                                     + 2 * (res + 1) ** 2 * n_all), res, n_all))
-
-    go_v2 = st.button("Reconstruct", type="primary", key="btn_v2_recon",
-                      disabled=(n_all == 0), use_container_width=False)
-
-    # Signature of everything the answer depends on, stored with it: a stale result is reported
-    # rather than silently shown. Same guard the 3D stack uses.
-    v2_key = (seq_all, res, float(s["v2_depth"]), float(s["v2_I0"]), float(s["v2_c_q"]),
-              float(s["v2_Q_c"]), float(s["v2_omega_inf"]), float(s["v2_c_cp"]),
-              float(s["v2_a"]), float(s["v2_b"]), float(s["v2_E0"]), float(s["v2_nu"]),
-              bool(s["v2_clamp"]), float(s["v2_tv_weight"]), float(s["v2_eps_rel"]),
-              bool(s["v2_freeze"]), bool(s["v2_uq"]))
-
-    if go_v2:
-        log_box = st.empty()
-        log_lines: list[str] = []
-        _last = [0.0]
-
-        def _render_v2_log() -> None:
-            _render_log_box(log_box, "".join(log_lines))
-
-        def _v2_log(chunk: str) -> None:
-            log_lines.append(chunk)
-            now = time.time()
-            if now - _last[0] >= 0.2:
-                _last[0] = now
-                _render_v2_log()
-
-        params_v2 = V2UQParams(
-            image_res=res, optical_depth=float(s["v2_depth"]), beam_steps=seq_all,
-            I0=float(s["v2_I0"]), c_q=float(s["v2_c_q"]), Q_c=float(s["v2_Q_c"]),
-            omega_inf=float(s["v2_omega_inf"]), c_cp=float(s["v2_c_cp"]),
-            a=float(s["v2_a"]), b=float(s["v2_b"]), E0=float(s["v2_E0"]),
-            nu=float(s["v2_nu"]), clamp_bottom=bool(s["v2_clamp"]),
-            eps_rel=float(s["v2_eps_rel"]), tv_weight=float(s["v2_tv_weight"]),
-            freeze_mechanics=bool(s["v2_freeze"]), run_uq=bool(s["v2_uq"]),
-        )
-        with st.spinner("Solving the v2 estimation NLP\u2026"):
-            try:
-                out = run_v2_reconstruction(params_v2, log_callback=_v2_log)
-                st.session_state["results_v2"] = {"res": out, "key": v2_key}
-            except RuntimeError as exc:   # curated (model-drift gate, no usable linear solver)
-                st.session_state.pop("results_v2", None)
-                st.error(str(exc))
-            except Exception as exc:
-                st.session_state.pop("results_v2", None)
-                st.error("Reconstruct failed: %s" % exc)
-                st.exception(exc)
-            finally:
-                _render_v2_log()
-
-    stash = st.session_state.get("results_v2")
-    if stash is None:
-        st.info("Build a measurement sequence, then press **Reconstruct**.")
-    else:
-        out = stash["res"]
-        if stash["key"] != v2_key:
-            st.warning("Parameters or the sequence changed since this was solved \u2014 press "
-                       "**Reconstruct** again to refresh it.")
-        st.success(
-            "inverse: **%s** (%s) \u00b7 continuation: %s \u00b7 fit RMS **%.3g** \u00b7 "
-            "theta RMS error **%.3g** (%.2f%% of peak) \u00b7 D-optimality **%s** \u00b7 "
-            "%s vars / %s cons \u00b7 model-vs-simulator residual %.1e"
-            % (out.inverse_status, out.inverse_linear_solver, out.continuation_status,
-               out.obs_rms, out.theta_rms,
-               100.0 * out.theta_rms / max(float(out.theta_true.max()), 1e-30),
-               "%.6g" % out.d_optimality if out.d_optimality == out.d_optimality else "n/a",
-               "{:,}".format(out.n_vars), "{:,}".format(out.n_cons), out.forward_residual))
-        # How much the mechanics actually did. Without this the exact/frozen choice looks like a
-        # free lunch: they agree to four figures whenever the transport barely moved anything,
-        # which is most of the default parameter range.
-        _act = out.n_theta_at_lower + out.n_theta_at_upper
-        st.caption(
-            "eq:xd_box active set on theta: **%d** at the lower bound, **%d** at the upper, "
-            "%d interior. %s This is the active set of *this* model \u2014 the manuscript's "
-            "active-constraint claim is evidenced by a different codebase, so nothing here "
-            "speaks to it."
-            % (out.n_theta_at_lower, out.n_theta_at_upper, out.n_theta_interior,
-               "With nothing active, the box constraint is indistinguishable from omitting it "
-               "for this geometry." if _act == 0 else
-               "The box is load-bearing here, so the bound multipliers k_aug consumes matter."))
-        st.caption(
-            "Transport this run: Courant **%.3f**, radius of gyration **%+.2f%%**, mass left "
-            "**%.3f** (simulated) vs **%.3f** (reconstructed). If the first two are near zero "
-            "the mechanics did almost nothing, and **Frozen mechanics** will agree with the "
-            "exact coupling because there was little to freeze \u2014 not because freezing is "
-            "free in general."
-            % (out.courant, out.rg_pct,
-               out.mass_true / max(float(out.theta_true.sum()), 1e-30),
-               out.mass_hat / max(float(out.theta_true.sum()), 1e-30)))
-        if out.uq_error:
-            st.warning("Sensitivity step failed, reconstruction kept: %s" % out.uq_error)
-        st.pyplot(_v2_recon_figure(out), use_container_width=True)
-        st.caption(
-            "**theta RMS error** is available only because the data is synthetic \u2014 it is "
-            "the estimator scored against the truth it was generated from, not something a real "
-            "experiment could report. **Fit RMS** is the residual the NLP actually minimised."
-        )
-
-
 # --- three modes, three tabs ----------------------------------------------------------
-tab_2d, tab_3d, tab_v6 = st.tabs(
-    ["2D dose-response + reconstruction", "3D degradation",
-     "2D implicit-transport shrinkage (v6)"]
+tab_2d, tab_shrinkage, tab_3d = st.tabs(
+    ["2D Decay Reconstruction", "2D Shrinkage Decay Reconstruction",
+     "3D Decay Reconstruction"]
 )
 
 # The 3D tab is populated FIRST in script order: the 2D body below ends in a Reconstruct
@@ -3468,8 +2266,8 @@ tab_2d, tab_3d, tab_v6 = st.tabs(
 with tab_3d:
     _render_3d_tab()
 
-with tab_v6:
-    _render_2d_v6_tab()
+with tab_shrinkage:
+    _render_2d_shrinkage_tab()
 
 with tab_2d:
     # --- main: live dose-response simulator (the image is a derived view of the table) -----

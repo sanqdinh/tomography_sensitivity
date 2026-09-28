@@ -1,8 +1,69 @@
-"""Pyomo transcription of v5, the shrinkage dose-response model.
+"""v5, the shrinkage dose-response model: the compaction potential made nonlocal.
+
+v4 with step 4 changed and nothing else moved.
+
+The problem v5 solves
+---------------------
+v4's flux is driven by ``Pi``, a pointwise function of the local state.  prop:xd_locality then
+bites: for an antisymmetric ``F_{p->q} = G(f_p, f_q, dw_p, dw_q)``, the interior of a region
+where the state is constant carries ``G(s,s,w,w) = 0`` on every face, so **a uniformly damaged
+bulk does not move**.  Measured in v4: interior flux divergence exactly ``0.000e+00`` under
+uniform ``dw``.  The sample therefore shuffles mass between neighbours at the rim instead of
+condensing as a body.
+
+What changes, and it is one line of physics
+-------------------------------------------
+The flux law is untouched.  Only its DRIVER changes, from ``Pi`` to a potential ``phi`` that is a
+global functional of the field::
+
+    [ varsigma + gamma*(1 - sigma_p) ] phi_p  -  sum_{q~p} sigma_pq (phi_q - phi_p)  =  Pi_p
+
+with ``sigma`` a material indicator and ``sigma_pq`` its face average.  Antisymmetry of the flux
+is untouched, so prop:xd_mass holds with its proof unchanged; what is broken is the POINTWISE
+hypothesis of prop:xd_locality, which is what forbade bulk contraction.  The proposition needs no
+correction -- antisymmetry is the whole of conservation, but it is pointwise locality of the
+driver that forbids whole-body motion.
+
+This is not a new closure.  subsec:rationale already names the family: reduce the elasticity to
+potential flow and take one Jacobi sweep from rest, and you get v4; iterate the sweep and you
+walk back to the elliptic answer.  ``varsigma`` is that dial, unpinned.
+
+Two things that look right and are not
+--------------------------------------
+* **The source is Pi, not dw.**  ``dw`` is a fraction of what is present and, by shielding, is
+  largest where least material lies upstream -- so it peaks at the rim and is largest of all in
+  vacuum, where nothing shields the beam and nothing is there to damage.  Driving the potential
+  with ``dw`` pushes the specimen OUTWARD.  ``Pi = dw * ftilde / f_max`` is the created void and
+  vanishes in vacuum by construction.
+* **The free surface needs an absorption coefficient that does NOT scale with the reach.**  A
+  plain screened Poisson ``(I + l^2 L) phi = Pi``, leaving the vacuum to pin itself, fails
+  quietly: ``phi`` comes out as a smoothed ``Pi``, still rim-peaked at every reach, because the
+  conduction in the ersatz background beats the identity term once ``l`` is large.  ``gamma`` is
+  a separate coefficient held fixed as ``varsigma`` varies.
+
+Why this is not simply v2 again
+-------------------------------
+Elasticity erased the design anisotropy because it has SHEAR: a dilatational eigenstrain is
+relieved largely by deviatoric rearrangement, so the body accommodates a concentrated contraction
+internally and its outline barely moves.  A scalar potential has no deviatoric degrees of
+freedom, so the whole relief must appear as boundary motion and inherits the angular structure of
+the source.  Nonlocality was never what cost the signal.
+
+Limits
+------
+``varsigma -> infinity`` recovers v4 exactly, with ``c_cp_v4 = c_cp_v5 * (l/Delta)^2``.
+``varsigma = 0`` is the pure Poisson closure and is the default.
+
+Reconstruction
+--------------
+The Pyomo reconstruction of this prototype is in the second half of this file, under the
+``=== reconstruction ===`` banner.  Its own notes follow.
+
+Pyomo transcription of v5, the shrinkage dose-response model.
 
 The reduced model with a NONLOCAL compaction potential.
 
-Same checking discipline as v4: data comes from :func:`degrade_v5.simulate` (numpy), so the
+Same checking discipline as v4: data comes from :func:`degrade_2d_shrinkage_decay_v2_proto4.simulate` (numpy), so the
 measurements and the model fitting them stay two independent implementations, and
 :func:`check_forward` compares them at the true solution before any reconstruction means anything.
 
@@ -25,27 +86,267 @@ the same shape it had in v4.
 
 Blocks per stage: ``S`` (chain), ``Ipix``, ``dw``, ``ft``, ``sigma``, ``Pi``, ``phi``, ``f``,
 plus ``yobs`` per ray.  Two more scalar fields than v4.
+
+Dose fractionation study
+------------------------
+(Formerly ``scripts/experiment_fractionation.py``; now the ``fractionation`` CLI verb.)
+
+Dose fractionation in the v5 forward model: 10 angles one at a time vs all 10 at once.
+
+The two runs deliver the SAME total exposure -- ten full-fan bundles at ten evenly spaced
+angles, the same ``I0`` per ray -- and differ only in how it is split in time:
+
+  A. SEQUENTIAL   ten measurement steps, one angle each.  This is what ``simulate`` does.
+  B. SIMULTANEOUS one measurement step carrying all ten angles.
+
+Any difference between them is fractionation, not dose.  It is expected to be non-zero because
+every channel in the step map is nonlinear in the per-step fluence: the converted fraction
+``dw = 1 - exp(-c I delta)`` saturates, the decay ``exp(-a I - b I^2)`` compounds, and the
+compaction flux is driven by a potential solved once per step.
+
+WHAT "SIMULTANEOUS" MEANS HERE, precisely.  Within one step every ray integrates the field as it
+stood at the START of that step, so rays do not shield one another's damage.  That is not an
+approximation invented for this experiment -- it is the convention the model already uses for a
+bundle, and the one CLAUDE.md records for the 3D sinogram ("rays within one measurement do not
+see each other's damage").  Firing ten angles at once therefore just sums the ten dose fields
+before the single decay and the single compaction, which is what simultaneous irradiation is.
+
+:func:`check_equivalence` is the gate: with ONE bundle, the simultaneous step must reproduce
+:func:`degrade_2d_shrinkage_decay_v2_proto4.step` bit-for-bit.  It does (0.0e+00), so the generalisation adds nothing and
+removes nothing at K=1, and the whole difference measured below is the fractionation.
+
+Run it::
+
+    python3 -m archives.degrade_2d_shrinkage_decay_v2_proto4 fractionation
+    python3 -m archives.degrade_2d_shrinkage_decay_v2_proto4 fractionation --a 0 --c 0.8 --tag a0_c0.8
+
+``--a 0 --b 0`` is the clean shrinkage case: the decay channel is off, :func:`prop:xd_mass`
+makes the total EXACTLY conserved, and every difference between the two runs is then transport
+alone rather than transport plus a difference in how much mass each schedule destroyed.
 """
 
 from __future__ import annotations
 
 import io
+import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
 import pyomo.environ as pyo
 
-from degrade_v2_uq import measurement_rays, solve_with_fallback
-from degrade_v3_uq import _neighbours
-from degrade_v5 import (V5Params, simulate, resolve, _phantom, _demo_sequence,
-                        shape_diagnostics as _shape_diagnostics)
-from degrade_v2 import scale_to_optical_depth
+from senDOE.helpers.rays import bundle_r_values, ray_line_integral
+from senDOE.helpers.dose import accumulate_dose, scale_to_optical_depth
+from senDOE.helpers.phantoms import demo_sequence as _demo_sequence, phantom as _phantom
+from senDOE.helpers.rays import measurement_rays
+from senDOE.helpers.shape_metrics import shape_diagnostics, shape_diagnostics as _shape_diagnostics
+from senDOE.helpers.solvers import reg_fraction as _reg_fraction, solve_with_fallback
+from senDOE.models.tomography_pyomo_2d_shrinkage_decay import _neighbours, _tv_expression
+from senDOE.models.tomography_2d_shrinkage_decay import compaction_potential, resolve
 
 
+
+
+
+
+@dataclass(frozen=True)
+class V5Params:
+    """Parameters of v5.  Three new symbols over v4: one physical (``reach``), two numerical."""
+
+    I0: float = 1.0
+    c: float = 0.1           # conversion coefficient, dw = 1 - exp(-c I_p delta_p)
+    a: float = 0.05          # decay, linear in fluence
+    b: float = 0.0           # decay, quadratic
+    c_cp: float = 0.3        # compaction number
+    # COMPACTION REACH, a physical length in the same units as dx. MANDATORY and strictly
+    # positive: varsigma = (dx/reach)^2 is the only unconditional regulariser of the potential
+    # operator, and l = infinity is NOT a legal setting -- see resolve(). None means "resolve to
+    # the specimen radius R", the default, not "infinite".
+    #   lower bound, physical : l >~ R/2, or the potential stays rim-peaked and you are back in
+    #                           v4's regime (centre/rim 0.42 at R/5, 2.24 at R/2, 4.06 as l->inf)
+    #   upper bound, numerical: cond(A) ~ (gamma+8)*(l/dx)^2, so l ~ 90 px is still unremarkable
+    reach: Optional[float] = None
+    gamma: float = 100.0     # vacuum absorption. Numerical. Needs gamma >> max(varsigma, 1).
+    # Density at which material starts conducting. Numerical. None -> the linear indicator
+    # sigma = ft/f_max, which needs no new parameter but makes a low-contrast interior behave
+    # partly like vacuum.
+    f_ref_frac: Optional[float] = 0.05
+    f_max: Optional[float] = None
+    beta: float = 1000.0     # logistic upwind sharpness
+    flux: str = "upwind"     # "upwind" | "harmonic" | "central"
+    eps_h: float = 1e-12
+    dx: float = 1.0
+
+    def varsigma(self) -> float:
+        """``(dx/reach)^2``.  Strictly positive; ``reach`` must have been resolved first."""
+        if self.reach is None:
+            raise ValueError("reach is unresolved: call degrade_2d_shrinkage_decay_v2_proto4.resolve(p, theta) first")
+        if not np.isfinite(self.reach) or self.reach <= 0:
+            raise ValueError(
+                "reach = %r is not a legal setting. The pure Poisson closure (l = infinity, "
+                "varsigma = 0) is a LIMIT to be approached and reported, never selected: with "
+                "no varsigma the only regulariser is the absorption gamma*(1-sigma), which "
+                "vanishes on any field without vacuum, leaving a singular pure Neumann "
+                "Laplacian. Use a finite l; l ~ R is the default." % (self.reach,))
+        return float((self.dx / self.reach) ** 2)
+
+    def decay_factor(self, I_p):
+        I_p = np.asarray(I_p, dtype=float)
+        return np.exp(-self.a * I_p - self.b * I_p ** 2)
+
+
+@dataclass
+class StepInfo5:
+    mass: float
+    lost: float
+    dw_max: float
+    I_max: float
+    state_min: float
+    compaction: float          # C_k, now built from phi rather than Pi
+    max_g: float
+    flux_sum: float
+    phi_max: float
+    phi_core_rim: float        # centre/rim ratio of phi; > 1 means the potential has inverted
+
+
+# --- step 4a: the compaction potential ---------------------------------------------------
+
+# --- step 4b: the flux, driven by phi instead of Pi ---------------------------------------
+
+def flux_divergence(ft, phi, c_cp: float, mode: str = "upwind", beta: float = 1000.0,
+                    eps_h: float = 1e-12):
+    """``sum_{q~p} F_{p->q}`` with the potential supplied directly.
+
+    Identical in form to v4's, and identical in value when ``phi`` is handed ``Pi`` -- which is
+    how the v4 limit is checked.  Antisymmetric by construction: each face contributes ``+F`` to
+    one cell and ``-F`` to its neighbour, so the divergence sums to zero over the grid and
+    prop:xd_mass is untouched.
+    """
+    ft = np.asarray(ft, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+    gh = phi[:, 1:] - phi[:, :-1]
+    gv = phi[1:, :] - phi[:-1, :]
+    if mode == "harmonic":
+        eh = eps_h * max(float(np.abs(ft).max()), 1e-300)
+        ah, bh = ft[:, :-1], ft[:, 1:]
+        av, bv = ft[:-1, :], ft[1:, :]
+        Fh = c_cp * (2.0 * ah * bh / (ah + bh + eh)) * gh
+        Fv = c_cp * (2.0 * av * bv / (av + bv + eh)) * gv
+    elif mode == "upwind":
+        wh = 1.0 / (1.0 + np.exp(-beta * gh))
+        wv = 1.0 / (1.0 + np.exp(-beta * gv))
+        Fh = c_cp * (wh * ft[:, :-1] + (1.0 - wh) * ft[:, 1:]) * gh
+        Fv = c_cp * (wv * ft[:-1, :] + (1.0 - wv) * ft[1:, :]) * gv
+    else:
+        Fh = c_cp * 0.5 * (ft[:, :-1] + ft[:, 1:]) * gh
+        Fv = c_cp * 0.5 * (ft[:-1, :] + ft[1:, :]) * gv
+    div = np.zeros_like(ft)
+    div[:, :-1] += Fh
+    div[:, 1:] -= Fh
+    div[:-1, :] += Fv
+    div[1:, :] -= Fv
+    return div, (Fh, Fv)
+
+
+def compaction_number(ft, phi, c_cp: float) -> float:
+    """``C_k = c_cp * max_p sum_{q~p} max(phi_q - phi_p, 0)``.  Donor-cell positivity bound."""
+    phi = np.asarray(phi, dtype=float)
+    gh = phi[:, 1:] - phi[:, :-1]
+    gv = phi[1:, :] - phi[:-1, :]
+    out = np.zeros_like(phi)
+    out[:, :-1] += np.maximum(gh, 0.0)
+    out[:, 1:] += np.maximum(-gh, 0.0)
+    out[:-1, :] += np.maximum(gv, 0.0)
+    out[1:, :] += np.maximum(-gv, 0.0)
+    return float(c_cp * np.max(out))
+
+
+# --- the step ------------------------------------------------------------------------------
+
+def step(f, r_values, angle_rad: float, p: V5Params):
+    """One measurement step.  Steps 1, 2, 3 and 5 are v4's verbatim; only 4 changed."""
+    f = np.asarray(f, dtype=float)
+    fm = float(p.f_max)
+
+    cIdelta, I_p = accumulate_dose(f, r_values, angle_rad, p.I0, p.c)   # 1
+    dw = 1.0 - np.exp(-cIdelta)                                          # 2
+    ft = f * p.decay_factor(I_p)                                         # 3
+    lost = float(f.sum() - ft.sum())
+
+    phi, Pi, sigma = compaction_potential(ft, dw, p)                     # 4a
+    div, (Fh, Fv) = flux_divergence(ft, phi, p.c_cp, p.flux, p.beta, p.eps_h)   # 4b
+    f_next = ft - div                                                    # 5
+
+    nr, nc = f.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    c = (nr - 1) / 2.0
+    rad = np.sqrt((xx - c) ** 2 + (yy - c) ** 2)
+    core, rim = rad < 0.25 * nr, (rad >= 0.30 * nr) & (rad < 0.40 * nr)
+    pr = (float(phi[core].mean()) / float(phi[rim].mean())
+          if rim.any() and abs(float(phi[rim].mean())) > 1e-300 else float("nan"))
+    gmax = max(float(np.abs(phi[:, 1:] - phi[:, :-1]).max()) if nc > 1 else 0.0,
+               float(np.abs(phi[1:, :] - phi[:-1, :]).max()) if nr > 1 else 0.0)
+    info = StepInfo5(mass=float(f_next.sum()), lost=lost, dw_max=float(dw.max()),
+                     I_max=float(I_p.max()), state_min=float(f_next.min()),
+                     compaction=compaction_number(ft, phi, p.c_cp), max_g=gmax,
+                     flux_sum=float(Fh.sum() + Fv.sum()),
+                     phi_max=float(phi.max()), phi_core_rim=pr)
+    return f_next, info
+
+
+def simulate(theta, seq, p: V5Params, image_res: int,
+             record_observations: bool = False, record_trajectory: bool = False):
+    """Run a measurement sequence.  Observations are index-shifted: ``y_{k+1} = C f_{k+1}``."""
+    theta = np.asarray(theta, dtype=float)
+    p = resolve(p, theta)
+    f = theta.copy()
+    infos, obs = [], []
+    hist = [f.copy()]
+    for angle_deg, offset, n_beams in seq:
+        ang = np.deg2rad(float(angle_deg))
+        rv = bundle_r_values(float(offset), int(n_beams), int(image_res))
+        f, info = step(f, rv, ang, p)
+        if record_observations:
+            obs.append(np.array([ray_line_integral(f, r, ang) for r in rv]))
+        infos.append(info)
+        if record_trajectory:
+            hist.append(f.copy())
+    out = [f, infos]
+    if record_observations:
+        out.append(obs)
+    if record_trajectory:
+        out.append(hist)
+    return tuple(out)
+
+
+def match_compaction_number(theta, seq, p: V5Params, image_res: int, target: float = 0.30,
+                            tol: float = 1e-3, max_iter: int = 40) -> float:
+    """Return the ``c_cp`` whose peak ``C_k`` over the run equals ``target``.
+
+    Comparisons between closures must be at matched CONTRACTION, not matched ``c_cp``: the
+    potential rescales the driver, so equal ``c_cp`` means very different amounts of motion and
+    any design-separation number taken that way is confounded.  ``C_k`` is linear in ``c_cp`` at
+    fixed trajectory, so a secant iteration converges in a handful of steps.
+    """
+    p = resolve(p, theta)
+    lo, hi = 1e-6, 1e6
+    for _ in range(max_iter):
+        mid = np.sqrt(lo * hi)
+        _f, infos = simulate(theta, seq, replace(p, c_cp=mid), image_res)
+        ck = max(i.compaction for i in infos)
+        if not np.isfinite(ck) or ck > target:
+            hi = mid
+        else:
+            lo = mid
+        if np.isfinite(ck) and abs(ck - target) < tol * target:
+            return float(mid)
+    return float(np.sqrt(lo * hi))
+
+
+# ============================== reconstruction ==============================
 def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None,
                    inline_Ipix: bool = False, inline_dw: bool = False,
                    inline_ft: bool = False, sigma_fixed=None, potential: bool = True):
@@ -75,7 +376,7 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
             "phi, so dropping the potential block at c_cp != 0 would silently build a DIFFERENT "
             "model rather than a cheaper one." % (p.c_cp,))
 
-    m = pyo.ConcreteModel(name="degrade_v5")
+    m = pyo.ConcreteModel(name="degrade_2d_shrinkage_decay_v2_proto4")
     m.res, m.n_steps, m.meas, m.p = res, K, meas, p
     # carried so initialize_from_numpy is self-contained: it re-runs the numpy model
     # through the SAME fixed measurement sequence this model was built around.
@@ -267,7 +568,7 @@ def build_v5_model(theta_ref, seq, p: V5Params, image_res: int, *, f_bounds=None
 # --- pinning and the gate ---------------------------------------------------------------
 
 def numpy_trajectory(theta, seq, p: V5Params, image_res: int):
-    """Every variable of the model, taken off a :func:`degrade_v5.simulate` run."""
+    """Every variable of the model, taken off a :func:`degrade_2d_shrinkage_decay_v2_proto4.simulate` run."""
     p = resolve(p, theta)
     res = int(image_res)
     npix = res * res
@@ -294,7 +595,6 @@ def numpy_trajectory(theta, seq, p: V5Params, image_res: int):
     # near-singular operator returns a large finite answer rather than an error. Re-solving it
     # here would have skipped the one guard that catches that, on the very path -- estimation
     # initialisation -- whose iterates can carry no vacuum and so trigger it.
-    from degrade_v5 import compaction_potential
     Pi = np.zeros_like(ft)
     sig = np.zeros_like(ft)
     phi = np.zeros_like(ft)
@@ -367,7 +667,7 @@ def max_residual(m):
 
 
 def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True, **kw):
-    """G1: does the Pyomo model reproduce degrade_v5.simulate? Residual only, no solver."""
+    """G1: does the Pyomo model reproduce degrade_2d_shrinkage_decay_v2_proto4.simulate? Residual only, no solver."""
     inline = {k: kw.pop(k) for k in ("inline_Ipix", "inline_dw", "inline_ft") if k in kw}
     p = V5Params(**kw)
     seq = _demo_sequence(n_steps)
@@ -386,19 +686,6 @@ def check_forward(image_res: int = 24, n_steps: int = 3, verbose: bool = True, *
 
 # --- estimation ---------------------------------------------------------------------------
 
-def _tv_expression(m, theta_scale: float):
-    res = m.res
-    eps = (1e-2 * theta_scale) ** 2
-    tv = 0.0
-    for i in range(res):
-        for j in range(res):
-            q = i * res + j
-            d0 = (m.f[q + res, 0] - m.f[q, 0]) if i < res - 1 else 0.0
-            d1 = (m.f[q + 1, 0] - m.f[q, 0]) if j < res - 1 else 0.0
-            tv += pyo.sqrt(d0 ** 2 + d1 ** 2 + eps)
-    return tv
-
-
 def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     m.YD = pyo.Set(initialize=[(k, j) for (k, j, _n) in m.obs_index], dimen=2, ordered=True)
     m.y_data = pyo.Var(m.YD, initialize=0.0)
@@ -413,24 +700,6 @@ def add_estimation_objective(m, y_data, tv_weight: float, theta_scale: float):
     m.obj = pyo.Objective(expr=fit
                           + tv_weight * _tv_expression(m, theta_scale) / (npix * theta_scale))
     return m.obj
-
-
-def _reg_fraction(log: str):
-    """``(regularised, total)`` IPOPT iterations.
-
-    Column 6 of an iteration line is ``lg(rg)``; ``"-"`` means no Hessian regularisation was
-    applied on that iteration.  Counting any other way is how the bogus "201 of 200" figure
-    arose -- a substring test that also matched the header and the restoration lines.
-    """
-    n = r = 0
-    for ln in log.splitlines():
-        f = ln.split()
-        if len(f) < 10 or not re.fullmatch(r"\d+r?", f[0]):
-            continue
-        n += 1
-        if f[6] != "-":
-            r += 1
-    return r, n
 
 
 @dataclass
@@ -601,9 +870,9 @@ def run_v5_reconstruction(params: V5UQParams, log_callback=None) -> V5UQResults:
         say("    max constraint residual %.3e  (%s)\n" % (gate_resid, where))
         if gate_resid > 1e-8:
             raise RuntimeError(
-                "The Pyomo model no longer reproduces degrade_v5.simulate on this geometry "
+                "The Pyomo model no longer reproduces degrade_2d_shrinkage_decay_v2_proto4.simulate on this geometry "
                 "(residual %.3e at %s). Reconstructing against it would not mean anything; "
-                "run degrade_v5_uq.check_forward() to localise the disagreement."
+                "run degrade_2d_shrinkage_decay_v2_proto4.check_forward() to localise the disagreement."
                 % (gate_resid, where))
 
     opts = dict(params.solver_opts or {})
@@ -723,7 +992,7 @@ def forward_solve(theta, seq, p: V5Params, image_res: int, *, linear_solver="ma9
     """Fix ``f[:,0] = theta`` and let IPOPT find the whole trajectory.
 
     Strictly stronger than :func:`check_forward`, which pins every variable to a
-    :func:`degrade_v5.simulate` trajectory and evaluates residuals.  That check can only say the
+    :func:`degrade_2d_shrinkage_decay_v2_proto4.simulate` trajectory and evaluates residuals.  That check can only say the
     equations were transcribed correctly at a point it was handed.  This one starts IPOPT
     somewhere else and asks it to *find* the trajectory, so it additionally says the model is
     square, solvable, and scaled well enough to converge -- which for v5 is a real question,
@@ -926,7 +1195,7 @@ def forward_solve_staged(theta, seq, p: V5Params, image_res: int, *, linear_solv
 # --- initialisation from the numpy model ------------------------------------------------
 
 def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False):
-    """Initialise every variable of a v5 Pyomo model from a :mod:`degrade_v5` run.
+    """Initialise every variable of a v5 Pyomo model from a :mod:`degrade_2d_shrinkage_decay_v2_proto4` run.
 
     **Spec-agnostic by construction.**  The forward model and the estimation model differ only
     in whether ``f[:,0]`` is fixed; the initialisation is the same operation in both, because in
@@ -1025,7 +1294,7 @@ def initialize_from_numpy(m, theta_seed=None, *, fix_theta=False, verbose=False)
 # --- CLI ------------------------------------------------------------------------------------
 #
 # A grid-32 reconstruction takes minutes and must not need a browser session open for the whole
-# of it. Same shape as degrade_v2_uq's: no subcommands, one --reconstruct flag switching between
+# of it. Same shape as degrade_2d_shrinkage_decay_v2_proto1's: no subcommands, one --reconstruct flag switching between
 # the model check (the default, and the cheap one) and a run.
 
 def _cli(argv=None):
@@ -1060,10 +1329,10 @@ def _cli(argv=None):
     a = ap.parse_args(argv)
 
     if not a.reconstruct:
-        check_forward(image_res=a.image_res, n_steps=a.n_steps, I0=a.I0, c=a.c, a=a.a,
-                      c_cp=a.c_cp, reach=a.reach, gamma=a.gamma, f_ref_frac=a.f_ref_frac,
-                      verbose=not a.quiet)
-        return 0
+        r = check_forward(image_res=a.image_res, n_steps=a.n_steps, I0=a.I0, c=a.c, a=a.a,
+                          c_cp=a.c_cp, reach=a.reach, gamma=a.gamma, f_ref_frac=a.f_ref_frac,
+                          verbose=not a.quiet)
+        return 0 if r < 1e-10 else 1
 
     params = V5UQParams(
         image_res=a.image_res, optical_depth=a.optical_depth,
@@ -1116,5 +1385,268 @@ def _cli(argv=None):
     return 0
 
 
+# ========================== dose fractionation study ==========================
+_FRACTIONATION_OUT = os.path.dirname(os.path.abspath(__file__))
+
+
+def step_simultaneous(f, bundles, p: V5Params):
+    """One step carrying several ``(r_values, angle_rad)`` bundles at once.
+
+    Mirrors :func:`degrade_2d_shrinkage_decay_v2_proto4.step` line for line; the only change is that steps 1-2 accumulate
+    over every bundle against the SAME ``f`` before step 3 decays it and step 4 solves one
+    potential.  Returns ``(f_next, info)`` with ``info`` a plain dict.
+    """
+    f = np.asarray(f, dtype=float)
+    cIdelta = np.zeros_like(f)
+    I_p = np.zeros_like(f)
+    for r_values, angle_rad in bundles:                                  # 1
+        a, b = accumulate_dose(f, r_values, angle_rad, p.I0, p.c)
+        cIdelta = cIdelta + a
+        I_p = I_p + b
+    dw = 1.0 - np.exp(-cIdelta)                                          # 2
+    ft = f * p.decay_factor(I_p)                                         # 3
+    lost = float(f.sum() - ft.sum())
+
+    phi, _Pi, _sigma = compaction_potential(ft, dw, p)                   # 4a
+    div, (Fh, Fv) = flux_divergence(ft, phi, p.c_cp, p.flux, p.beta, p.eps_h)   # 4b
+    f_next = ft - div                                                    # 5
+
+    info = dict(mass=float(f_next.sum()), lost=lost, dw_max=float(dw.max()),
+                I_max=float(I_p.max()), state_min=float(f_next.min()),
+                compaction=compaction_number(ft, phi, p.c_cp),
+                flux_sum=float(Fh.sum() + Fv.sum()), phi_max=float(phi.max()))
+    return f_next, info
+
+
+def check_equivalence(image_res: int = 24, verbose: bool = True) -> float:
+    """Gate: at ONE bundle the simultaneous step must BE :func:`degrade_2d_shrinkage_decay_v2_proto4.step`."""
+    theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
+    p = resolve(V5Params(reach=7.0, f_ref_frac=0.002), theta)
+    rv = bundle_r_values(0.0, 0, image_res)
+    ang = np.deg2rad(37.0)
+    a, _ = step(theta, rv, ang, p)
+    b, _ = step_simultaneous(theta, [(rv, ang)], p)
+    err = float(np.abs(a - b).max())
+    if verbose:
+        print("  gate: one-bundle simultaneous == degrade_2d_shrinkage_decay_v2_proto4.step -> %.3e  %s"
+              % (err, "PASS" if err == 0.0 else "FAIL (must be exactly 0)"))
+    return err
+
+
+def radial_profile(img, centroid, n_bins: int, r_max: float):
+    """Mass per radial band about a FIXED centroid.  Mass, not mean: it must sum to the total."""
+    nr, nc = img.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    rad = np.sqrt((xx - centroid[0]) ** 2 + (yy - centroid[1]) ** 2).ravel()
+    w = np.asarray(img, dtype=float).ravel()
+    edges = np.linspace(0.0, r_max, n_bins + 1)
+    out = np.array([w[(rad >= edges[i]) & (rad < edges[i + 1])].sum() for i in range(n_bins)])
+    return 0.5 * (edges[:-1] + edges[1:]), out
+
+
+def run_fractionation(image_res=32, n_angles=10, optical_depth=1.1, **over):
+    """Both runs on one phantom.  Returns ``(theta, resultA, resultB, params)``."""
+    theta = scale_to_optical_depth(_phantom(image_res), optical_depth, image_res)
+    kw = dict(I0=1.0, c=0.1, a=0.05, b=0.0, c_cp=0.3, reach=7.0, gamma=100.0,
+              f_ref_frac=0.002, beta=1000.0)
+    kw.update(over)
+    p = resolve(V5Params(**kw), theta)
+
+    angles = [180.0 * k / n_angles for k in range(n_angles)]
+    rv = bundle_r_values(0.0, 0, image_res)          # full fan, zero offset: identical per angle
+
+    # A -- ten steps, one angle each. The stock path, untouched.
+    seq = tuple((a, 0.0, 0) for a in angles)
+    fA, infosA = simulate(theta, seq, p, image_res)
+    A = dict(f=fA, steps=len(infosA),
+             ck=max(i.compaction for i in infosA), dw=max(i.dw_max for i in infosA),
+             fmin=min(i.state_min for i in infosA), phi=max(i.phi_max for i in infosA),
+             lost=sum(i.lost for i in infosA))
+
+    # B -- one step, all ten angles.
+    fB, infoB = step_simultaneous(theta, [(rv, np.deg2rad(a)) for a in angles], p)
+    B = dict(f=fB, steps=1, ck=infoB["compaction"], dw=infoB["dw_max"],
+             fmin=infoB["state_min"], phi=infoB["phi_max"], lost=infoB["lost"])
+
+    for d in (A, B):
+        d["mass"] = float(d["f"].sum())
+        d["support_pct"], d["half_pct"], d["flips"] = shape_diagnostics(theta, d["f"])
+    return theta, A, B, p, angles
+
+
+def match_ck(target, image_res, n_angles, kw, tol=2e-3, max_iter=25, verbose=True):
+    """Scale ``c_cp`` until the WORSE of the two schedules hits ``target`` for max C_k.
+
+    One ``c_cp`` for both runs, not one each: it is a material property, and the experiment
+    varies the schedule, not the material.  Matching per-run would confound the comparison with
+    a different compaction amplitude, which is exactly what
+    :func:`degrade_2d_shrinkage_decay_v2_proto4.match_compaction_number` warns against.
+
+    The simultaneous run binds, and there C_k is EXACTLY linear in ``c_cp`` -- within one step
+    ``phi`` is solved from ``ft`` and ``dw`` before the flux, so it does not see ``c_cp`` at all.
+    Sequentially the feedback through ``f`` makes it only nearly linear, so this iterates the
+    fixed point ``c <- c * target / C_k(c)`` rather than assuming one shot is enough.
+    """
+    c = float(kw.get("c_cp", 0.3))
+    for it in range(1, max_iter + 1):
+        k = dict(kw); k["c_cp"] = c
+        _t, A, B, _p, _a = run_fractionation(image_res=image_res, n_angles=n_angles, **k)
+        worst = max(A["ck"], B["ck"])
+        if verbose:
+            print("    match c_cp=%.5f -> C_k seq %.4f / sim %.4f (worst %.4f)"
+                  % (c, A["ck"], B["ck"], worst))
+        if abs(worst - target) <= tol:
+            return c
+        c *= target / max(worst, 1e-12)
+    return c
+
+
+def _figure(theta, res, title, path, vmax, span, prof_ref, dlim):
+    """Four panels.  Colour scales are passed in so the two figures are directly comparable."""
+    f = res["f"]
+    nr, nc = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nc]
+    m0 = float(theta.sum())
+    cen = ((xx * theta).sum() / m0, (yy * theta).sum() / m0)   # FIXED initial centroid
+    r, prof = radial_profile(f, cen, 16, 0.55 * nr)
+    r0, prof0 = prof_ref
+
+    import matplotlib
+    matplotlib.use("Agg")                  # headless
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 4, figsize=(17.5, 4.4))
+    im = ax[0].imshow(theta, cmap="gray", vmin=0.0, vmax=vmax, interpolation="nearest")
+    ax[0].set_title("theta (undamaged)", fontsize=10); fig.colorbar(im, ax=ax[0], fraction=0.046)
+    im = ax[1].imshow(f, cmap="gray", vmin=0.0, vmax=vmax, interpolation="nearest")
+    ax[1].set_title("f after exposure", fontsize=10); fig.colorbar(im, ax=ax[1], fraction=0.046)
+    im = ax[2].imshow(f - theta, cmap="coolwarm", vmin=-span, vmax=span, interpolation="nearest")
+    ax[2].set_title("change  f - theta", fontsize=10); fig.colorbar(im, ax=ax[2], fraction=0.046)
+    for a in ax[:3]:
+        a.set_xticks([]); a.set_yticks([])
+
+    # NORMALISED by total mass, and shown as a difference. At a = 0.05 the decay removes ~39% of
+    # the mass uniformly, which swamps the transport in an absolute profile and paints the whole
+    # change panel one colour. Dividing by the total removes the decay and leaves the SHAPE
+    # change, which is what the compaction does and what this experiment is about. Positive
+    # inner bands with negative outer bands is condensation.
+    d = prof / max(prof.sum(), 1e-300) - prof0 / max(prof0.sum(), 1e-300)
+    ax[3].axhline(0.0, color="#bbbbbb", lw=1)
+    ax[3].bar(r, d, width=(r[1] - r[0]) * 0.85,
+              color=["#1f77b4" if v >= 0 else "#d62728" for v in d])
+    ax[3].set_title("radial redistribution, mass-normalised\n"
+                    "(inner + / outer - = condensation)", fontsize=10)
+    ax[3].set_xlabel("radius (px)"); ax[3].set_ylabel("share of total mass, after - theta")
+    ax[3].set_ylim(-dlim, dlim)          # SHARED across both figures, so they compare by eye
+    ax[3].ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax[3].spines[["top", "right"]].set_visible(False)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.99))
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
+def _fractionation_cli(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Dose fractionation in the v5 forward model: sequential vs simultaneous.")
+    ap.add_argument("--grid", type=int, default=32)
+    ap.add_argument("--angles", type=int, default=10)
+    ap.add_argument("--I0", type=float, default=1.0)
+    ap.add_argument("--c", type=float, default=0.1, help="c_omega, the conversion coefficient")
+    ap.add_argument("--a", type=float, default=0.05, help="linear decay; 0 with b=0 conserves mass")
+    ap.add_argument("--b", type=float, default=0.0)
+    ap.add_argument("--c-cp", type=float, default=0.3)
+    ap.add_argument("--reach", type=float, default=7.0)
+    ap.add_argument("--gamma", type=float, default=100.0)
+    ap.add_argument("--f-ref-frac", type=float, default=0.002)
+    ap.add_argument("--match-ck", type=float, default=None, metavar="TARGET",
+                    help="solve for the c_cp that puts the WORSE schedule's max C_k at TARGET, "
+                         "and use that one c_cp for both runs. Use to stay inside the donor-cell "
+                         "positivity bound (C_k <= 1), which the simultaneous schedule breaches "
+                         "at c_cp = 0.3 with c_omega = 0.8.")
+    ap.add_argument("--tag", default="", help="suffix for the PNG names, so runs do not overwrite")
+    a = ap.parse_args(argv)
+
+    print("Dose fractionation in the v5 forward model: 10 angles one at a time vs all 10 at once.")
+    print()
+    check_equivalence()
+    print()
+
+    kw = dict(I0=a.I0, c=a.c, a=a.a, b=a.b, c_cp=a.c_cp, reach=a.reach, gamma=a.gamma,
+              f_ref_frac=a.f_ref_frac)
+    if a.match_ck is not None:
+        print("  matching c_cp so the worse schedule's max C_k = %.3f" % a.match_ck)
+        kw["c_cp"] = match_ck(a.match_ck, a.grid, a.angles, kw)
+        print("    -> c_cp = %.5f (was %.5f), applied to BOTH runs\n" % (kw["c_cp"], a.c_cp))
+    theta, A, B, p, angles = run_fractionation(image_res=a.grid, n_angles=a.angles, **kw)
+    sfx = ("_" + a.tag) if a.tag else ""
+    nr, _ = theta.shape
+    yy, xx = np.mgrid[0:nr, 0:nr]
+    m0 = float(theta.sum())
+    cen = ((xx * theta).sum() / m0, (yy * theta).sum() / m0)
+    prof_ref = radial_profile(theta, cen, 16, 0.55 * nr)
+
+    vmax = float(theta.max())
+    span = max(float(np.abs(A["f"] - theta).max()), float(np.abs(B["f"] - theta).max()))
+
+    def _nd(f):
+        _r, pr = radial_profile(f, cen, 16, 0.55 * nr)
+        return pr / max(pr.sum(), 1e-300) - prof_ref[1] / max(prof_ref[1].sum(), 1e-300)
+    dlim = 1.05 * max(float(np.abs(_nd(A["f"])).max()), float(np.abs(_nd(B["f"])).max()))
+
+    hdr = ("grid %d, %d evenly spaced angles, full fan | I0=%g c=%g a=%g b=%g c_cp=%g "
+           "reach=%g gamma=%g f_ref_frac=%g"
+           % (nr, len(angles), p.I0, p.c, p.a, p.b, p.c_cp, p.reach, p.gamma, p.f_ref_frac))
+    pA = _figure(theta, A, "A. SEQUENTIAL - %d steps, one angle each\n%s" % (A["steps"], hdr),
+                 os.path.join(_FRACTIONATION_OUT, "v5_fractionation_sequential%s.png" % sfx),
+                 vmax, span, prof_ref, dlim)
+    pB = _figure(theta, B, "B. SIMULTANEOUS - 1 step carrying all %d angles\n%s"
+                 % (len(angles), hdr),
+                 os.path.join(_FRACTIONATION_OUT, "v5_fractionation_simultaneous%s.png" % sfx),
+                 vmax, span, prof_ref, dlim)
+
+    print("  %-26s %14s %14s %14s" % ("", "A sequential", "B simultaneous", "B - A"))
+    rows = [("measurement steps", "steps", "%d", 0),
+            ("total mass", "mass", "%.5f", 1),
+            ("mass lost to decay", "lost", "%.5f", 1),
+            ("support radius 99% (%)", "support_pct", "%+.3f", 1),
+            ("half-mass radius (%)", "half_pct", "%+.3f", 1),
+            ("radial sign changes", "flips", "%d", 0),
+            ("max C_k (bound <= 1)", "ck", "%.4f", 1),
+            ("max dw", "dw", "%.4f", 1),
+            ("max phi", "phi", "%.4f", 1),
+            ("min f", "fmin", "%.3e", 1)]
+    for lab, key, fmt, diff in rows:
+        a, b = A[key], B[key]
+        d = (fmt % (b - a)) if diff else ("%+d" % (b - a))
+        print("  %-26s %14s %14s %14s" % (lab, fmt % a, fmt % b, d))
+
+    dif = B["f"] - A["f"]
+    print()
+    if p.a == 0.0 and p.b == 0.0:
+        m0 = float(theta.sum())
+        print("  a = b = 0, so prop:xd_mass makes the total EXACTLY conserved and every")
+        print("  difference below is TRANSPORT alone:")
+        print("    mass drift  sequential %+.3e   simultaneous %+.3e   (relative to %.5f)"
+              % (A["mass"] - m0, B["mass"] - m0, m0))
+    if max(A["ck"], B["ck"]) > 1.0:
+        print("  WARNING C_k > 1: the donor-cell positivity bound no longer holds "
+              "(sequential %.3f, simultaneous %.3f). Check min f." % (A["ck"], B["ck"]))
+    print("  final fields differ by %.4e max abs = %.2f%% of peak theta"
+          % (np.abs(dif).max(), 100.0 * np.abs(dif).max() / vmax))
+    print("  mass A -> B: %.5f -> %.5f (%+.3f%%)"
+          % (A["mass"], B["mass"], 100.0 * (B["mass"] - A["mass"]) / A["mass"]))
+    print()
+    print("  wrote %s" % pA)
+    print("  wrote %s" % pB)
+    return 0
+
+
 if __name__ == "__main__":
+    # `python3 -m archives.<this module> fractionation [...]` runs the dose-fractionation
+    # study; anything else is the reconstruction CLI.
+    if sys.argv[1:2] == ["fractionation"]:
+        sys.exit(_fractionation_cli(sys.argv[2:]))
     sys.exit(_cli())

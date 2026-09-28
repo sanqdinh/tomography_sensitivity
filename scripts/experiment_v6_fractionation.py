@@ -20,7 +20,7 @@ this experiment -- it is the convention the model already uses for a bundle, and
 CLAUDE.md records for the 3D sinogram.  Firing ten angles at once therefore sums the ten dose
 fields before the single decay, the single potential solve and the single transport solve.
 :func:`check_equivalence` is the gate: at ONE bundle the simultaneous step must reproduce
-:func:`degrade_v6.step` bit-for-bit.
+:func:`senDOE.models.tomography_2d_shrinkage_decay.step` bit-for-bit.
 
 TWO THINGS ARE SIMPLER HERE THAN IN v5, both because of the implicit transport.
 
@@ -38,8 +38,8 @@ schedule destroyed.  That is the default here, unlike in the v5 script.
 
 Run it::
 
-    python3 experiment_v6_fractionation.py
-    python3 experiment_v6_fractionation.py --c 0.4 --grid 64 --tag g64
+    PYTHONPATH=. python3 scripts/experiment_v6_fractionation.py
+    PYTHONPATH=. python3 scripts/experiment_v6_fractionation.py --c 0.4 --grid 64 --tag g64
 """
 
 from __future__ import annotations
@@ -52,18 +52,20 @@ import matplotlib
 matplotlib.use("Agg")                      # headless, like every other figure path in this repo
 import matplotlib.pyplot as plt
 
-from degrade_v2 import accumulate_dose, scale_to_optical_depth
-# step_simultaneous lives in degrade_v6 now, not here: app.py needs it too, and two copies
-# of the step map is exactly the drift this repo keeps warning about.
-from degrade_v6 import (V6Params, _phantom, resolve, shape_diagnostics, simulate, step,
-                        step_simultaneous, half_mass_radius, centroid_of)
-from dose_response import bundle_r_values
+from senDOE.helpers.dose import accumulate_dose, scale_to_optical_depth
+# step_simultaneous lives in senDOE.models.tomography_2d_shrinkage_decay now, not here: app.py
+# needs it too, and two copies of the step map is exactly the drift this repo keeps warning about.
+from senDOE.helpers.phantoms import phantom as _phantom
+from senDOE.models.tomography_2d_shrinkage_decay import (
+    ShrinkageDecayParams as V6Params, resolve, shape_diagnostics, simulate, step,
+    step_simultaneous, half_mass_radius, centroid_of)
+from senDOE.helpers.rays import bundle_r_values
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def check_equivalence(image_res: int = 24, verbose: bool = True) -> float:
-    """Gate: at ONE bundle the simultaneous step must BE :func:`degrade_v6.step`."""
+    """Gate: at ONE bundle the simultaneous step must BE the model's own :func:`step`."""
     theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
     p = resolve(V6Params(reach=7.0, f_ref_frac=0.002, eta=1e-3), theta)
     rv = bundle_r_values(0.0, 0, image_res)
@@ -72,7 +74,7 @@ def check_equivalence(image_res: int = 24, verbose: bool = True) -> float:
     b, _ = step_simultaneous(theta, [(rv, ang)], p)
     err = float(np.abs(a - b).max())
     if verbose:
-        print("  gate: one-bundle simultaneous == degrade_v6.step -> %.3e  %s"
+        print("  gate: one-bundle simultaneous == step -> %.3e  %s"
               % (err, "PASS" if err == 0.0 else "FAIL (must be exactly 0)"))
     assert err == 0.0, err
     return err

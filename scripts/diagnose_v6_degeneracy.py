@@ -9,10 +9,13 @@ from scipy.linalg import svd
 
 from pyomo.contrib.pynumero.interfaces.pyomo_nlp import PyomoNLP
 
-from degrade_v2 import scale_to_optical_depth
-from degrade_v6 import V6Params, _demo_sequence, _phantom, resolve, select_eta, simulate, simulate_simultaneous
-from degrade_v6_uq import add_estimation_objective, build_v6_model, initialize_from_numpy
-from degrade_v2_uq import solve_with_fallback
+from senDOE.helpers.dose import scale_to_optical_depth
+from senDOE.helpers.phantoms import demo_sequence as _demo_sequence, phantom as _phantom
+from senDOE.models.tomography_2d_shrinkage_decay import (ShrinkageDecayParams as V6Params, resolve,
+                                                      select_eta, simulate, simulate_simultaneous)
+from senDOE.models.tomography_pyomo_2d_shrinkage_decay import (
+    add_estimation_objective, build_shrinkage_decay_model as build_v6_model, initialize_from_numpy)
+from senDOE.helpers.solvers import solve_with_fallback
 
 
 def _component(name: str) -> str:

@@ -5,7 +5,7 @@ This is the **2.5D** companion to the 2D live simulator in ``app.py``. The volum
 each measurement fires the *same* ``(r, theta)`` bundle through every z-slice, and rays never
 cross between slices. That makes the per-slice ray math identical to the established 2D path,
 so this module degrades each slice by calling the very same
-:func:`dose_response.degradation_dose_response` the 2D picture uses -- the two cannot drift.
+:func:`senDOE.helpers.dose.degradation_dose_response` the 2D picture uses -- the two cannot drift.
 
 Degradation still differs from slice to slice even though the geometry is shared, because each
 slice presents different material: ``I_local = I0*exp(-sum radon)`` attenuates according to what
@@ -16,7 +16,7 @@ This is pure numpy and needs no IPOPT / k_aug, so it runs anywhere in seconds.
 
 Run headless as a smoke test::
 
-    python3 tomography_3d.py
+    python3 -m senDOE.models.tomography_3d
 """
 
 from __future__ import annotations
@@ -24,11 +24,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import binary_erosion
 
-from dose_response import (
-    bundle_r_values,
-    degradation_dose_response,
-    ray_line_integral_stack,
-)
+from senDOE.helpers.dose import degradation_dose_response
+from senDOE.helpers.rays import bundle_r_values, ray_line_integral_stack
 
 # --- 3D Shepp-Logan ellipsoid tables ----------------------------------------------------
 # One row per ellipsoid: (a, b, c, x0, y0, z0, phi_deg, theta_deg, psi_deg, value).
