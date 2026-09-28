@@ -1,6 +1,6 @@
-"""Dose fractionation in the v6 forward model: 10 angles one at a time vs all 10 at once.
+"""Dose fractionation in the shrinkage-decay forward model: 10 angles one at a time vs all 10 at once.
 
-The v6 counterpart of ``experiment_fractionation.py``, which asked the same question of v5.
+The shrinkage-decay counterpart of ``experiment_fractionation.py``, which asked the same question of v5.
 
 The two runs deliver the SAME total exposure -- ten full-fan bundles at ten evenly spaced
 angles, the same ``I0`` per ray -- and differ only in how it is split in time:
@@ -27,7 +27,7 @@ TWO THINGS ARE SIMPLER HERE THAN IN v5, both because of the implicit transport.
 v5's version of this experiment needed :func:`match_ck`, an outer loop scaling ``c_cp`` until the
 worse schedule's compaction number hit a target, because beyond ``C_k = 1`` v5's explicit flux
 loses positivity and the comparison would have been run partly outside the model's validity --
-CLAUDE.md records the effect coming out at 5x rather than 24x once that was imposed.  **v6 has no
+CLAUDE.md records the effect coming out at 5x rather than 24x once that was imposed.  **shrinkage-decay has no
 such bound.**  eq:xd_implicit_transport is an M-matrix at every ``c_cp``, so both schedules are
 valid at the same ``c_cp``, and ``c_cp`` is held fixed at its material value with no matching
 step at all.  The number below is therefore the raw fractionation, not a bounded proxy for it.
@@ -38,8 +38,8 @@ schedule destroyed.  That is the default here, unlike in the v5 script.
 
 Run it::
 
-    PYTHONPATH=. python3 scripts/experiment_v6_fractionation.py
-    PYTHONPATH=. python3 scripts/experiment_v6_fractionation.py --c 0.4 --grid 64 --tag g64
+    PYTHONPATH=. python3 scripts/experiment_shrinkage_fractionation.py
+    PYTHONPATH=. python3 scripts/experiment_shrinkage_fractionation.py --c 0.4 --grid 64 --tag g64
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ from senDOE.helpers.dose import accumulate_dose, scale_to_optical_depth
 # needs it too, and two copies of the step map is exactly the drift this repo keeps warning about.
 from senDOE.helpers.phantoms import phantom as _phantom
 from senDOE.models.tomography_2d_shrinkage_decay import (
-    ShrinkageDecayParams as V6Params, resolve, shape_diagnostics, simulate, step,
+    ShrinkageDecayParams, resolve, shape_diagnostics, simulate, step,
     step_simultaneous, half_mass_radius, centroid_of)
 from senDOE.helpers.rays import bundle_r_values
 
@@ -67,7 +67,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def check_equivalence(image_res: int = 24, verbose: bool = True) -> float:
     """Gate: at ONE bundle the simultaneous step must BE the model's own :func:`step`."""
     theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
-    p = resolve(V6Params(reach=7.0, f_ref_frac=0.002, eta=1e-3), theta)
+    p = resolve(ShrinkageDecayParams(reach=7.0, f_ref_frac=0.002, eta=1e-3), theta)
     rv = bundle_r_values(0.0, 0, image_res)
     ang = np.deg2rad(37.0)
     a, _ = step(theta, rv, ang, p)
@@ -97,7 +97,7 @@ def run(image_res=32, n_angles=10, optical_depth=1.1, **over):
     kw = dict(I0=1.0, c=0.4, a=0.0, b=0.0, c_cp=0.3, reach=7.0, gamma=100.0,
               f_ref_frac=0.002, eta=1e-3)
     kw.update(over)
-    p = resolve(V6Params(**kw), theta)
+    p = resolve(ShrinkageDecayParams(**kw), theta)
 
     angles = [180.0 * k / n_angles for k in range(n_angles)]
     rv = bundle_r_values(0.0, 0, image_res)          # full fan, zero offset: identical per angle
@@ -182,7 +182,7 @@ def figure(theta, A, B, p, angles, path):
 
     ratio = (A["half_pct"] / B["half_pct"]) if B["half_pct"] != 0 else float("inf")
     fig.suptitle(
-        "v6 dose fractionation: %d evenly spaced angles, sequential vs simultaneous\n"
+        "shrinkage-decay dose fractionation: %d evenly spaced angles, sequential vs simultaneous\n"
         "I0=%.3g  c_omega=%.3g  a=%.3g  b=%.3g  c_cp=%.3g  l=%.3g px  eta=%.0e  grid %d   ---   "
         "same total exposure, differing only in how it is split in time\n"
         "SEQUENTIAL CONTRACTS %.2fx AS MUCH (%+.3f%% against %+.3f%%).  Cause: dw saturates --   "
@@ -227,7 +227,7 @@ def main(argv=None):
 
     print("  grid %d, %d angles, I0=%.3g c_omega=%.3g a=%.3g b=%.3g c_cp=%.3g l=%.3g eta=%.0e"
           % (a.grid, a.angles, p.I0, p.c, p.a, p.b, p.c_cp, p.reach, p.eta))
-    print("  NO c_cp matching: v6's transport is an M-matrix at every c_cp, so both schedules")
+    print("  NO c_cp matching: shrinkage-decay's transport is an M-matrix at every c_cp, so both schedules")
     print("  are valid at the material value. v5's run of this needed that outer loop.")
     print()
     hdr = ("%-14s %7s %10s %10s %7s %8s %10s %11s %10s"
@@ -262,7 +262,7 @@ def main(argv=None):
           "absorp/vs A %.1e B %.1e" % (A["colsum"], B["colsum"], A["mass_residual"],
                                        B["mass_residual"], A["absorp"], B["absorp"]))
     print()
-    name = "v6_fractionation%s.png" % (("_" + a.tag) if a.tag else "")
+    name = "shrinkage_fractionation%s.png" % (("_" + a.tag) if a.tag else "")
     path = figure(theta, A, B, p, angles, os.path.join(os.getcwd(), name))
     print("  wrote %s" % path)
     return 0

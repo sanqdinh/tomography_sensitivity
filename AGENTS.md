@@ -14,7 +14,7 @@
 - `python3 -m senDOE.models.tomography_2d_shrinkage_decay` runs the model invariant checks.
 - `python3 -m senDOE.models.tomography_pyomo_2d_shrinkage_decay --image-res 16 --n-steps 2` compares the Pyomo and NumPy formulations. Add `--solve` only when IPOPT is available.
 
-Run scripts from the repository root with `PYTHONPATH=.`, for example `PYTHONPATH=. python3 scripts/experiment_v6_limits.py`.
+Run scripts from the repository root with `PYTHONPATH=.`, for example `PYTHONPATH=. python3 scripts/experiment_shrinkage_limits.py`.
 
 ## Coding Style & Naming Conventions
 

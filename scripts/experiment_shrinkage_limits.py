@@ -1,4 +1,4 @@
-"""The two v6 limits subsec:assumptions asks for and does not report.
+"""The two shrinkage-decay limits subsec:assumptions asks for and does not report.
 
 Both are "Numerical checks" items that
 :func:`senDOE.models.tomography_2d_shrinkage_decay.check_invariants` deliberately leaves out,
@@ -28,9 +28,9 @@ because each is a *sweep* rather than an assertion and neither belongs in a Dock
 
 Run it::
 
-    PYTHONPATH=. python3 scripts/experiment_v6_limits.py            # both sweeps, disc, grid 64
-    PYTHONPATH=. python3 scripts/experiment_v6_limits.py --phantom  # the same on Shepp-Logan
-    PYTHONPATH=. python3 scripts/experiment_v6_limits.py --only reach
+    PYTHONPATH=. python3 scripts/experiment_shrinkage_limits.py            # both sweeps, disc, grid 64
+    PYTHONPATH=. python3 scripts/experiment_shrinkage_limits.py --phantom  # the same on Shepp-Logan
+    PYTHONPATH=. python3 scripts/experiment_shrinkage_limits.py --only reach
 
 Nothing here is asserted: these are measurements to quote, and the numbers move with the
 geometry.  The assertions live in
@@ -46,7 +46,7 @@ import numpy as np
 from senDOE.helpers.phantoms import (demo_sequence as _demo_sequence, disc as _disc,
                                      phantom as _phantom)
 from senDOE.models.tomography_2d_shrinkage_decay import (
-    ShrinkageDecayParams as V6Params, simulate, resolve, compaction_potential, implicit_transport,
+    ShrinkageDecayParams, simulate, resolve, compaction_potential, implicit_transport,
     half_mass_radius, centroid_of, scale_to_optical_depth)
 
 F_REF_FRACS = (0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 5e-4, 2e-4)
@@ -84,7 +84,7 @@ def sweep_f_ref(image_res: int = 64, n_steps: int = 12, use_phantom: bool = Fals
     ctr = centroid_of(theta)
     r0 = half_mass_radius(theta, ctr)
     f_int = _interior_value(theta)
-    base = resolve(V6Params(**kw), theta)
+    base = resolve(ShrinkageDecayParams(**kw), theta)
     vs = base.varsigma()
 
     print("SWEEP 1: the conduction threshold f_ref")
@@ -135,7 +135,7 @@ def sweep_reach(image_res: int = 64, n_steps: int = 12, use_phantom: bool = Fals
     ctr = centroid_of(theta)
     r0 = half_mass_radius(theta, ctr)
     kw.pop("c_cp", None)
-    base = V6Params(**kw)
+    base = ShrinkageDecayParams(**kw)
 
     print("SWEEP 2: the small-reach limit approaches the pointwise driver")
     print("  %s, grid %d, gamma = %.3g, f_ref/fmax = %.3g, effective amplitude "

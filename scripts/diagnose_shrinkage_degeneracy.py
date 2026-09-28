@@ -1,4 +1,4 @@
-"""Read-only rank diagnostics for the v6 Pyomo reconstruction model."""
+"""Read-only rank diagnostics for the shrinkage-decay Pyomo reconstruction model."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from pyomo.contrib.pynumero.interfaces.pyomo_nlp import PyomoNLP
 
 from senDOE.helpers.dose import scale_to_optical_depth
 from senDOE.helpers.phantoms import demo_sequence as _demo_sequence, phantom as _phantom
-from senDOE.models.tomography_2d_shrinkage_decay import (ShrinkageDecayParams as V6Params, resolve,
+from senDOE.models.tomography_2d_shrinkage_decay import (ShrinkageDecayParams, resolve,
                                                       select_eta, simulate, simulate_simultaneous)
 from senDOE.models.tomography_pyomo_2d_shrinkage_decay import (
-    add_estimation_objective, build_shrinkage_decay_model as build_v6_model, initialize_from_numpy)
+    add_estimation_objective, build_shrinkage_decay_model, initialize_from_numpy)
 from senDOE.helpers.solvers import solve_with_fallback
 
 
@@ -26,16 +26,16 @@ def diagnose(image_res: int, n_steps: int, simultaneous: bool, eta_arg: float | 
              continuation: bool, solve: bool) -> None:
     theta = scale_to_optical_depth(_phantom(image_res), 1.1, image_res)
     seq = _demo_sequence(n_steps)
-    p0 = V6Params(I0=0.0, c_cp=0.0) if continuation else V6Params()
+    p0 = ShrinkageDecayParams(I0=0.0, c_cp=0.0) if continuation else ShrinkageDecayParams()
     if eta_arg is None:
         eta, eta_info = select_eta(theta, seq, p0, image_res, simultaneous=simultaneous)
     else:
         eta, eta_info = eta_arg, {}
-    p = resolve(V6Params(I0=p0.I0, c_cp=p0.c_cp, eta=eta), theta)
+    p = resolve(ShrinkageDecayParams(I0=p0.I0, c_cp=p0.c_cp, eta=eta), theta)
     run = simulate_simultaneous if simultaneous else simulate
     _, _, y = run(theta, seq, p, image_res, record_observations=True)
 
-    m = build_v6_model(theta, seq, p, image_res, f_bounds=(0.0, None),
+    m = build_shrinkage_decay_model(theta, seq, p, image_res, f_bounds=(0.0, None),
                        potential=not continuation, simultaneous=simultaneous)
     add_estimation_objective(m, y, 0.001, float(np.abs(theta).max()))
     residual = initialize_from_numpy(m, theta)
@@ -56,7 +56,7 @@ def diagnose(image_res: int, n_steps: int, simultaneous: bool, eta_arg: float | 
     eps_rank = np.finfo(float).eps * max(jac.shape)
     rank = int(np.count_nonzero(rel > eps_rank))
 
-    print("v6 reconstruction Jacobian")
+    print("shrinkage-decay reconstruction Jacobian")
     print("  grid=%d steps=%d schedule=%s model=%s eta=%.6g forward_ratio=%s" % (
         image_res, n_steps, "simultaneous" if simultaneous else "sequential",
         "continuation" if continuation else "full", eta,
