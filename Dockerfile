@@ -40,15 +40,15 @@ RUN --mount=type=secret,id=sendoe_read_token \
     set -eu; \
     askpass=/tmp/sendoe-git-askpass; \
     printf '%s\n' '#!/bin/sh' \
-        'case "$$1" in' \
+        'case "$1" in' \
         '*Username*) echo x-access-token ;;' \
         '*Password*) cat /run/secrets/sendoe_read_token ;;' \
         '*) exit 1 ;;' \
-        'esac' > "$$askpass"; \
-    chmod 700 "$$askpass"; \
-    GIT_ASKPASS="$$askpass" GIT_TERMINAL_PROMPT=0 \
+        'esac' > "$askpass"; \
+    chmod 700 "$askpass"; \
+    GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
         python3 -m pip install --no-cache-dir -r requirements.txt; \
-    rm -f "$$askpass"
+    rm -f "$askpass"
 
 # 3) Install the native solver binaries to a FIXED, user-independent location.
 #    IDAES_DATA (set above) makes get-extensions install to /opt/idaes/bin regardless of
