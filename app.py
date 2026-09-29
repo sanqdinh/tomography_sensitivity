@@ -62,6 +62,7 @@ from senDOE.helpers.geometry import (
 # of this file is unchanged.
 from senDOE.helpers.rays import bundle_r_values as _bundle_r_values
 from senDOE.helpers.dose import degradation_dose_response as _degradation_dose_response
+from senDOE.helpers.solvers import SolverCancelled
 from senDOE.models.tomography_3d import shepp_logan_3d, simulate_3d, detector_grid
 from senDOE.helpers.dose import accumulate_dose as _accumulate_dose, scale_to_optical_depth
 from senDOE.models.tomography_pyomo_2d_shrinkage_decay import (
@@ -209,6 +210,24 @@ def _current_script_ctx():
         return get_script_run_ctx()
     except Exception:
         return None
+
+
+def _script_stop_requested(ctx) -> bool:
+    """Read Streamlit's pending STOP request without consuming rerun requests.
+
+    Streamlit 1.38 only checks this state at UI yield points. Native solver calls block the script
+    thread, so the cancellable solver executor polls it directly while IPOPT is running.
+    """
+    requests = getattr(ctx, "script_requests", None) if ctx is not None else None
+    lock = getattr(requests, "_lock", None)
+    if requests is None or lock is None:
+        return False
+    try:
+        with lock:
+            state = getattr(requests, "_state", None)
+            return getattr(state, "name", "") == "STOP"
+    except Exception:
+        return False
 
 
 def _attach_script_ctx(ctx) -> bool:
@@ -660,7 +679,7 @@ def _phantom_3d(image_res: int, n_slices: int, contrast: float):
 @st.cache_data(show_spinner=False, max_entries=512)
 def _recon_slice_3d(seq: tuple, image_res: int, n_slices: int, contrast: float,
                     I0: float, alpha: float, beta: float, tv_weight: float, k: int,
-                    _log_callback=None):
+                    _log_callback=None, _cancel_callback=None):
     """Reconstruct ONE z-slice exactly the way the 2D tab reconstructs its phantom.
 
     The slice handed over is the **undamaged** ``vol0[:, :, k]``, with ``I0/alpha/beta`` passed
@@ -683,6 +702,7 @@ def _recon_slice_3d(seq: tuple, image_res: int, n_slices: int, contrast: float,
         UQParams(image_res=image_res, I0=I0, alpha=alpha, beta=beta, tv_weight=tv_weight,
                  beam_steps=steps, phantom=vol0[:, :, int(k)]),
         log_callback=_log_callback,
+        cancel_callback=_cancel_callback,
     )
     return (np.asarray(res.image_reconstruct, dtype=float),
             None if res.log_cov_diag_2D is None else np.asarray(res.log_cov_diag_2D, dtype=float),
@@ -1657,6 +1677,7 @@ def _render_3d_tab():
                 log_box = st.empty()
                 log_lines: list[str] = []
                 _last = [0.0]
+                _ctx = _current_script_ctx()
 
                 def _render_log() -> None:
                     _render_log_box(log_box, "".join(log_lines))
@@ -1685,12 +1706,15 @@ def _render_3d_tab():
                             float(s["live3d_I0"]), float(s["live3d_alpha"]),
                             float(s["live3d_beta"]), float(s["live3d_tv_weight"]), kz,
                             _log_callback=_log_cb,
+                            _cancel_callback=lambda: _script_stop_requested(_ctx),
                         )
                         recon[:, :, kz] = a
                         if c is not None:
                             logcov[:, :, kz] = c
                         dopt[kz] = dv
                         status[kz] = "%s / %s" % (fwd, inv)
+                    except SolverCancelled:
+                        st.stop()
                     except Exception as exc:
                         # One slice must not lose the rest: k_aug's covariance here is
                         # intentionally rank-deficient and can fail on a starved geometry.
@@ -2233,8 +2257,11 @@ def _render_2d_shrinkage_tab():
             with st.spinner("Solving the estimation NLP, then k_aug..."):
                 try:
                     out = run_shrinkage_decay_reconstruction(
-                        params_shrinkage, log_callback=_shrinkage_log)
+                        params_shrinkage, log_callback=_shrinkage_log,
+                        cancel_callback=lambda: _script_stop_requested(_ctx))
                     st.session_state["results_shrinkage"] = {"res": out, "key": shrinkage_key}
+                except SolverCancelled:
+                    st.stop()
                 except Exception as exc:
                     st.session_state.pop("results_shrinkage", None)
                     st.error("Reconstruction failed: %s" % exc)
@@ -2244,9 +2271,12 @@ def _render_2d_shrinkage_tab():
             with st.spinner("Computing the selected naive reconstruction..."):
                 try:
                     out = run_naive_shrinkage_reconstruction(
-                        params_shrinkage, log_callback=_shrinkage_log)
+                        params_shrinkage, log_callback=_shrinkage_log,
+                        cancel_callback=lambda: _script_stop_requested(_ctx))
                     st.session_state["results_shrinkage_naive"] = {
                         "res": out, "key": naive_key}
+                except SolverCancelled:
+                    st.stop()
                 except Exception as exc:
                     st.session_state.pop("results_shrinkage_naive", None)
                     st.error("Naive reconstruction failed: %s" % exc)
@@ -2498,6 +2528,7 @@ with tab_2d:
             tv_weight=float(st.session_state["live_tv_weight"]),
             beam_steps=steps,
         )
+        _ctx = _current_script_ctx()
 
         with _log_slot.container():
             if param_cols > 5000 or total_rays > 2000:
@@ -2525,8 +2556,12 @@ with tab_2d:
 
             with st.spinner("Solving forward + inverse problem and extracting sensitivity..."):
                 try:
-                    results = run_simple_uq(params, log_callback=log_callback)
+                    results = run_simple_uq(
+                        params, log_callback=log_callback,
+                        cancel_callback=lambda: _script_stop_requested(_ctx))
                     st.session_state["results"] = results
+                except SolverCancelled:
+                    st.stop()
                 except RuntimeError as exc:  # curated, user-facing guidance (e.g. singular-KKT UQ failure)
                     st.session_state.pop("results", None)
                     st.error(str(exc))  # message is already actionable; skip the scary chained traceback

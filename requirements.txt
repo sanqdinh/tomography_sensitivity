@@ -6,7 +6,7 @@ pyomo==6.10.0
 
 # Canonical tomography and sensitivity library. Pin an immutable source revision so Docker/Fly
 # builds do not silently change when the upstream branch advances.
-senDOE @ git+https://github.com/sanqdinh/sDOE_senNLP.git@d34d35d73383222dbfd0c7aa688e40943d7a09ed
+senDOE @ git+https://github.com/sanqdinh/sDOE_senNLP.git@c96fd2a33afedb5547da00c5020bf446a6355bec
 
 # Scientific stack
 numpy==1.26.4
