@@ -32,7 +32,6 @@ import io
 import os
 import shutil
 import sys
-import threading
 import time
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -226,38 +225,6 @@ def _script_stop_requested(ctx) -> bool:
         with lock:
             state = getattr(requests, "_state", None)
             return getattr(state, "name", "") == "STOP"
-    except Exception:
-        return False
-
-
-def _attach_script_ctx(ctx) -> bool:
-    """Give the CURRENT thread this session's Streamlit context, if it has none.
-
-    Pyomo streams the solver log from its own reader thread ("Thread-N (_mergedReader)"), and a
-    thread without a ScriptRunContext cannot touch ``st``: every call logs
-    "missing ScriptRunContext!" and then raises NoSessionContext, which Pyomo reports as
-    "Error writing to output stream ... The following was left in the output buffer:" followed by
-    the IPOPT line it just dropped. So the terminal fills with noise AND the iteration lines
-    never reach the UI -- the log box is not merely ugly, it is incomplete.
-
-    Attaching the context is the documented way to make a background thread Streamlit-aware, and
-    it is safe in this particular shape: the main thread is BLOCKED inside ``solve()`` for the
-    whole life of the reader thread, so there is no concurrent script run to race against.
-
-    Never raises. On a Streamlit that has moved these symbols the caller just buffers instead,
-    and ``senDOE.helpers.solvers._solve_streaming`` keeps the complete log either way.
-    """
-    try:
-        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
-    except Exception:
-        return False
-    try:
-        if get_script_run_ctx() is not None:
-            return True
-        if ctx is None:
-            return False
-        add_script_run_ctx(threading.current_thread(), ctx)
-        return get_script_run_ctx() is not None
     except Exception:
         return False
 
@@ -2219,28 +2186,16 @@ def _render_2d_shrinkage_tab():
     if go_shrinkage or run_naive:
         log_box = st.empty()
         log_lines: list[str] = []
-        _last = [0.0]
-        # Captured HERE, on the script thread, for THIS session -- see _current_script_ctx.
         _ctx = _current_script_ctx()
 
         def _render_shrinkage_log() -> None:
             _render_log_box(log_box, "".join(log_lines))
 
         def _shrinkage_log(chunk: str) -> None:
-            # Runs on Pyomo's reader thread. Terminal first and unthrottled -- that is the raw
-            # IPOPT log and it should appear as it is produced. Then buffer, so the box stays
-            # complete even when the render cannot happen. Then render, at most every 0.2 s.
+            # Pyomo calls this on its reader thread. Streamlit elements are not thread-safe, so
+            # only buffer and echo here; the script thread renders at solve boundaries below.
             _term_echo(chunk)
             log_lines.append(chunk)
-            now = time.time()
-            if now - _last[0] < 0.2:
-                return
-            _last[0] = now
-            if _attach_script_ctx(_ctx):
-                try:
-                    _render_shrinkage_log()
-                except Exception:
-                    pass        # a dropped frame is fine; the buffer still holds every line
 
         params_shrinkage = ShrinkageDecayUQParams(
             image_res=res, optical_depth=float(s["shrinkage_depth"]), beam_steps=seq_all,
@@ -2541,18 +2496,16 @@ with tab_2d:
             # Fixed-height scrolling box showing the newest lines (see _render_log_box).
             log_box = st.empty()
             log_lines: list[str] = []
-            _last_render = [0.0]
 
             def _render_log() -> None:
                 # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
                 _render_log_box(log_box, "".join(log_lines))
 
             def log_callback(chunk: str) -> None:
+                # Called from Pyomo's reader thread: buffer and echo only. Rendering Streamlit
+                # elements here causes cross-thread layout flicker while the script is blocked.
                 log_lines.append(chunk)
-                now = time.time()
-                if now - _last_render[0] >= 0.2:  # throttle so the iframe rebuild doesn't flicker
-                    _last_render[0] = now
-                    _render_log()
+                _term_echo(chunk)
 
             with st.spinner("Solving forward + inverse problem and extracting sensitivity..."):
                 try:
