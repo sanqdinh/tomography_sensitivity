@@ -4,6 +4,10 @@
 idaes-pse==2.10.0
 pyomo==6.10.0
 
+# Canonical tomography and sensitivity library. Pin an immutable source revision so Docker/Fly
+# builds do not silently change when the upstream branch advances.
+senDOE @ git+https://github.com/sanqdinh/sDOE_senNLP.git@c96fd2a33afedb5547da00c5020bf446a6355bec
+
 # Scientific stack
 numpy==1.26.4
 scipy==1.13.1
@@ -14,3 +18,6 @@ pandas==2.2.2
 
 # Web UI
 streamlit==1.38.0
+# Interactive 3D volume rendering (st.plotly_chart) in the 3D degradation tab.
+# Pure-python wheel + a bundled JS asset; no native build, no solver interaction.
+plotly==5.24.1
