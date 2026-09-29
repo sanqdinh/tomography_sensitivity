@@ -32,6 +32,7 @@ import io
 import os
 import shutil
 import sys
+import threading
 import time
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -169,7 +170,6 @@ _LOG_BOX_HEIGHT = 300
 def _render_log_box(slot, text: str) -> None:
     """Draw the rolling solver-log tail into ``slot`` (an ``st.empty()`` placeholder)."""
     tail = "".join(text).splitlines()[-_LOG_TAIL_LINES:]
-    slot.empty()                     # drop the previous box so they do not stack
     with slot.container():
         with st.container(height=_LOG_BOX_HEIGHT):
             st.code("\n".join(tail), language=None)
@@ -227,6 +227,66 @@ def _script_stop_requested(ctx) -> bool:
             return getattr(state, "name", "") == "STOP"
     except Exception:
         return False
+
+
+def _run_with_live_log(log_box, ctx, solver_call):
+    """Run a solver in a worker while the Streamlit thread renders its log safely.
+
+    ``solver_call`` receives ``(log_callback, cancel_callback)``. The worker callback only
+    buffers text and echoes it to the terminal; all Streamlit operations stay on this thread.
+    """
+    log_lines: list[str] = []
+    log_lock = threading.Lock()
+    cancel_event = threading.Event()
+    done = threading.Event()
+    outcome = {}
+
+    def _log_callback(chunk: str) -> None:
+        _term_echo(chunk)
+        with log_lock:
+            log_lines.append(chunk)
+
+    def _worker() -> None:
+        try:
+            outcome["result"] = solver_call(_log_callback, cancel_event.is_set)
+        except BaseException as exc:
+            outcome["error"] = (exc, exc.__traceback__)
+        finally:
+            done.set()
+
+    def _snapshot() -> str:
+        with log_lock:
+            return "".join(log_lines)
+
+    worker = threading.Thread(target=_worker, name="tomo-solver", daemon=True)
+    worker.start()
+    last_render = 0.0
+    rendered_length = -1
+    try:
+        _render_log_box(log_box, "")
+        while not done.wait(0.1):
+            if _script_stop_requested(ctx):
+                cancel_event.set()
+                worker.join(timeout=10.0)
+                st.stop()
+            now = time.monotonic()
+            current_length = len(_snapshot())
+            if now - last_render >= 1.0 and current_length != rendered_length:
+                _render_log_box(log_box, _snapshot())
+                rendered_length = current_length
+                last_render = now
+        final_log = _snapshot()
+        if len(final_log) != rendered_length:
+            _render_log_box(log_box, final_log)
+    except BaseException:
+        cancel_event.set()
+        worker.join(timeout=10.0)
+        raise
+
+    if "error" in outcome:
+        error, traceback = outcome["error"]
+        raise error.with_traceback(traceback)
+    return outcome["result"]
 
 
 def _empty_beam_table() -> pd.DataFrame:
@@ -2185,17 +2245,7 @@ def _render_2d_shrinkage_tab():
     run_naive = bool(go_shrinkage_naive or go_shrinkage)
     if go_shrinkage or run_naive:
         log_box = st.empty()
-        log_lines: list[str] = []
         _ctx = _current_script_ctx()
-
-        def _render_shrinkage_log() -> None:
-            _render_log_box(log_box, "".join(log_lines))
-
-        def _shrinkage_log(chunk: str) -> None:
-            # Pyomo calls this on its reader thread. Streamlit elements are not thread-safe, so
-            # only buffer and echo here; the script thread renders at solve boundaries below.
-            _term_echo(chunk)
-            log_lines.append(chunk)
 
         params_shrinkage = ShrinkageDecayUQParams(
             image_res=res, optical_depth=float(s["shrinkage_depth"]), beam_steps=seq_all,
@@ -2211,23 +2261,23 @@ def _render_2d_shrinkage_tab():
         if go_shrinkage:
             with st.spinner("Solving the estimation NLP, then k_aug..."):
                 try:
-                    out = run_shrinkage_decay_reconstruction(
-                        params_shrinkage, log_callback=_shrinkage_log,
-                        cancel_callback=lambda: _script_stop_requested(_ctx))
+                    out = _run_with_live_log(
+                        log_box, _ctx,
+                        lambda log, cancel: run_shrinkage_decay_reconstruction(
+                            params_shrinkage, log_callback=log, cancel_callback=cancel))
                     st.session_state["results_shrinkage"] = {"res": out, "key": shrinkage_key}
                 except SolverCancelled:
                     st.stop()
                 except Exception as exc:
                     st.session_state.pop("results_shrinkage", None)
                     st.error("Reconstruction failed: %s" % exc)
-                finally:
-                    _render_shrinkage_log()
         if run_naive:
             with st.spinner("Computing the selected naive reconstruction..."):
                 try:
-                    out = run_naive_shrinkage_reconstruction(
-                        params_shrinkage, log_callback=_shrinkage_log,
-                        cancel_callback=lambda: _script_stop_requested(_ctx))
+                    out = _run_with_live_log(
+                        log_box, _ctx,
+                        lambda log, cancel: run_naive_shrinkage_reconstruction(
+                            params_shrinkage, log_callback=log, cancel_callback=cancel))
                     st.session_state["results_shrinkage_naive"] = {
                         "res": out, "key": naive_key}
                 except SolverCancelled:
@@ -2235,8 +2285,6 @@ def _render_2d_shrinkage_tab():
                 except Exception as exc:
                     st.session_state.pop("results_shrinkage_naive", None)
                     st.error("Naive reconstruction failed: %s" % exc)
-                finally:
-                    _render_shrinkage_log()
 
     stash_shrinkage = st.session_state.get("results_shrinkage")
     regular = stash_shrinkage["res"] if stash_shrinkage else None
@@ -2495,23 +2543,13 @@ with tab_2d:
             st.subheader("Solver log (inverse solve)")
             # Fixed-height scrolling box showing the newest lines (see _render_log_box).
             log_box = st.empty()
-            log_lines: list[str] = []
-
-            def _render_log() -> None:
-                # Rolling tail (escaped) so very long solver logs stay responsive in the browser.
-                _render_log_box(log_box, "".join(log_lines))
-
-            def log_callback(chunk: str) -> None:
-                # Called from Pyomo's reader thread: buffer and echo only. Rendering Streamlit
-                # elements here causes cross-thread layout flicker while the script is blocked.
-                log_lines.append(chunk)
-                _term_echo(chunk)
 
             with st.spinner("Solving forward + inverse problem and extracting sensitivity..."):
                 try:
-                    results = run_simple_uq(
-                        params, log_callback=log_callback,
-                        cancel_callback=lambda: _script_stop_requested(_ctx))
+                    results = _run_with_live_log(
+                        log_box, _ctx,
+                        lambda log, cancel: run_simple_uq(
+                            params, log_callback=log, cancel_callback=cancel))
                     st.session_state["results"] = results
                 except SolverCancelled:
                     st.stop()
@@ -2522,8 +2560,6 @@ with tab_2d:
                     st.session_state.pop("results", None)
                     st.error(f"Run failed: {exc}")
                     st.exception(exc)
-                finally:
-                    _render_log()  # final flush: last lines always shown and pinned to the bottom
 
     # Render current results into the fixed slot (new ones after a solve; persisted on a plain rerun).
     _render_results(_results_slot, st.session_state.get("results"))
